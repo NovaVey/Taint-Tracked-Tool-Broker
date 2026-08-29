@@ -1,5 +1,7 @@
 # Taint-Tracked Tool Broker
 
+[![CI](https://github.com/NovaVey/Taint-Tracked-Tool-Broker/actions/workflows/ci.yml/badge.svg)](https://github.com/NovaVey/Taint-Tracked-Tool-Broker/actions/workflows/ci.yml)
+
 Provenance labeling for agent inputs, enforced at the tool-call boundary. Blocks untrusted data from reaching shell, filesystem, and network sinks — including when it arrives paraphrased, translated, re-encoded, or laundered through a boolean decision instead of copied verbatim. Ships with an injection corpus and a published list of known gaps.
 
 ## The problem
@@ -73,6 +75,8 @@ Runs [`corpus/cases.ts`](./corpus/cases.ts): 14 cases across 11 attack classes �
 ## Known gaps
 
 This library does not achieve information-flow-control soundness — it achieves a conservative, structural approximation with named, honest limits. It gates on "was untrusted content live in this scope's tracked context," which is a sound proxy for "did the model act on it," not proof of causal influence. See [`GAPS.md`](./GAPS.md) for the full list, including the two true known gaps the corpus asserts rather than papers over.
+
+Found a way past the gating logic that isn't already in that list? See [`SECURITY.md`](./SECURITY.md).
 
 ## Development
 
