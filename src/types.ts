@@ -1,0 +1,338 @@
+/**
+ * Core type contract for the Taint-Tracked Tool Broker (TTTB).
+ *
+ * This module is the single source of truth every other module imports
+ * from. See DESIGN.md for the full rationale — in short:
+ *
+ *   - A single trust lattice (`TaintLevel`) is used EVERYWHERE: both for
+ *     the per-scope watermark (the actual safety boundary, §4.1) and for
+ *     individual fingerprint records (attribution/explainability, §4.2).
+ *   - The watermark, not content matching, decides whether a call is
+ *     gated. Fingerprint matches can only ever tighten a verdict, never
+ *     loosen one (§4.2, §7.2).
+ *
+ * This file contains only types and small, pure, dependency-free helpers
+ * (the lattice ordering and the sink-class mapping). Anything that needs
+ * Node built-ins (crypto, timers) lives in a downstream module.
+ */
+
+// ---------------------------------------------------------------------------
+// The trust lattice (§4.0)
+// ---------------------------------------------------------------------------
+
+/** CLEAN(0) < DERIVED_UNTRUSTED(1) < RAW_UNTRUSTED(2). Totally ordered. */
+export type TaintLevel = 'CLEAN' | 'DERIVED_UNTRUSTED' | 'RAW_UNTRUSTED';
+
+export const LEVEL_ORDER: Record<TaintLevel, number> = {
+  CLEAN: 0,
+  DERIVED_UNTRUSTED: 1,
+  RAW_UNTRUSTED: 2,
+};
+
+export function maxLevel(a: TaintLevel, b: TaintLevel): TaintLevel {
+  return LEVEL_ORDER[a] >= LEVEL_ORDER[b] ? a : b;
+}
+
+export function levelAtLeast(level: TaintLevel, floor: TaintLevel): boolean {
+  return LEVEL_ORDER[level] >= LEVEL_ORDER[floor];
+}
+
+// ---------------------------------------------------------------------------
+// Provenance & sensitivity
+// ---------------------------------------------------------------------------
+
+export interface ProvenanceTag {
+  /** Equal to the originating fingerprint's exactHash, or a uuid for non-text events. */
+  id: string;
+  sourceCallId: string;
+  toolName: string;
+  sessionId: string;
+  capturedAt: number;
+  note?: string;
+}
+
+export interface SensitivityLabel {
+  containsPrivateData: boolean;
+  /** e.g. 'credentials' | 'pii' | 'email-contents' | ... — free-form, integrator-defined. */
+  categories: string[];
+}
+
+export const NOT_SENSITIVE: SensitivityLabel = { containsPrivateData: false, categories: [] };
+
+// ---------------------------------------------------------------------------
+// Layer 2 — content-addressed fingerprint registry (precision & explainability
+// only; NEVER the sole basis for a gating decision — see §4.2)
+// ---------------------------------------------------------------------------
+
+export interface Fingerprint {
+  exactHash: string;
+  /** 64-bit simhash, survives light edits/reordering better than exact hashing. */
+  simhash: bigint;
+  /** Deduplicated hashes of word-shingles, used for overlap/containment scoring. */
+  shingleHashes: Uint32Array;
+  length: number;
+}
+
+export interface TaintRecord {
+  /** Equal to fingerprint.exactHash. */
+  id: string;
+  provenance: ProvenanceTag;
+  level: TaintLevel;
+  sensitivity: SensitivityLabel;
+  fingerprint: Fingerprint;
+  /** Explicit provenance-graph parents, e.g. set by the quarantine/summarize path. */
+  derivedFrom?: string[];
+  /** 1.0 for exact/derived records; decays for fuzzy matches produced during lookup. */
+  confidence: number;
+}
+
+export type MatchType = 'exact' | 'simhash' | 'shingle' | 'quarantine-derived' | 'wrapper';
+
+export interface TaintMatch {
+  record: TaintRecord;
+  matchType: MatchType;
+  /** Dotted/bracketed path into the argument object where the match was found, e.g. "body.text[0]". */
+  argPath: string;
+  score: number;
+}
+
+export interface FuzzyLookupOpts {
+  simhashMaxDistance?: number;
+  /**
+   * Implemented as an overlap coefficient (|A∩B| / min(|A|,|B|)), not a plain
+   * Jaccard index — that's what makes a short malicious excerpt embedded in a
+   * much larger blob (or vice versa) still score highly. See DESIGN.md §4.2
+   * and taint/fingerprint.ts.
+   */
+  jaccardMin?: number;
+}
+
+export interface TaintRegistry {
+  register(
+    text: string,
+    provenance: ProvenanceTag,
+    level: TaintLevel,
+    sensitivity: SensitivityLabel,
+    derivedFrom?: string[],
+  ): TaintRecord;
+  lookupExact(text: string): TaintRecord | undefined;
+  lookupFuzzy(text: string, opts?: FuzzyLookupOpts): TaintMatch[];
+  getById(id: string): TaintRecord | undefined;
+  readonly size: number;
+}
+
+// ---------------------------------------------------------------------------
+// Layer 1 — in-process wrapper (best-effort fast path, never load-bearing —
+// see §4.3. Degrades silently; soundness never depends on it surviving.)
+// ---------------------------------------------------------------------------
+
+export const TAINT_BRAND: unique symbol = Symbol('tttb.taintedValue');
+
+export interface TaintedValue<T> {
+  readonly [TAINT_BRAND]: true;
+  readonly value: T;
+  readonly level: TaintLevel;
+  readonly sources: ProvenanceTag[];
+}
+
+// ---------------------------------------------------------------------------
+// Layer 0 — scope watermark (THE load-bearing safety boundary, §4.1)
+// ---------------------------------------------------------------------------
+
+export interface TaintWatermark {
+  level: TaintLevel;
+  /** Independent dimension: an escalator on policy decisions, never itself a gate (§3.2, §7.2). */
+  privateDataSeen: boolean;
+  /** Audit trail only — policy gating logic must never branch on the contents of this array. */
+  sources: ProvenanceTag[];
+}
+
+export type ScopeKind = 'session' | 'turn';
+
+export interface TaintScope {
+  kind: ScopeKind;
+  id: string;
+  watermark: TaintWatermark;
+}
+
+/**
+ * Whether `startNewTurn()` clears the watermark. 'session' (the default) never
+ * clears until an explicit declassify(); 'turn' is a lower-friction opt-in
+ * that trades soundness for usability — see GAPS.md #2 (cross-turn latent
+ * influence is a named, accepted gap of 'turn' mode).
+ */
+export type ResetScope = 'turn' | 'session';
+
+// ---------------------------------------------------------------------------
+// Sinks (§7.1)
+// ---------------------------------------------------------------------------
+
+export type SinkClass = 'EXEC' | 'MUTATE' | 'EXFIL' | 'NONE';
+
+export type SinkCapability =
+  | 'exec:shell'
+  | 'exec:code'
+  | 'write:fs'
+  | 'write:external-account'
+  | 'finance:purchase'
+  | 'irreversible:other'
+  | 'net:outbound'
+  | 'net:email'
+  | 'net:api-call'
+  | 'net:post-message';
+
+const CAPABILITY_TO_CLASS: Record<SinkCapability, SinkClass> = {
+  'exec:shell': 'EXEC',
+  'exec:code': 'EXEC',
+  'write:fs': 'MUTATE',
+  'write:external-account': 'MUTATE',
+  'finance:purchase': 'MUTATE',
+  'irreversible:other': 'MUTATE',
+  'net:outbound': 'EXFIL',
+  'net:email': 'EXFIL',
+  'net:api-call': 'EXFIL',
+  'net:post-message': 'EXFIL',
+};
+
+/** EXEC is the most severe class (needs no private data to be catastrophic, §3.2), then EXFIL, then MUTATE. */
+const CLASS_SEVERITY: Record<SinkClass, number> = { NONE: 0, MUTATE: 1, EXFIL: 2, EXEC: 3 };
+
+/** A tool with multiple capabilities spanning classes is gated by its most severe declared class. */
+export function sinkClassOf(capabilities: readonly SinkCapability[]): SinkClass {
+  let best: SinkClass = 'NONE';
+  for (const cap of capabilities) {
+    const cls = CAPABILITY_TO_CLASS[cap];
+    if (CLASS_SEVERITY[cls] > CLASS_SEVERITY[best]) best = cls;
+  }
+  return best;
+}
+
+export interface SinkCapabilities {
+  /** Empty ⇒ sinkClass NONE — the tool is not policy-gated at all. */
+  capabilities: SinkCapability[];
+  readsPrivateData?: { categories: string[] } | false;
+}
+
+export interface ToolExecutor<A = unknown, R = unknown> {
+  name: string;
+  capabilities: SinkCapabilities;
+  /** Does a successful call raise the watermark to RAW_UNTRUSTED? */
+  isSource?: boolean;
+  /** Deterministic/pure tools may opt out of raising even if isSource is set. */
+  trusted?: boolean;
+  execute(args: A): Promise<R>;
+}
+
+export interface ToolCall {
+  id: string;
+  toolName: string;
+  args: unknown;
+  sessionId: string;
+}
+
+// ---------------------------------------------------------------------------
+// Policy (§7)
+// ---------------------------------------------------------------------------
+
+export interface TaintContext {
+  matchedRecords: TaintMatch[];
+  /** Authoritative — read from the scope watermark, NOT derived from argument content. */
+  scopeLevel: TaintLevel;
+  /** Belt-and-suspenders signal from Layer 2; a policy may only use this to TIGHTEN a verdict. */
+  argFingerprintFloor: TaintLevel;
+  privateDataSeen: boolean;
+  sinkClass: SinkClass;
+}
+
+export type PolicyDecision =
+  | { action: 'ALLOW' }
+  | { action: 'ALLOW_WITH_WARNING'; reason: string }
+  | { action: 'REQUIRE_APPROVAL'; reason: string; approvalToken: string }
+  | { action: 'BLOCK'; reason: string }
+  | { action: 'QUARANTINE_AND_RETRY'; reason: string; suggestedSchemaId?: string };
+
+export type RequireApprovalDecision = Extract<PolicyDecision, { action: 'REQUIRE_APPROVAL' }>;
+
+export type PolicyFn = (call: ToolCall, taint: TaintContext) => Promise<PolicyDecision> | PolicyDecision;
+
+export interface ApprovalChannel {
+  /**
+   * Receives the full REQUIRE_APPROVAL decision (not just its reason string)
+   * so an implementation can bind its response to `decision.approvalToken`
+   * — e.g. an approval UI that generates a link/webhook keyed by the token
+   * and verifies a matching response before resolving true, rather than
+   * trusting that whatever comes back on this call corresponds to this
+   * particular request.
+   */
+  requestApproval(call: ToolCall, taint: TaintContext, decision: RequireApprovalDecision): Promise<boolean>;
+}
+
+export interface AuditEvent {
+  verdict: PolicyDecision;
+  call: ToolCall;
+  taint: TaintContext;
+  at: number;
+  /** Set when the underlying tool actually ran (ALLOW*, or REQUIRE_APPROVAL that was granted). */
+  executed: boolean;
+}
+
+export interface AuditSink {
+  record(event: AuditEvent): void;
+}
+
+// ---------------------------------------------------------------------------
+// The mandatory, sanctioned quarantine/summarize path (§6.2)
+// ---------------------------------------------------------------------------
+
+export interface QuarantineOpts<S = unknown> {
+  sessionId: string;
+  instructions?: string;
+  /** A narrow/enum/bounded schema tightens the result and is the actual safety property — see GAPS.md #4. */
+  schema?: { parse(x: unknown): S };
+  /** Input MUST be registry-known, not text the agent free-typed from memory (§6.2 step 1). */
+  sourceTaintRecordId: string;
+}
+
+export interface QuarantineResult<S = string> {
+  text: string;
+  value: S;
+  taintRecordId: string;
+  level: 'DERIVED_UNTRUSTED';
+}
+
+export type QuarantineFn = <S = string>(text: string, opts: QuarantineOpts<S>) => Promise<QuarantineResult<S>>;
+
+/**
+ * The actual LLM call an integrator supplies for the quarantine path. Must be
+ * capability-less: no tool access, no conversation history beyond `text` and
+ * `opts.instructions`. TTTB does not ship a default implementation — it has
+ * no opinion on which model/provider you use — see quarantine.ts.
+ */
+export type QuarantineImpl = <S = string>(
+  text: string,
+  opts: { instructions?: string; schema?: { parse(x: unknown): S } },
+) => Promise<S>;
+
+// ---------------------------------------------------------------------------
+// The broker (§7.3, §8)
+// ---------------------------------------------------------------------------
+
+export interface ToolCallBroker {
+  register(tool: ToolExecutor): void;
+  /** Registers `executor` and returns an interposed drop-in replacement whose execute() routes through call(). */
+  wrap<T extends ToolExecutor>(executor: T): T;
+  call(toolName: string, args: unknown): Promise<unknown>;
+
+  summarize: QuarantineFn;
+
+  /** Escape hook for untrusted content that reaches the model outside any tracked tool call — see GAPS.md #1. */
+  markContextExposure(source: { toolName?: string; note: string }, level?: TaintLevel): void;
+
+  /** Per `resetScope`: clears the watermark ('turn' mode) or is a no-op ('session' mode, the default). */
+  startNewTurn(): void;
+  /** The ONLY path that lowers a watermark. Explicit, audited, never an implicit side effect of an approval. */
+  declassify(reason: string, approvedBy: string): void;
+
+  readonly scope: Readonly<TaintScope>;
+  readonly registry: TaintRegistry;
+}
