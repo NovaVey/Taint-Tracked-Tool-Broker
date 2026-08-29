@@ -20,6 +20,8 @@ Once `RAW_UNTRUSTED` (or, for `EXEC` sinks, even `DERIVED_UNTRUSTED`) is set in 
 
 A `summarize()` call with an unconstrained free-text field lets an injected payload ride through largely intact, and `DERIVED_UNTRUSTED` policy is deliberately lighter than `RAW_UNTRUSTED` for `MUTATE`/`EXFIL` sinks — so a wide-open schema quietly reintroduces much of the risk the tier distinction exists to reduce. Narrow, typed schemas are the safety property; this is a documented usage discipline, not something the type system enforces.
 
+`summarize()`'s own input-provenance check (§6.2 step 1) requires `text` to be substantially derived from the claimed `sourceTaintRecordId` — a length-ratio cap plus an asymmetric shingle-coverage check (`quarantine.ts`), not a spoofing-proof verification. An adversarial input crafted to sit just inside both thresholds (e.g. a large genuine quote from the source padded with a modest amount of fabricated content, still under the length cap) can still pass. This closed a real, reproduced bypass found during review — a huge fabricated payload could ride through by borrowing a single shingle from a tiny source, because the original check used a symmetric overlap coefficient dominated by whichever side was smaller — but "closed the reproduced exploit" is not the same claim as "unspoofable."
+
 ## 5. Implicit/covert channels through an already-approved option set
 
 If a sink accepts a choice among a small number of pre-approved values (e.g. five hardcoded email templates) and only the choice itself is influenced by untrusted content, the watermark still gates the call correctly — but a design that allowlists specific argument values as always-safe (a common performance/usability optimization operators may add) can reopen a narrow signaling channel this library does not close.
@@ -63,6 +65,10 @@ The same cat-and-mouse dynamic seen in plagiarism-detection and spam-filter fing
 ## 15. Overclaiming disclaimer
 
 This design gates on "was untrusted content live in this scope's tracked context," which is a sound and conservative proxy for "did the model act on it" — but it is still a proxy. It cannot inspect the model's internal reasoning, so it cannot distinguish a privileged call the untrusted content genuinely influenced from one that happens to occur in the same scope but is entirely unrelated. Every claim of "catching summarize-then-act" in `DESIGN.md` should be read as "catching privileged actions taken while untrusted content was in tracked scope," not as evidence of true causal-influence detection.
+
+## 16. Non-cloneable tool-call arguments fall back to a shared, mutable reference
+
+`ToolCallBroker.call()` snapshots `args` (via `structuredClone`) so that what a human approves, what gets audited, and what actually executes can't silently diverge if something mutates the object in between (§ "Concurrency and args integrity" in `DESIGN.md`). `structuredClone` can't handle every JS value (functions, most class instances, etc.); when it throws, the broker falls back to the original live reference for that call, silently losing the isolation guarantee for that one call. Tool arguments are expected to be JSON-able in essentially all realistic tool-calling APIs, so this is a narrow edge case, but it is not enforced by the type system — a `ToolExecutor<A>` with a non-cloneable `A` re-opens the args-mutation risk item 16 exists to close.
 
 ## Not yet implemented (tracked, not silent)
 

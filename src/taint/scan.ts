@@ -27,6 +27,18 @@ export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanRe
     floor = maxLevel(floor, level);
   };
 
+  function checkStringLeaf(text: string, path: string): void {
+    const exact = registry.lookupExact(text);
+    if (exact) {
+      matches.push({ record: exact, matchType: 'exact', argPath: path, score: 1 });
+      bump(exact.level);
+    }
+    for (const match of registry.lookupFuzzy(text)) {
+      matches.push({ ...match, argPath: path });
+      bump(match.record.level);
+    }
+  }
+
   function visit(node: unknown, path: string): void {
     if (node === null || node === undefined) return;
 
@@ -44,15 +56,7 @@ export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanRe
     }
 
     if (typeof node === 'string') {
-      const exact = registry.lookupExact(node);
-      if (exact) {
-        matches.push({ record: exact, matchType: 'exact', argPath: path, score: 1 });
-        bump(exact.level);
-      }
-      for (const match of registry.lookupFuzzy(node)) {
-        matches.push({ ...match, argPath: path });
-        bump(match.record.level);
-      }
+      checkStringLeaf(node, path);
       return;
     }
 
@@ -63,7 +67,12 @@ export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanRe
 
     if (typeof node === 'object') {
       for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-        visit(value, path ? `${path}.${key}` : key);
+        // Untrusted text can be smuggled as an object KEY, not just a value
+        // (e.g. `{ [attackerText]: true }`) — scan the key itself as a
+        // string leaf too, not just what it maps to.
+        const childPath = path ? `${path}.${key}` : key;
+        checkStringLeaf(key, childPath);
+        visit(value, childPath);
       }
     }
   }

@@ -35,9 +35,9 @@ export class QuarantineInputUnknownError extends TaintBrokerError {
 
 /**
  * Thrown by broker.summarize() when `text` bears essentially no resemblance
- * to the record named by `sourceTaintRecordId`. This is a narrow check
- * (loose overlap threshold) — it catches "no relation at all" abuse, not a
- * determined spoof. See GAPS.md #4.
+ * to the record named by `sourceTaintRecordId` (too long relative to the
+ * source, or too little of `text`'s own content traces back to it). Not a
+ * spoofing-proof check — see DESIGN.md §6.2, GAPS.md #4.
  */
 export class QuarantineInputMismatchError extends TaintBrokerError {
   constructor(recordId: string) {
@@ -46,5 +46,52 @@ export class QuarantineInputMismatchError extends TaintBrokerError {
         'The claimed source and the text being quarantined must actually be related. See DESIGN.md §6.2, GAPS.md #4.',
     );
     this.name = 'QuarantineInputMismatchError';
+  }
+}
+
+/**
+ * Thrown by register()/wrap() when a tool declares itself both a source of
+ * untrusted content (isSource: true, not trusted) AND a privileged sink
+ * (non-empty capabilities). Such a tool can read and act on untrusted
+ * content within a single, un-gated call — the watermark that is supposed
+ * to gate its own sink behavior has no way to be raised until AFTER the
+ * call's privileged effect has already happened. Split it into two
+ * separate broker-mediated calls (a source-only fetch, then a sink-only
+ * act), or use the composite fetch-and-quarantine pattern in DESIGN.md
+ * §6.2's implementation note instead.
+ */
+export class DualRoleToolError extends TaintBrokerError {
+  constructor(toolName: string) {
+    super(
+      `Tool "${toolName}" is registered as both isSource:true (untrusted) and a privileged sink (non-empty capabilities). ` +
+        'A single call to such a tool could read and act on untrusted content before the watermark that gates its own ' +
+        'sink behavior is ever raised. Split it into a source-only call and a separate sink-only call, mark it trusted ' +
+        'if its source content is genuinely not attacker-influenceable, or use the fetch-and-quarantine pattern in ' +
+        'DESIGN.md §6.2\'s implementation note. See GAPS.md.',
+    );
+    this.name = 'DualRoleToolError';
+  }
+}
+
+/**
+ * Thrown when broker.call() is invoked reentrantly — from within a tool's
+ * own execute() (or anything it awaited) on the SAME broker instance,
+ * before the outer call has finished. Reentrant calls would deadlock the
+ * per-broker serialization lock that makes watermark raises atomic with
+ * respect to concurrently-dispatched calls (see DESIGN.md's concurrency
+ * implementation note). If a tool genuinely needs to invoke another
+ * registered tool, call that tool's own execute() directly and take
+ * responsibility for its policy implications yourself.
+ */
+export class ReentrantCallError extends TaintBrokerError {
+  constructor(toolName: string) {
+    super(
+      `Reentrant broker.call("${toolName}", ...) detected: a tool's execute() (or something it awaited) called ` +
+        "broker.call() again on the same broker instance before the outer call finished. This is not supported — it " +
+        'would deadlock the serialization lock that makes watermark raises atomic across concurrently-dispatched ' +
+        "calls. If a tool needs another registered tool's behavior, call its execute() directly instead of going " +
+        'back through the broker.',
+    );
+    this.name = 'ReentrantCallError';
   }
 }

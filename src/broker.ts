@@ -6,6 +6,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type {
   ApprovalChannel,
   AuditSink,
@@ -25,10 +26,10 @@ import { NOT_SENSITIVE, sinkClassOf } from './types.js';
 import { InMemoryTaintRegistry } from './taint/registry.js';
 import { createScope, declassifyScope, markPrivateDataSeen, raiseWatermark } from './taint/scope.js';
 import { scanArgsForTaint } from './taint/scan.js';
-import { exactHash } from './taint/fingerprint.js';
+import { exactHash, toRegistrableText } from './taint/fingerprint.js';
 import { defaultPolicy } from './policy/default-policy.js';
 import { createQuarantine, unconfiguredQuarantineImpl } from './quarantine.js';
-import { ToolCallBlockedError, UnknownToolError } from './errors.js';
+import { DualRoleToolError, ReentrantCallError, ToolCallBlockedError, UnknownToolError } from './errors.js';
 
 export interface BrokerOptions {
   sessionId?: string;
@@ -49,6 +50,15 @@ function blockedMessage(toolName: string, decision: { action: string; reason?: s
   return `Tool call "${toolName}" was not executed (${decision.action}): ${reason}`;
 }
 
+/** Best-effort deep clone for args snapshotting. Falls back to the original reference for values structuredClone can't handle (functions, etc.) — a documented residual gap, not silently unsafe for the common JSON-able-args case. */
+function safeClone<T>(value: T): T {
+  try {
+    return structuredClone(value);
+  } catch {
+    return value;
+  }
+}
+
 class Broker implements ToolCallBroker {
   private readonly sessionId: string;
   private readonly resetScopeMode: ResetScope;
@@ -57,6 +67,17 @@ class Broker implements ToolCallBroker {
   private readonly auditSink: AuditSink;
   private readonly tools = new Map<string, ToolExecutor>();
   private currentScope: TaintScope;
+
+  // Serializes every call() invocation on this broker instance so that a
+  // source call's watermark raise always happens-before any later call's
+  // gating decision reads that watermark, even under concurrent dispatch
+  // (e.g. an agent harness running a model's parallel tool_use blocks via
+  // Promise.all). See DESIGN.md's concurrency implementation note.
+  private lockTail: Promise<void> = Promise.resolve();
+  // Detects a tool's execute() calling broker.call() again on the same
+  // broker before the outer call finishes — that would deadlock the lock
+  // above, so it's rejected immediately instead.
+  private readonly reentrancyGuard = new AsyncLocalStorage<true>();
 
   readonly registry: TaintRegistry;
   readonly summarize: QuarantineFn;
@@ -79,6 +100,15 @@ class Broker implements ToolCallBroker {
   }
 
   register(tool: ToolExecutor): void {
+    const sinkClass = sinkClassOf(tool.capabilities.capabilities);
+    if (tool.isSource && !tool.trusted && sinkClass !== 'NONE') {
+      // A single call to a dual-role tool could read untrusted content and
+      // act on it in the same, un-gated step: the watermark that would
+      // gate its OWN sink behavior can't rise until after execute()
+      // resolves. Rejected at registration time — see errors.ts and
+      // GAPS.md.
+      throw new DualRoleToolError(tool.name);
+    }
     this.tools.set(tool.name, tool);
   }
 
@@ -89,10 +119,40 @@ class Broker implements ToolCallBroker {
   }
 
   async call(toolName: string, args: unknown): Promise<unknown> {
+    if (this.reentrancyGuard.getStore()) {
+      throw new ReentrantCallError(toolName);
+    }
+    return this.withLock(() => this.reentrancyGuard.run(true, () => this.dispatch(toolName, args)));
+  }
+
+  private async withLock<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = this.lockTail;
+    let release: () => void = () => {};
+    this.lockTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  private async dispatch(toolName: string, args: unknown): Promise<unknown> {
     const tool = this.tools.get(toolName);
     if (!tool) throw new UnknownToolError(toolName);
 
-    const call: ToolCall = { id: randomUUID(), toolName, args, sessionId: this.sessionId };
+    // One snapshot used everywhere a caller-visible record of "what was
+    // requested" is needed (policy, approval, audit) — never the live
+    // object — plus a second, independent snapshot handed to execute().
+    // Otherwise a tool that mutates its own args in place (an entirely
+    // ordinary pattern) silently corrupts what the approval channel showed
+    // a human and what the audit log records as having executed, since
+    // both would share one mutable reference with whatever execute() did
+    // to it.
+    const argsSnapshot = safeClone(args);
+    const call: ToolCall = { id: randomUUID(), toolName, args: argsSnapshot, sessionId: this.sessionId };
     const sinkClass = sinkClassOf(tool.capabilities.capabilities);
 
     let result: unknown;
@@ -101,9 +161,9 @@ class Broker implements ToolCallBroker {
       // Not a privileged sink: no gating, no audit record. Source tools
       // (fetch_url, read_email, ...) typically land here — their taint
       // effects are applied below, after execution, regardless of sinkClass.
-      result = await tool.execute(args);
+      result = await tool.execute(safeClone(args));
     } else {
-      const { matches, floor } = scanArgsForTaint(args, this.registry);
+      const { matches, floor } = scanArgsForTaint(argsSnapshot, this.registry);
       const taint: TaintContext = {
         matchedRecords: matches,
         scopeLevel: this.currentScope.watermark.level,
@@ -116,12 +176,12 @@ class Broker implements ToolCallBroker {
       let executed = false;
 
       if (decision.action === 'ALLOW' || decision.action === 'ALLOW_WITH_WARNING') {
-        result = await tool.execute(args);
+        result = await tool.execute(safeClone(args));
         executed = true;
       } else if (decision.action === 'REQUIRE_APPROVAL') {
-        const granted = this.approvalChannel ? await this.approvalChannel.requestApproval(call, taint, decision.reason) : false;
+        const granted = this.approvalChannel ? await this.approvalChannel.requestApproval(call, taint, decision) : false;
         if (granted) {
-          result = await tool.execute(args);
+          result = await tool.execute(safeClone(args));
           executed = true;
         }
       }
@@ -174,7 +234,7 @@ class Broker implements ToolCallBroker {
     }
 
     if (tool.isSource && !tool.trusted) {
-      const text = typeof result === 'string' ? result : JSON.stringify(result);
+      const text = toRegistrableText(result);
       const sensitivity = capabilities.readsPrivateData
         ? { containsPrivateData: true, categories: capabilities.readsPrivateData.categories }
         : NOT_SENSITIVE;

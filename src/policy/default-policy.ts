@@ -1,14 +1,15 @@
 /**
- * The default policy matrix (DESIGN.md §7.2).
- *
- * Two structural rules the panel's synthesis specifically fixed relative to
- * the source proposals — see DESIGN.md §3:
+ * The default policy matrix (DESIGN.md §7.2), table-driven so the two
+ * structural rules the panel's synthesis specifically fixed relative to the
+ * source proposals (see DESIGN.md §3) are each expressed exactly once
+ * instead of being hand-repeated across near-identical if/else branches:
  *
  *   1. Sink severity is keyed off capability class FIRST: EXEC is hard-gated
- *      by watermark level alone, never contingent on `privateDataSeen`.
+ *      by watermark level alone — the table's EXEC rows use the SAME action
+ *      for both the with- and without-private-data columns.
  *   2. `privateDataSeen` is an ESCALATOR (REQUIRE_APPROVAL -> BLOCK), never a
- *      GATE — an EXFIL/MUTATE call while untrusted content is live always
- *      requires at least approval, even with no private-data leg at all.
+ *      GATE — every RAW_UNTRUSTED/MUTATE and RAW_UNTRUSTED/EXFIL cell's
+ *      "without" column is REQUIRE_APPROVAL, never ALLOW*.
  *
  * This function only ever reads `taint.scopeLevel` to decide the base
  * verdict; `taint.argFingerprintFloor` (Layer 2) is applied afterwards, and
@@ -16,19 +17,77 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import type { PolicyDecision, PolicyFn, TaintContext } from '../types.js';
+import type { PolicyDecision, PolicyFn, SinkClass, TaintContext, TaintLevel } from '../types.js';
 import { LEVEL_ORDER } from '../types.js';
 
-function requireApproval(reason: string): PolicyDecision {
-  return { action: 'REQUIRE_APPROVAL', reason, approvalToken: randomUUID() };
+type Verdict = PolicyDecision['action'];
+
+interface MatrixCell {
+  /** Verdict when privateDataSeen is false. */
+  without: Verdict;
+  /** Verdict when privateDataSeen is true — equal to `without` for EXEC (never escalated further; already at its ceiling for that tier). */
+  withPrivateData: Verdict;
+  reasonWithout: string;
+  reasonWithPrivateData: string;
 }
 
-function block(reason: string): PolicyDecision {
-  return { action: 'BLOCK', reason };
-}
+const MATRIX: Record<Exclude<TaintLevel, 'CLEAN'>, Record<Exclude<SinkClass, 'NONE'>, MatrixCell>> = {
+  RAW_UNTRUSTED: {
+    EXEC: {
+      without: 'BLOCK',
+      withPrivateData: 'BLOCK',
+      reasonWithout: 'EXEC sink while untrusted content is live in this scope — unconditional block regardless of private-data exposure.',
+      reasonWithPrivateData: 'EXEC sink while untrusted content is live in this scope — unconditional block regardless of private-data exposure.',
+    },
+    MUTATE: {
+      without: 'REQUIRE_APPROVAL',
+      withPrivateData: 'BLOCK',
+      reasonWithout: 'MUTATE sink while untrusted content is live in this scope.',
+      reasonWithPrivateData: 'MUTATE sink while untrusted content is live in scope AND private data has been read this scope (lethal-trifecta escalation).',
+    },
+    EXFIL: {
+      without: 'REQUIRE_APPROVAL',
+      withPrivateData: 'BLOCK',
+      reasonWithout: 'EXFIL sink while untrusted content is live in this scope.',
+      reasonWithPrivateData: 'EXFIL sink with untrusted content live in scope AND private data read this scope — full lethal trifecta.',
+    },
+  },
+  DERIVED_UNTRUSTED: {
+    EXEC: {
+      without: 'REQUIRE_APPROVAL',
+      withPrivateData: 'REQUIRE_APPROVAL',
+      reasonWithout: 'EXEC sink after content was only quarantine-derived — still requires approval unconditionally, never gated only by the trifecta.',
+      reasonWithPrivateData:
+        'EXEC sink after content was only quarantine-derived — still requires approval unconditionally, never gated only by the trifecta.',
+    },
+    MUTATE: {
+      without: 'ALLOW_WITH_WARNING',
+      withPrivateData: 'REQUIRE_APPROVAL',
+      reasonWithout: 'MUTATE sink after quarantine-derived exposure only; no private data read this scope.',
+      reasonWithPrivateData: 'MUTATE sink after quarantine-derived exposure, with private data also read this scope.',
+    },
+    EXFIL: {
+      without: 'ALLOW_WITH_WARNING',
+      withPrivateData: 'REQUIRE_APPROVAL',
+      reasonWithout: 'EXFIL sink after quarantine-derived exposure only; no private data read this scope.',
+      reasonWithPrivateData: 'EXFIL sink after quarantine-derived exposure, with private data also read this scope (full trifecta).',
+    },
+  },
+};
 
-function allowWithWarning(reason: string): PolicyDecision {
-  return { action: 'ALLOW_WITH_WARNING', reason };
+function toDecision(verdict: Verdict, reason: string): PolicyDecision {
+  switch (verdict) {
+    case 'ALLOW':
+      return { action: 'ALLOW' };
+    case 'ALLOW_WITH_WARNING':
+      return { action: 'ALLOW_WITH_WARNING', reason };
+    case 'REQUIRE_APPROVAL':
+      return { action: 'REQUIRE_APPROVAL', reason, approvalToken: randomUUID() };
+    case 'BLOCK':
+      return { action: 'BLOCK', reason };
+    case 'QUARANTINE_AND_RETRY':
+      return { action: 'QUARANTINE_AND_RETRY', reason };
+  }
 }
 
 function baseDecision(taint: TaintContext): PolicyDecision {
@@ -38,34 +97,8 @@ function baseDecision(taint: TaintContext): PolicyDecision {
     return { action: 'ALLOW' };
   }
 
-  if (scopeLevel === 'RAW_UNTRUSTED') {
-    if (sinkClass === 'EXEC') {
-      return block('EXEC sink while untrusted content is live in this scope — unconditional block regardless of private-data exposure.');
-    }
-    if (sinkClass === 'MUTATE') {
-      return privateDataSeen
-        ? block('MUTATE sink while untrusted content is live in scope AND private data has been read this scope (lethal-trifecta escalation).')
-        : requireApproval('MUTATE sink while untrusted content is live in this scope.');
-    }
-    // EXFIL
-    return privateDataSeen
-      ? block('EXFIL sink with untrusted content live in scope AND private data read this scope — full lethal trifecta.')
-      : requireApproval('EXFIL sink while untrusted content is live in this scope.');
-  }
-
-  // scopeLevel === 'DERIVED_UNTRUSTED' — content only reached the model via the sanctioned quarantine path.
-  if (sinkClass === 'EXEC') {
-    return requireApproval('EXEC sink after content was only quarantine-derived — still requires approval unconditionally, never gated only by the trifecta.');
-  }
-  if (sinkClass === 'MUTATE') {
-    return privateDataSeen
-      ? requireApproval('MUTATE sink after quarantine-derived exposure, with private data also read this scope.')
-      : allowWithWarning('MUTATE sink after quarantine-derived exposure only; no private data read this scope.');
-  }
-  // EXFIL
-  return privateDataSeen
-    ? requireApproval('EXFIL sink after quarantine-derived exposure, with private data also read this scope (full trifecta).')
-    : allowWithWarning('EXFIL sink after quarantine-derived exposure only; no private data read this scope.');
+  const cell = MATRIX[scopeLevel][sinkClass];
+  return privateDataSeen ? toDecision(cell.withPrivateData, cell.reasonWithPrivateData) : toDecision(cell.without, cell.reasonWithout);
 }
 
 export const defaultPolicy: PolicyFn = (_call, taint) => {
@@ -84,7 +117,8 @@ export const defaultPolicy: PolicyFn = (_call, taint) => {
     LEVEL_ORDER[taint.argFingerprintFloor] > LEVEL_ORDER[taint.scopeLevel] &&
     (decision.action === 'ALLOW' || decision.action === 'ALLOW_WITH_WARNING')
   ) {
-    return requireApproval(
+    return toDecision(
+      'REQUIRE_APPROVAL',
       'A fingerprint match ties this argument to an untrusted source at a higher level than the current scope watermark reports (e.g. after a turn reset).',
     );
   }

@@ -68,12 +68,11 @@ export function shingleHashesOf(text: string): Uint32Array {
 }
 
 /**
- * Overlap coefficient |A∩B| / min(|A|,|B|) between two sorted, deduplicated
- * hash sets. Both inputs are sorted ascending, so intersection is a linear
- * merge — no quadratic scan even for large shingle sets.
+ * |A∩B| between two sorted, deduplicated hash sets. Both inputs are sorted
+ * ascending, so this is a linear merge — no quadratic scan even for large
+ * shingle sets.
  */
-export function overlapCoefficient(a: Uint32Array, b: Uint32Array): number {
-  if (a.length === 0 || b.length === 0) return 0;
+export function shingleIntersectionSize(a: Uint32Array, b: Uint32Array): number {
   let i = 0;
   let j = 0;
   let intersection = 0;
@@ -88,7 +87,25 @@ export function overlapCoefficient(a: Uint32Array, b: Uint32Array): number {
       j++;
     }
   }
-  return intersection / Math.min(a.length, b.length);
+  return intersection;
+}
+
+/**
+ * Overlap coefficient |A∩B| / min(|A|,|B|) — symmetric containment: high
+ * whenever EITHER set is (almost) fully covered by the other, which is what
+ * catches a short excerpt embedded in a large blob just as well as a large
+ * source condensed to a short quote. This is the right measure for Layer 2
+ * fuzzy *matching* (registry.ts), where either direction is a legitimate hit.
+ *
+ * It is deliberately NOT used for validating quarantine input provenance
+ * (quarantine.ts) — there the question is asymmetric ("is `text` mostly
+ * accounted for by `source`?"), and min()-based scoring is exactly what lets
+ * a large fabricated `text` borrow a tiny source's high score. See
+ * quarantine.ts's own asymmetric check.
+ */
+export function overlapCoefficient(a: Uint32Array, b: Uint32Array): number {
+  if (a.length === 0 || b.length === 0) return 0;
+  return shingleIntersectionSize(a, b) / Math.min(a.length, b.length);
 }
 
 /**
@@ -141,4 +158,9 @@ export function buildFingerprint(text: string): Fingerprint {
     shingleHashes: shingleHashesOf(text),
     length: text.length,
   };
+}
+
+/** Shared text-coercion for anything that gets registered/hashed: strings pass through, everything else is JSON-stringified. */
+export function toRegistrableText(value: unknown): string {
+  return typeof value === 'string' ? value : JSON.stringify(value);
 }

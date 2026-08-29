@@ -251,10 +251,20 @@ export type PolicyDecision =
   | { action: 'BLOCK'; reason: string }
   | { action: 'QUARANTINE_AND_RETRY'; reason: string; suggestedSchemaId?: string };
 
+export type RequireApprovalDecision = Extract<PolicyDecision, { action: 'REQUIRE_APPROVAL' }>;
+
 export type PolicyFn = (call: ToolCall, taint: TaintContext) => Promise<PolicyDecision> | PolicyDecision;
 
 export interface ApprovalChannel {
-  requestApproval(call: ToolCall, taint: TaintContext, reason: string): Promise<boolean>;
+  /**
+   * Receives the full REQUIRE_APPROVAL decision (not just its reason string)
+   * so an implementation can bind its response to `decision.approvalToken`
+   * — e.g. an approval UI that generates a link/webhook keyed by the token
+   * and verifies a matching response before resolving true, rather than
+   * trusting that whatever comes back on this call corresponds to this
+   * particular request.
+   */
+  requestApproval(call: ToolCall, taint: TaintContext, decision: RequireApprovalDecision): Promise<boolean>;
 }
 
 export interface AuditEvent {

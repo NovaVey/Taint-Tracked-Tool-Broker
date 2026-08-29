@@ -11,14 +11,39 @@
 
 import { randomUUID } from 'node:crypto';
 import type { ProvenanceTag, QuarantineFn, QuarantineImpl, QuarantineOpts, QuarantineResult, TaintRegistry } from './types.js';
-import { buildFingerprint, exactHash, overlapCoefficient } from './taint/fingerprint.js';
+import { buildFingerprint, exactHash, shingleIntersectionSize, toRegistrableText } from './taint/fingerprint.js';
 import { QuarantineInputMismatchError, QuarantineInputUnknownError } from './errors.js';
 
-// Deliberately loose: a real summarize() call may legitimately use only a
-// slice of the source. This only catches "claims a source it bears no
-// relation to at all" abuse — it is not a spoofing-proof check. See
+// Two independent, asymmetric checks — text must be substantially DERIVED
+// FROM the claimed source, not merely similar to it. Neither alone is
+// enough: a min()-based overlap coefficient (the general-purpose Layer 2
+// matcher in fingerprint.ts) lets a large fabricated `text` inherit a tiny
+// source's high score just by borrowing one shared shingle, since min()
+// picks the smaller (source's) shingle count as the denominator. Both
+// checks below are deliberately relative to `text`'s OWN size instead:
+//
+//   1. Length ratio — a genuine quarantine input is not many times LONGER
+//      than its claimed source. This alone rejects "borrow one shingle
+//      from a tiny source, pad with 90KB of fabricated content" before
+//      even building a fingerprint for it.
+//   2. Source coverage — what fraction of TEXT's own shingles are
+//      accounted for by the source, i.e. intersection / |text's shingles|
+//      (not min(|text|,|source|)). A genuine excerpt of the source scores
+//      close to 1.0 here; a mostly-fabricated payload with a few borrowed
+//      shingles scores close to 0.
+//
+// Still not a spoofing-proof check (a sufficiently large verbatim quote
+// padded with a small amount of fabricated content still passes) — see
 // DESIGN.md §6.2 step 1 and GAPS.md #4.
-const MIN_OVERLAP_WITH_CLAIMED_SOURCE = 0.15;
+const MAX_LENGTH_EXPANSION = 2; // text may be at most this many times longer than its claimed source
+// Deliberately loose: a short claimed excerpt can lose a large FRACTION of
+// its shingles to a single small edit (inserting one word near the middle
+// of a 12-word text can shift half its 5-word windows) even though it is
+// obviously still substantially the same content. The length-ratio check
+// above is the primary defense against the "large fabricated payload"
+// shape this exists to catch; this is a secondary, coarser check for
+// same-sized-but-unrelated text.
+const MIN_SOURCE_COVERAGE = 0.3; // fraction of text's own shingles that must trace back to the source
 
 export function createQuarantine(impl: QuarantineImpl, registry: TaintRegistry, raiseToDerivedUntrusted: (tag: ProvenanceTag) => void): QuarantineFn {
   return async function summarize<S = string>(text: string, opts: QuarantineOpts<S>): Promise<QuarantineResult<S>> {
@@ -28,9 +53,15 @@ export function createQuarantine(impl: QuarantineImpl, registry: TaintRegistry, 
     }
 
     if (exactHash(text) !== sourceRecord.id) {
+      if (text.length > sourceRecord.fingerprint.length * MAX_LENGTH_EXPANSION) {
+        throw new QuarantineInputMismatchError(opts.sourceTaintRecordId);
+      }
       const inputFingerprint = buildFingerprint(text);
-      const overlap = overlapCoefficient(inputFingerprint.shingleHashes, sourceRecord.fingerprint.shingleHashes);
-      if (overlap < MIN_OVERLAP_WITH_CLAIMED_SOURCE) {
+      const coverage =
+        inputFingerprint.shingleHashes.length === 0
+          ? 0
+          : shingleIntersectionSize(inputFingerprint.shingleHashes, sourceRecord.fingerprint.shingleHashes) / inputFingerprint.shingleHashes.length;
+      if (coverage < MIN_SOURCE_COVERAGE) {
         throw new QuarantineInputMismatchError(opts.sourceTaintRecordId);
       }
     }
@@ -39,7 +70,7 @@ export function createQuarantine(impl: QuarantineImpl, registry: TaintRegistry, 
     if (opts.instructions !== undefined) implOpts.instructions = opts.instructions;
     if (opts.schema !== undefined) implOpts.schema = opts.schema;
     const value = await impl<S>(text, implOpts);
-    const outText = typeof value === 'string' ? value : JSON.stringify(value);
+    const outText = toRegistrableText(value);
 
     // The broker's own code — not the summarizing LLM — unconditionally
     // registers the result. This edge cannot be suppressed or spoofed even

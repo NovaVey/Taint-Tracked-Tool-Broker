@@ -33,6 +33,26 @@ describe('InMemoryTaintRegistry', () => {
     expect(second.level).toBe('RAW_UNTRUSTED');
   });
 
+  it('re-registration never downgrades an existing record’s level, in either direction', () => {
+    const registry = new InMemoryTaintRegistry();
+    registry.register(SOURCE, tag(), 'DERIVED_UNTRUSTED', NOT_SENSITIVE);
+    // A later registration of the byte-identical text at a WEAKER level
+    // (e.g. an unrelated integrator call registering known boilerplate as
+    // CLEAN, per DESIGN.md §6.2's implementation note) must not silently
+    // erase the stronger label already on record.
+    const second = registry.register(SOURCE, tag(), 'CLEAN', NOT_SENSITIVE);
+    expect(registry.size).toBe(1);
+    expect(second.level).toBe('DERIVED_UNTRUSTED');
+    expect(registry.getById(second.id)?.level).toBe('DERIVED_UNTRUSTED');
+  });
+
+  it('re-registration unions sensitivity rather than dropping it', () => {
+    const registry = new InMemoryTaintRegistry();
+    registry.register(SOURCE, tag(), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+    const second = registry.register(SOURCE, tag(), 'RAW_UNTRUSTED', { containsPrivateData: true, categories: ['credentials'] });
+    expect(second.sensitivity).toEqual({ containsPrivateData: true, categories: ['credentials'] });
+  });
+
   it('finds a fuzzy match for a wrapped/lightly-edited excerpt but not for unrelated text', () => {
     const registry = new InMemoryTaintRegistry();
     registry.register(SOURCE, tag(), 'RAW_UNTRUSTED', NOT_SENSITIVE);

@@ -45,6 +45,7 @@ export type {
   ToolCall,
   TaintContext,
   PolicyDecision,
+  RequireApprovalDecision,
   PolicyFn,
   ApprovalChannel,
   AuditEvent,
@@ -64,7 +65,16 @@ export type { BrokerOptions } from './broker.js';
 export { defaultPolicy } from './policy/default-policy.js';
 
 export { InMemoryTaintRegistry } from './taint/registry.js';
-export { buildFingerprint, computeSimhash, exactHash, hammingDistance, overlapCoefficient, wordShingles } from './taint/fingerprint.js';
+export {
+  buildFingerprint,
+  computeSimhash,
+  exactHash,
+  hammingDistance,
+  overlapCoefficient,
+  shingleIntersectionSize,
+  toRegistrableText,
+  wordShingles,
+} from './taint/fingerprint.js';
 export { scanArgsForTaint } from './taint/scan.js';
 export type { ScanResult } from './taint/scan.js';
 export { createScope, createWatermark, declassifyScope, markPrivateDataSeen, raiseWatermark } from './taint/scope.js';
@@ -80,4 +90,12 @@ export {
 
 export { unconfiguredQuarantineImpl } from './quarantine.js';
 
-export { TaintBrokerError, ToolCallBlockedError, UnknownToolError, QuarantineInputMismatchError, QuarantineInputUnknownError } from './errors.js';
+export {
+  TaintBrokerError,
+  ToolCallBlockedError,
+  UnknownToolError,
+  QuarantineInputMismatchError,
+  QuarantineInputUnknownError,
+  DualRoleToolError,
+  ReentrantCallError,
+} from './errors.js';

@@ -10,7 +10,8 @@
  */
 
 import type { FuzzyLookupOpts, ProvenanceTag, SensitivityLabel, TaintLevel, TaintMatch, TaintRecord, TaintRegistry } from '../types.js';
-import { buildFingerprint, hammingDistance, overlapCoefficient } from './fingerprint.js';
+import { maxLevel } from '../types.js';
+import { buildFingerprint, exactHash, hammingDistance, overlapCoefficient } from './fingerprint.js';
 
 const DEFAULT_SIMHASH_MAX_DISTANCE = 3; // out of 64 bits
 const DEFAULT_OVERLAP_MIN = 0.6;
@@ -34,9 +35,18 @@ export class InMemoryTaintRegistry implements TaintRegistry {
     const fingerprint = buildFingerprint(text);
     const existing = this.byExactHash.get(fingerprint.exactHash);
     if (existing) {
-      // Same content seen again (e.g. re-fetched page): keep the strongest
-      // level/provenance rather than silently shadowing it with a duplicate.
-      existing.level = existing.level === 'RAW_UNTRUSTED' || level === 'RAW_UNTRUSTED' ? 'RAW_UNTRUSTED' : level;
+      // Same content seen again (e.g. re-fetched page, or a second source
+      // exposing identical text): the record's level and sensitivity are
+      // monotonic across re-registration — never let a later, weaker
+      // registration silently downgrade what's already known. Provenance
+      // intentionally stays first-seen (stable attribution for "where did
+      // this first enter the system"); level/sensitivity are the safety-
+      // relevant fields and must only ever strengthen.
+      existing.level = maxLevel(existing.level, level);
+      existing.sensitivity = {
+        containsPrivateData: existing.sensitivity.containsPrivateData || sensitivity.containsPrivateData,
+        categories: Array.from(new Set([...existing.sensitivity.categories, ...sensitivity.categories])),
+      };
       return existing;
     }
     const record: TaintRecord = {
@@ -54,7 +64,7 @@ export class InMemoryTaintRegistry implements TaintRegistry {
   }
 
   lookupExact(text: string): TaintRecord | undefined {
-    return this.byExactHash.get(buildFingerprint(text).exactHash);
+    return this.byExactHash.get(exactHash(text));
   }
 
   lookupFuzzy(text: string, opts: FuzzyLookupOpts = {}): TaintMatch[] {
