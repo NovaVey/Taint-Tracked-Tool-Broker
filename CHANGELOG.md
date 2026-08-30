@@ -4,6 +4,8 @@ All notable changes to this project are documented here. Format loosely follows 
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-30
+
 ### Added
 
 - **Test coverage reporting** (`npm run coverage`, `vitest.config.ts`): v8-provider coverage over `src/**`, enforced in CI as a real gate (a dedicated `coverage` job, separate from the Node 20/22/24 test matrix) rather than just a report — thresholds are set a few points below the actual measured coverage as of this change (statements 96.32% / branches 91.82% / functions 99.21% / lines 98.03%) so a genuine regression fails CI without ordinary refactors tripping it.
@@ -16,6 +18,10 @@ All notable changes to this project are documented here. Format loosely follows 
 - **Docs + tests, no code**: `DESIGN.md` §6.2's dual-model-split note previously said the Q-LLM's tool-access isolation is not something this library enforces. It turns out it already was, as a side effect of GAPS.md #17's reentrancy guard: a `QuarantineImpl` callback attempting `broker.call()` (top-level or nested inside a composite fetch-and-quarantine tool) is rejected with `ReentrantCallError`, same as a tool's `execute()` re-entering the broker. New regression tests in `test/broker.spec.ts` prove this rather than just asserting it; `ReentrantCallError`'s message now names the quarantine-callback scenario alongside the original tool-execute() one.
 - **`diffProposedArgs()`** (`src/taint/counterfactual-diff.ts`, GAPS.md #15): a pure, stateless structural diff between two proposed tool-call argument trees — the shipped half of the "counterfactual argument diffing" research direction DESIGN.md §6 already named. An integrator who has done their own counterfactual re-run (re-invoking their model with tainted content excised — this library has no model access to do that part itself) calls this to get precise, path-tagged diffs (the same dotted/bracketed convention as `TaintMatch.argPath`) between what was actually proposed and what the re-run proposed, instead of hand-writing the tree-walking themselves. Purely diagnostic: never touches the broker, a scope, or any policy decision. `Date`/`RegExp` are compared by content; any other non-plain value (`Map`, `Set`, a class instance) by reference rather than silently misrepresented via naive key-enumeration (the same failure mode `jsonSafeClone()` fails loud on instead of risking) — reference equality can only ever over-report a divergence, never hide a real one.
 - **`BrokerOptions.warnOnLikelyUnclassifiedSink`** (GAPS.md #10): an opt-in advisory heuristic mirroring `warnOnLikelyUnmarkedSource` (GAPS.md #1) for the mirror-image gap — flags, via an `ALLOW_WITH_WARNING` `AuditEvent` at `register()`/`wrap()` time, a tool declared with empty `capabilities` (`sinkClass: 'NONE'`, invisible to every policy check) whose `name` contains a keyword (`write`, `delete`, `exec`, `send`, `purchase`, ... — tunable, `true` uses a sensible default list) that often indicates a mutating/dangerous action. The common real-world trigger this narrows: an ordinary tool whose `capabilities` array was simply left empty by mistake, not a deliberately-deceptive one — GAPS.md #10 is explicit that this heuristic cannot catch the latter, or a tool whose real behavior doesn't show up in its name at all. Purely advisory: never changes what's registered or gates anything on its own. New reserved synthetic tool name `__tttb_registration_warning` for this event.
+
+### Fixed
+
+- README.md's injection-corpus counterfactual-baseline numbers had drifted stale after `egress-allowlist-blocks-unapproved-host` was added to the corpus (still quoting 13 non-benign cases / 10 prevented; the corpus reports 14 / 11 as of this release) — corrected against a fresh `npm run corpus` run rather than assumed.
 
 ## [0.1.0] - 2026-08-30
 
