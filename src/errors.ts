@@ -151,6 +151,32 @@ export class UnplannedPrivilegedActionError extends TaintBrokerError {
 }
 
 /**
+ * Thrown by a registerRawForQuarantine()-wrapped tool's execute() when its
+ * result can't be turned into the `{ text, taintRecordId }` pair the helper
+ * promises: either the result isn't text-representable (toRegistrableText()
+ * threw — e.g. a circular object) or, in the narrow window between this
+ * call's own registration and this check, the record was evicted from the
+ * registry (a bounded `maxEntries` registry under heavy concurrent use —
+ * see GAPS.md #13). The underlying tool call already executed and the
+ * watermark already raised by this point; only the id lookup this helper
+ * exists to save callers from doing themselves has failed. Call
+ * broker.summarize() manually with a taintRecordId obtained another way, or
+ * avoid registerRawForQuarantine() for tools whose results aren't
+ * text/JSON-representable.
+ */
+export class QuarantineSourceUnavailableError extends TaintBrokerError {
+  constructor(toolName: string, cause?: unknown) {
+    super(
+      `registerRawForQuarantine()-wrapped tool "${toolName}" executed successfully, but its result could not be ` +
+        'resolved to a taintRecordId for summarize(). Either the result is not text/JSON-representable, or the ' +
+        'record was evicted from the registry before it could be looked up (see GAPS.md #13).',
+      cause !== undefined ? { cause } : undefined,
+    );
+    this.name = 'QuarantineSourceUnavailableError';
+  }
+}
+
+/**
  * Thrown when broker.call() is invoked reentrantly — from within a tool's
  * own execute() (or anything it awaited) on the SAME broker instance,
  * before the outer call has finished. Reentrant calls would deadlock the
