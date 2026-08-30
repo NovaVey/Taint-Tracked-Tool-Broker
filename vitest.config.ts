@@ -4,7 +4,9 @@ export default defineConfig({
   test: {
     coverage: {
       provider: 'v8',
-      reporter: ['text', 'text-summary', 'json-summary', 'html'],
+      // lcov is for Codecov's upload action (ci.yml's coverage job); the
+      // rest are for local/CI-log human reading.
+      reporter: ['text', 'text-summary', 'json-summary', 'html', 'lcov'],
       // Only src/ is the shipped library surface — corpus/, examples/, and
       // bench/ are exercised by their own scripts (npm run corpus / example* /
       // bench*), not by vitest, and types.ts is declarations with no

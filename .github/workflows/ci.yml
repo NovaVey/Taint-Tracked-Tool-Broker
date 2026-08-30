@@ -41,3 +41,11 @@ jobs:
       # below them. Runs once (not across the full Node matrix above) since
       # V8 coverage isn't meaningfully Node-version-sensitive here.
       - run: npm run coverage
+      # Feeds the live README badge. fail_ci_if_error defaults to false —
+      # a Codecov outage or a not-yet-configured CODECOV_TOKEN secret
+      # shouldn't fail this repo's own CI; the coverage thresholds above
+      # already are the real gate.
+      - uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/lcov.info

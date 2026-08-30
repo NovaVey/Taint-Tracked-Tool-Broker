@@ -2,6 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/taint-tracked-tool-broker.svg)](https://www.npmjs.com/package/taint-tracked-tool-broker)
 [![CI](https://github.com/NovaVey/Taint-Tracked-Tool-Broker/actions/workflows/ci.yml/badge.svg)](https://github.com/NovaVey/Taint-Tracked-Tool-Broker/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/NovaVey/Taint-Tracked-Tool-Broker/graph/badge.svg)](https://codecov.io/gh/NovaVey/Taint-Tracked-Tool-Broker)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](./LICENSE)
 [![Node.js >= 20](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178c6.svg)](https://www.typescriptlang.org/)
