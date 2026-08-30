@@ -1731,14 +1731,29 @@ describe('allowedOutboundHosts (opt-in egress allowlist, DESIGN.md §7.4)', () =
     expect(result).toContain('wrote:');
   });
 
-  it('does not fire when the call carries no http(s) URL argument at all — documented scope boundary, not a general egress-classification mechanism', async () => {
+  it('blocks a send_email call whose recipient address is on a host not in the allowlist — email addresses are checked too, not just http(s) URLs (GAPS.md #18)', async () => {
     const broker = createBroker({ allowedOutboundHosts: ['approved.example'] });
     broker.register(sendEmail());
-    // send_email's `to` is an email address, not a URL — findOutboundHosts
+    await expect(
+      broker.call('send_email', { to: 'x@not-approved.example', body: 'hi' }),
+    ).rejects.toBeInstanceOf(DisallowedOutboundHostError);
+  });
+
+  it('allows a send_email call whose recipient address IS on an allowlisted host', async () => {
+    const broker = createBroker({ allowedOutboundHosts: ['approved.example'] });
+    broker.register(sendEmail());
+    const result = await broker.call('send_email', { to: 'x@approved.example', body: 'hi' });
+    expect(result).toContain('sent:');
+  });
+
+  it('does not fire when the call carries no http(s) URL or email-address argument at all — documented scope boundary, not a general egress-classification mechanism', async () => {
+    const broker = createBroker({ allowedOutboundHosts: ['approved.example'] });
+    broker.register(netPost());
+    // A bare recipient id, not a URL or an email address — findOutboundHosts
     // finds nothing to check, so this call is invisible to the allowlist
     // (GAPS.md #18). The normal policy still applies (CLEAN scope -> ALLOW).
-    const result = await broker.call('send_email', { to: 'x@example.com', body: 'hi' });
-    expect(result).toContain('sent:');
+    const result = await broker.call('net_post', { recipientId: 'user-4471', body: 'hi' });
+    expect(result).toContain('posted:');
   });
 
   it('is additive: an allowlisted host still goes through the normal policy check afterward, and can still be blocked by it', async () => {

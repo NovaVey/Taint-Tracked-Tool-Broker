@@ -7,6 +7,7 @@ All notable changes to this project are documented here. Format loosely follows 
 ### Added
 
 - **`.github/workflows/release.yml` now creates an actual GitHub Release**, not just a git tag, after a successful npm publish — a plain tag never got the repo's Releases page "Latest" badge, since that's a separate GitHub object a tag alone doesn't create. Uses the runner's preinstalled `gh` CLI (no new third-party Action) with `--generate-notes`; `permissions.contents` bumped from `read` to `write` accordingly.
+- **`allowedOutboundHosts` now also detects email-address destinations, not just `http(s)` URLs** (`taint/egress.ts`'s `findOutboundHosts`, GAPS.md #18): a `net:email` sink's recipient carries no scheme at all, so it was previously the single most consequential blind spot named in that gap entry — the flagship example GAPS.md #18 itself opened with. Uses an anchored (whole-string) email-address pattern, deliberately more conservative than a generic "looks like a hostname" heuristic (considered and rejected — too high a false-positive risk for a hard-`BLOCK`-capable check, unlike this library's advisory-only `warnOnLikely*` heuristics). New corpus case `egress-allowlist-blocks-unapproved-email-recipient` demonstrates the distinguishing behavior via `send_email`, alongside the existing URL-based case. GAPS.md #18 and DESIGN.md §7.4 updated to name exactly what's newly covered and what still isn't (a bare hostname with no scheme and no `@`, or a destination assembled across multiple argument fields, remain invisible on purpose).
 
 ## [0.2.0] - 2026-08-30
 

@@ -20,12 +20,17 @@ describe('findOutboundHosts', () => {
     expect(findOutboundHosts({ body: 'not a url, just some text' })).toEqual([]);
   });
 
+  it('skips null/undefined leaves without erroring, and still finds a genuine host alongside them', () => {
+    expect(findOutboundHosts({ a: null, b: undefined, c: 'https://a.example' })).toEqual([
+      'a.example',
+    ]);
+  });
+
   it('does not treat a URL-shaped object KEY as a host — only values are scanned', () => {
     expect(findOutboundHosts({ 'https://attacker.example': true })).toEqual([]);
   });
 
-  it('ignores non-http(s) URL schemes (e.g. mailto:, file:) — this check is scoped to http(s) egress only', () => {
-    expect(findOutboundHosts({ target: 'mailto:someone@example.com' })).toEqual([]);
+  it('ignores a non-http(s), non-email URL scheme (e.g. file:) — this check is scoped to http(s) and email egress only', () => {
     expect(findOutboundHosts({ target: 'file:///etc/passwd' })).toEqual([]);
   });
 
@@ -41,6 +46,45 @@ describe('findOutboundHosts', () => {
     // without this module needing to know about the taint-wrapper brand.
     const wrapped = { value: 'https://c.example/z', level: 'RAW_UNTRUSTED', sources: [] };
     expect(findOutboundHosts(wrapped)).toEqual(['c.example']);
+  });
+
+  // GAPS.md #18's own flagship named example of what used to be invisible:
+  // a net:email sink's recipient carries no http(s):// scheme at all.
+  describe('email-address destinations (GAPS.md #18)', () => {
+    it('finds the domain of a genuine email address in a plain string value', () => {
+      expect(findOutboundHosts({ to: 'someone@attacker.example' })).toEqual(['attacker.example']);
+    });
+
+    it('lowercases the extracted domain, matching the convention URL.hostname already normalizes to', () => {
+      expect(findOutboundHosts({ to: 'Someone@ATTACKER.Example' })).toEqual(['attacker.example']);
+    });
+
+    it('a mailto: URI is caught via the email path even though its scheme is not http(s)', () => {
+      // Its local part happens to include the "mailto:" prefix text, which
+      // is harmless — the destination domain extracted is still correct.
+      expect(findOutboundHosts({ target: 'mailto:someone@example.com' })).toEqual(['example.com']);
+    });
+
+    it('does not match prose that merely contains an "@" — the whole string must be email-shaped (anchored match)', () => {
+      expect(findOutboundHosts({ body: 'reach me at someone@example.com please' })).toEqual([]);
+    });
+
+    it('does not match a bare "@handle" or a domain with no dot (e.g. an internal hostname) — avoids over-eager false positives on a hard-blocking check', () => {
+      expect(findOutboundHosts({ handle: '@someone' })).toEqual([]);
+      expect(findOutboundHosts({ to: 'user@localhost' })).toEqual([]);
+    });
+
+    it('does not treat an email-shaped object KEY as a host — only values are scanned, same as the URL case', () => {
+      expect(findOutboundHosts({ 'someone@attacker.example': true })).toEqual([]);
+    });
+
+    it('finds an email domain nested at any depth, across arrays and objects', () => {
+      expect(
+        findOutboundHosts({
+          recipients: [{ email: 'a@a.example' }, 'b@b.example'],
+        }),
+      ).toEqual(['a.example', 'b.example']);
+    });
   });
 });
 
