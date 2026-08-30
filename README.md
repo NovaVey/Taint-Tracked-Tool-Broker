@@ -18,6 +18,8 @@ This library gates on *exposure* instead of content. The moment untrusted conten
 npm install taint-tracked-tool-broker
 ```
 
+**ESM only** — this package ships as native ESM (`"type": "module"`, no CommonJS build). `import` it from an ESM project as normal. A CommonJS project on a Node version without [`require(esm)`](https://nodejs.org/api/modules.html#loading-ecmascript-modules-using-require) support can't `require()` it directly (`ERR_REQUIRE_ESM`) — use a dynamic `await import('taint-tracked-tool-broker')` instead.
+
 ## Quick start
 
 ```ts

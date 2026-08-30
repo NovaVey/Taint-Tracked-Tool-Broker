@@ -25,6 +25,14 @@
  * not, by itself, propagate taint to every downstream reader of written
  * content — that still requires the receiving side to actually restore and
  * use this state (or to call `markContextExposure()` itself).
+ *
+ * Also NOT included: a declared plan (`broker.declarePlan()`, DESIGN.md
+ * §11). `SerializedBrokerState` carries only the watermark and the
+ * registry — a broker restored from another one's exported state starts
+ * with plan-freeze disengaged even if the original had a live plan, and
+ * `declarePlan()` can't re-establish one afterward if the restored
+ * watermark is already non-CLEAN (it requires CLEAN). See DESIGN.md §11's
+ * own note on this for the concrete consequence.
  */
 
 import type { TaintRecord, TaintRegistry, TaintWatermark, ToolCallBroker } from './types.js';
