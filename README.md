@@ -59,7 +59,7 @@ await shellExec.execute({ cmd: 'anything the model writes, paraphrased or not' }
 - **A single trust lattice** — `CLEAN < DERIVED_UNTRUSTED < RAW_UNTRUSTED` — used for both the scope watermark and individual fingerprint records.
 - **The scope watermark is the safety boundary.** It rises the instant a source tool (`isSource: true`) returns, before the model reads the result. It is monotonic; only `broker.declassify()` lowers it, and only as an explicit, audited action.
 - **Sinks are classified `EXEC` / `MUTATE` / `EXFIL` / `NONE`** by declared capability (`exec:shell`, `write:fs`, `net:email`, ...). `EXEC` is hard-gated by watermark level alone — it needs no private data to be catastrophic. `EXFIL`/`MUTATE` calls while untrusted content is live always require at least approval; a `readsPrivateData` tool having been called this scope *escalates* that to a hard block (the "lethal trifecta"), it never *gates* on its own.
-- **The fingerprint registry is secondary.** Exact hash + simhash + word-shingle overlap gives precise "this argument literally contains text from source X" attribution when a literal or near-literal chain survives — but it can only ever *tighten* a policy verdict, never loosen one, and it is never the sole basis for allowing a call.
+- **The fingerprint registry is secondary.** Exact hash + simhash + word-shingle overlap gives precise "this argument literally contains text from source X" attribution when a literal or near-literal chain survives — but it can only ever *tighten* a policy verdict, never loosen one, and it is never the sole basis for allowing a call. Fuzzy lookup is indexed (LSH-banded simhash + a shingle inverted index), not a linear scan, and an optional `maxEntries` bounds memory for long-running sessions.
 - **`broker.summarize()`** is the sanctioned way to condense/paraphrase untrusted content before it re-enters the model's context without staying at `RAW_UNTRUSTED`: a capability-less LLM call you supply, whose output the broker itself (not the LLM) registers as `DERIVED_UNTRUSTED` — never all the way back to clean.
 - **`broker.declarePlan(steps)`** is an optional, additive strict mode (DESIGN.md §11): commit to the exact sequence of privileged tool calls *before* any untrusted read, and any later privileged call that doesn't match the next committed step is rejected — on top of, never instead of, the normal policy check above.
 - **State can cross a process boundary.** `createBroker({ initialWatermark, registry })` plus `serializeBrokerState()`/`restoreBrokerState()` let one broker's watermark and registry be exported (JSON-safe) and used to seed another — for a sub-agent, a worker, or a resumed session. Not automatic; an integrator still has to call these and pass the result along.
@@ -87,7 +87,7 @@ npm install
 npm run typecheck   # tsc --noEmit
 npm test            # vitest (unit tests + the injection corpus)
 npm run corpus      # just the corpus, with a readable pass/fail table
-npm run build        # emit dist/
+npm run build       # emit dist/
 ```
 
 ## License
