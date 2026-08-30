@@ -747,6 +747,146 @@ describe('concurrent call() dispatch', () => {
   });
 });
 
+// Adversarial suite for the barrier-exemption narrowing (DESIGN.md's
+// implementation note, "narrowing the lock to a targeted barrier"). The
+// tests above this point already regression-cover the ORIGINAL race the
+// lock exists to prevent, unchanged; everything below specifically probes
+// the NEW exemption logic — both that it delivers the concurrency benefit
+// it exists for, and that it cannot reopen the original race under any of
+// the new cases it introduces (a NONE-sink private-data reader, an unknown
+// tool name, reentrancy from within an exempt call, and a repeated
+// multi-call stress mix).
+describe('barrier exemption (narrowed lock)', () => {
+  it('an exempt call is NOT blocked behind a slow, concurrently-dispatched gated call — the actual point of narrowing the barrier', async () => {
+    const broker = createBroker();
+    let slowResolved = false;
+    broker.register({
+      name: 'slow_gated', // sinkClass != NONE -> barrier-participating
+      capabilities: { capabilities: ['net:email'] },
+      async execute() {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        slowResolved = true;
+        return 'sent';
+      },
+    });
+    broker.register({
+      name: 'fast_util', // NONE-sink, not a source, no private data -> exempt
+      capabilities: { capabilities: [] },
+      async execute() {
+        return 'instant';
+      },
+    });
+
+    const slowPromise = broker.call('slow_gated', { to: 'x', body: 'y' }); // dispatched FIRST — under the old global lock this alone would make fast_util wait behind it
+    const fastResult = await broker.call('fast_util', {});
+    // fast_util resolved without waiting for slow_gated's 80ms delay —
+    // proves it genuinely bypassed the queue rather than merely completing
+    // quickly once its turn came.
+    expect(fastResult).toBe('instant');
+    expect(slowResolved).toBe(false);
+    await slowPromise;
+  });
+
+  it('an exempt call running concurrently with a raiser does not disturb the raiser’s watermark effect', async () => {
+    const broker = createBroker();
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register({ name: 'util', capabilities: { capabilities: [] }, async execute() { return 'ok'; } });
+    broker.register(shellExec());
+
+    const [fetchOutcome, utilOutcome, shellOutcome] = await Promise.allSettled([
+      broker.call('fetch_url', {}),
+      broker.call('util', {}),
+      broker.call('shell_exec', { cmd: 'x' }), // listed after fetch_url — must still be gated
+    ]);
+    expect(fetchOutcome.status).toBe('fulfilled');
+    expect(utilOutcome).toEqual({ status: 'fulfilled', value: 'ok' });
+    expect(shellOutcome.status).toBe('rejected');
+    if (shellOutcome.status === 'rejected') expect(shellOutcome.reason).toBeInstanceOf(ToolCallBlockedError);
+    expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+  });
+
+  it('a NONE-sink tool that reads private data is barrier-PARTICIPATING, not exempt — a later gated call under Promise.all still sees both effects', async () => {
+    const broker = createBroker();
+    broker.register({
+      name: 'fetch_url',
+      capabilities: { capabilities: [] },
+      isSource: true,
+      async execute() {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return MALICIOUS_PAGE;
+      },
+    });
+    broker.register({
+      name: 'read_creds', // NONE sinkClass, but readsPrivateData — must NOT be exempt
+      capabilities: { capabilities: [], readsPrivateData: { categories: ['credentials'] } },
+      async execute() {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return 'sk-live-x';
+      },
+    });
+    broker.register(sendEmail());
+
+    const [fetchOutcome, credsOutcome, emailOutcome] = await Promise.allSettled([
+      broker.call('fetch_url', {}),
+      broker.call('read_creds', {}),
+      broker.call('send_email', { to: 'x@example.com', body: 'y' }), // listed last — full lethal trifecta must be visible to it
+    ]);
+    expect(fetchOutcome.status).toBe('fulfilled');
+    expect(credsOutcome.status).toBe('fulfilled');
+    expect(emailOutcome.status).toBe('rejected');
+    if (emailOutcome.status === 'rejected') expect(emailOutcome.reason).toBeInstanceOf(ToolCallBlockedError);
+    expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+    expect(broker.scope.watermark.privateDataSeen).toBe(true);
+  });
+
+  it('reentrant broker.call() from within an EXEMPT tool’s execute() still throws ReentrantCallError — the reentrancy guard applies regardless of barrier exemption', async () => {
+    const broker = createBroker();
+    broker.register({
+      name: 'inert_util', // NONE-sink, not a source, no private data -> exempt
+      capabilities: { capabilities: [] },
+      async execute() {
+        return broker.call('inert_util', {});
+      },
+    });
+    await expect(broker.call('inert_util', {})).rejects.toBeInstanceOf(ReentrantCallError);
+  });
+
+  it('an unknown tool name is never treated as barrier-exempt — still throws UnknownToolError without disturbing a concurrently-raced real call’s ordering', async () => {
+    const broker = createBroker();
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register(shellExec());
+
+    const [unknownOutcome, fetchOutcome, shellOutcome] = await Promise.allSettled([
+      broker.call('does_not_exist', {}),
+      broker.call('fetch_url', {}),
+      broker.call('shell_exec', { cmd: 'x' }),
+    ]);
+    expect(unknownOutcome.status).toBe('rejected');
+    if (unknownOutcome.status === 'rejected') expect(unknownOutcome.reason).toBeInstanceOf(UnknownToolError);
+    expect(fetchOutcome.status).toBe('fulfilled');
+    expect(shellOutcome.status).toBe('rejected'); // still correctly gated against fetch_url's raise
+  });
+
+  it('stress: many mixed exempt/raiser/gated calls dispatched concurrently produce a correctly-gated final state, repeated across many runs to catch rare nondeterminism', async () => {
+    for (let iteration = 0; iteration < 25; iteration++) {
+      const broker = createBroker();
+      broker.register(fetchUrl(MALICIOUS_PAGE));
+      broker.register({ name: 'util', capabilities: { capabilities: [] }, async execute() { return 'ok'; } }); // exempt
+      broker.register(shellExec());
+
+      const results = await Promise.allSettled([
+        broker.call('util', {}),
+        broker.call('fetch_url', {}),
+        broker.call('util', {}),
+        broker.call('shell_exec', { cmd: 'x' }), // listed after fetch_url — must always be gated
+        broker.call('util', {}),
+      ]);
+      expect(results.map((r) => r.status)).toEqual(['fulfilled', 'fulfilled', 'fulfilled', 'rejected', 'fulfilled']);
+      expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+    }
+  });
+});
+
 describe('args snapshotting', () => {
   it('a tool mutating its own args in place does not corrupt what was shown to the approver or what is audited', async () => {
     const events: AuditEvent[] = [];

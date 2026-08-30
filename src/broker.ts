@@ -19,6 +19,7 @@ import type {
   QuarantineSourceResult,
   RawQuarantineSourceTool,
   ResetScope,
+  SinkClass,
   TaintContext,
   TaintLevel,
   TaintRegistry,
@@ -304,11 +305,43 @@ class Broker implements ToolCallBroker {
     };
   }
 
+  /**
+   * True for a call that can safely bypass the serialization lock entirely
+   * — see DESIGN.md's implementation note on narrowing the lock to a
+   * targeted barrier. A call is exempt only if it can neither READ the
+   * watermark for a gating decision (`sinkClass === 'NONE'`) nor WRITE to
+   * it (not an untrusted source that would raise the level, and doesn't
+   * read private data that would set `privateDataSeen`). An exempt call's
+   * entire dispatch — gating (skipped for NONE), execute(), and
+   * applyPostExecutionEffects() — is then provably inert to
+   * `this.currentScope.watermark` in both directions, so its presence or
+   * absence in the lock queue cannot affect the correctness of any other
+   * call's relative ordering. An unknown tool name is deliberately never
+   * exempt (see call() below) — it falls through to dispatch()'s own
+   * UnknownToolError inside the lock, same as today, just via the "not
+   * exempt" path rather than a special case here.
+   */
+  private isBarrierExempt(tool: ToolExecutor, sinkClass: SinkClass): boolean {
+    return sinkClass === 'NONE' && !isUntrustedSource(tool) && !tool.capabilities.readsPrivateData;
+  }
+
   async call(toolName: string, args: unknown): Promise<unknown> {
     if (this.reentrancyGuard.getStore()) {
       throw new ReentrantCallError(toolName);
     }
-    return this.withLock(() => this.reentrancyGuard.run(true, () => this.dispatch(toolName, args)));
+    // Tool lookup + sinkClass + exemption decision all happen synchronously
+    // here, before any `await` — exactly like withLock()'s own queue-join
+    // happens synchronously today — so an exempt call's decision to skip
+    // the queue is made at the same deterministic invocation-order point a
+    // participating call's queue position would be captured at. dispatch()
+    // still does its own tool lookup independently; recomputing sinkClass
+    // there too is cheap and can't disagree (same tool object, pure function).
+    const tool = this.tools.get(toolName);
+    const run = (): Promise<unknown> => this.reentrancyGuard.run(true, () => this.dispatch(toolName, args));
+    if (tool && this.isBarrierExempt(tool, sinkClassOf(tool.capabilities.capabilities))) {
+      return run();
+    }
+    return this.withLock(run);
   }
 
   async callSafe(toolName: string, args: unknown): Promise<CallResult> {
