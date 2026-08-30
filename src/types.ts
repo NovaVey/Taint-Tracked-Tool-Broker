@@ -360,8 +360,15 @@ export interface ToolCallBroker {
 
   summarize: QuarantineFn;
 
-  /** Escape hook for untrusted content that reaches the model outside any tracked tool call — see GAPS.md #1. */
-  markContextExposure(source: { toolName?: string; note: string }, level?: TaintLevel): void;
+  /**
+   * Escape hook for untrusted content that reaches the model outside any
+   * tracked tool call — see GAPS.md #1. Pass `text` when the actual exposed
+   * content is known so it also gets a Layer 2 fingerprint record (the same
+   * register-then-raise pattern an ordinary source-tool call gets); omit it
+   * when only the fact of an exposure is known (e.g. "this tool's
+   * description changed since last seen"), not its content.
+   */
+  markContextExposure(source: { toolName?: string; note: string; text?: string }, level?: TaintLevel): void;
 
   /** Per `resetScope`: clears the watermark ('turn' mode) or is a no-op ('session' mode, the default). */
   startNewTurn(): void;

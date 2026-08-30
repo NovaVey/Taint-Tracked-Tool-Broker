@@ -68,7 +68,23 @@ export interface BrokerOptions {
    * snapshotting exists to close.
    */
   cloneArgs?: (value: unknown) => unknown;
+  /**
+   * Opt-in advisory heuristic for GAPS.md #1: when a call to a tool NOT
+   * registered `isSource: true` returns at least this many characters of
+   * text, an `ALLOW_WITH_WARNING` `AuditEvent` flags it — the most probable
+   * real-world way #1 bites isn't an exotic untracked channel, it's an
+   * ordinary source tool (a wiki reader, a Slack fetcher) that simply
+   * forgot the `isSource: true` declaration, so its results never raise
+   * the watermark. Purely advisory: never changes the watermark, never
+   * gates anything, and can false-positive on a genuinely large but
+   * inert/trusted result — tune the threshold (or leave this unset) per
+   * how noisy that is for your tools. `true` uses a default threshold of
+   * 200 characters; a number sets your own.
+   */
+  warnOnLikelyUnmarkedSource?: boolean | number;
 }
+
+const DEFAULT_UNMARKED_SOURCE_WARN_THRESHOLD = 200;
 
 const NOOP_AUDIT: AuditSink = { record() {} };
 
@@ -84,6 +100,7 @@ class Broker implements ToolCallBroker {
   private readonly approvalChannel: ApprovalChannel | undefined;
   private readonly auditSink: AuditSink;
   private readonly cloneArgs: (value: unknown) => unknown;
+  private readonly warnOnLikelyUnmarkedSource: number | undefined;
   private readonly tools = new Map<string, ToolExecutor>();
   private currentScope: TaintScope;
 
@@ -113,6 +130,12 @@ class Broker implements ToolCallBroker {
     this.approvalChannel = opts.approvalChannel;
     this.auditSink = opts.auditSink ?? NOOP_AUDIT;
     this.cloneArgs = opts.cloneArgs ?? structuredClone;
+    this.warnOnLikelyUnmarkedSource =
+      opts.warnOnLikelyUnmarkedSource === true
+        ? DEFAULT_UNMARKED_SOURCE_WARN_THRESHOLD
+        : opts.warnOnLikelyUnmarkedSource === false || opts.warnOnLikelyUnmarkedSource === undefined
+          ? undefined
+          : opts.warnOnLikelyUnmarkedSource;
     this.registry = opts.registry ?? new InMemoryTaintRegistry();
     this.currentScope = createScope(this.resetScopeMode, this.sessionId);
     if (opts.initialWatermark) {
@@ -292,25 +315,75 @@ class Broker implements ToolCallBroker {
       });
     }
 
+    if (this.warnOnLikelyUnmarkedSource !== undefined && sinkClass === 'NONE' && !tool.isSource) {
+      // Opt-in, purely advisory (GAPS.md #1): the most probable real-world
+      // way #1 bites isn't an exotic untracked channel, it's an ordinary
+      // source tool that simply forgot isSource:true, so its results never
+      // raise the watermark — silently, with no error and no test failure
+      // to catch it. Best-effort like applyPostExecutionEffects()'s own
+      // serialization — a result toRegistrableText() can't handle just
+      // skips the check rather than throwing.
+      let text: string | undefined;
+      try {
+        text = toRegistrableText(result);
+      } catch {
+        text = undefined;
+      }
+      if (text !== undefined && text.length >= this.warnOnLikelyUnmarkedSource) {
+        this.auditSink.record({
+          verdict: {
+            action: 'ALLOW_WITH_WARNING',
+            reason: `Advisory: tool "${toolName}" is not registered isSource:true but returned ${text.length} chars of text (>= the warnOnLikelyUnmarkedSource threshold of ${this.warnOnLikelyUnmarkedSource}). If this tool can return content the agent didn't originate, it likely should be isSource:true (GAPS.md #1) — this warning never changes the watermark or gates anything on its own.`,
+          },
+          call,
+          taint: {
+            matchedRecords: [],
+            scopeLevel: this.currentScope.watermark.level,
+            argFingerprintFloor: 'CLEAN',
+            privateDataSeen: this.currentScope.watermark.privateDataSeen,
+            sinkClass: 'NONE',
+          },
+          at: Date.now(),
+          executed: true,
+        });
+      }
+    }
+
     return result;
   }
 
-  markContextExposure(source: { toolName?: string; note: string }, level: TaintLevel = 'RAW_UNTRUSTED'): void {
+  markContextExposure(source: { toolName?: string; note: string; text?: string }, level: TaintLevel = 'RAW_UNTRUSTED'): void {
+    // Optional `text`: registers the actual exposed content into the Layer
+    // 2 fingerprint registry (mirroring applyPostExecutionEffects()'s
+    // register-then-raise pattern for ordinary source-tool calls), instead
+    // of leaving this channel's content permanently invisible to fuzzy
+    // matching. Best-effort like that path too — a text that can't be
+    // fingerprinted (unlikely here, since it's always a plain string
+    // already, not an arbitrary result needing serialization) still raises
+    // the watermark; registration just falls back to a random id.
     const provenance = {
-      id: randomUUID(),
+      id: source.text !== undefined ? exactHash(source.text) : randomUUID(),
       sourceCallId: `context-exposure:${randomUUID()}`,
       toolName: source.toolName ?? '__untracked_context__',
       sessionId: this.sessionId,
       capturedAt: Date.now(),
       note: source.note,
     };
+    if (source.text !== undefined) {
+      this.registry.register(source.text, provenance, level, NOT_SENSITIVE);
+    }
     raiseWatermark(this.currentScope, level, provenance);
     this.auditSink.record({
       verdict: {
         action: 'ALLOW_WITH_WARNING',
         reason: `markContextExposure(): untrusted content reached the model outside any tracked tool call (${provenance.toolName}) — "${source.note}". This is the manual escape hatch for GAPS.md #1; the library could not detect this exposure on its own.`,
       },
-      call: { id: provenance.sourceCallId, toolName: '__tttb_context_exposure', args: { toolName: source.toolName, note: source.note, level }, sessionId: this.sessionId },
+      call: {
+        id: provenance.sourceCallId,
+        toolName: '__tttb_context_exposure',
+        args: { toolName: source.toolName, note: source.note, level, ...(source.text !== undefined ? { text: source.text } : {}) },
+        sessionId: this.sessionId,
+      },
       taint: {
         matchedRecords: [],
         scopeLevel: this.currentScope.watermark.level,
