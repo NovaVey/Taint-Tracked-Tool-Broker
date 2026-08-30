@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { findOutboundHosts, isAllowedOutboundHost } from '../src/index.js';
+import { ArgsTooDeepError, findOutboundHosts, isAllowedOutboundHost } from '../src/index.js';
 
 describe('findOutboundHosts', () => {
   it('finds the hostname of a genuine http(s) URL in a plain string value', () => {
@@ -38,6 +38,18 @@ describe('findOutboundHosts', () => {
     const args: Record<string, unknown> = { url: 'https://a.example' };
     args.self = args;
     expect(findOutboundHosts(args)).toEqual(['a.example']);
+  });
+
+  it('throws a clean, catchable ArgsTooDeepError instead of overflowing the call stack on a pathologically deep args tree', () => {
+    let deep: unknown = 'bottom';
+    for (let i = 0; i < 10_000; i++) deep = { nested: deep };
+    expect(() => findOutboundHosts({ payload: deep })).toThrow(ArgsTooDeepError);
+  });
+
+  it('does not reject an ordinary, realistically-nested args tree', () => {
+    let ok: unknown = 'https://a.example';
+    for (let i = 0; i < 50; i++) ok = { nested: ok };
+    expect(() => findOutboundHosts({ payload: ok })).not.toThrow();
   });
 
   it('finds a host inside a Layer-1 TaintedValue-wrapped object without needing special-case handling — it is walked generically like any other object', () => {

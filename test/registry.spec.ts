@@ -114,6 +114,50 @@ describe('InMemoryTaintRegistry', () => {
     expect(() => new InMemoryTaintRegistry({ maxEntries: 1.5 })).toThrow(RangeError);
   });
 
+  it('rejects a non-positive-integer maxFuzzyCandidatesPerLookup', () => {
+    expect(() => new InMemoryTaintRegistry({ maxFuzzyCandidatesPerLookup: 0 })).toThrow(RangeError);
+    expect(() => new InMemoryTaintRegistry({ maxFuzzyCandidatesPerLookup: -1 })).toThrow(
+      RangeError,
+    );
+    expect(() => new InMemoryTaintRegistry({ maxFuzzyCandidatesPerLookup: 1.5 })).toThrow(
+      RangeError,
+    );
+  });
+
+  it('maxFuzzyCandidatesPerLookup bounds the candidate set scored per lookup — a small cap can miss a real match buried behind many near-duplicate decoys registered first (registry candidate-gathering, GAPS.md #13)', () => {
+    const DECOY_COUNT = 10;
+    function buildRegistry(opts: { maxFuzzyCandidatesPerLookup?: number }) {
+      const registry = new InMemoryTaintRegistry(opts);
+      for (let i = 0; i < DECOY_COUNT; i++) {
+        registry.register(
+          `Reminder copy ${i}: "${SOURCE}" — please handle at your convenience, variant ${i} of this notice.`,
+          tag({ id: `decoy-${i}` }),
+          'RAW_UNTRUSTED',
+          NOT_SENSITIVE,
+        );
+      }
+      // The genuinely-matching record, registered LAST — so it is always
+      // the last candidate any shared simhash-band/shingle bucket offers.
+      const real = registry.register(SOURCE, tag({ id: 'real' }), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+      return { registry, real };
+    }
+    const query = `Quoting the page: "${SOURCE}" — thought you should see this before end of day.`;
+
+    const { registry: smallCapRegistry, real: realSmall } = buildRegistry({
+      maxFuzzyCandidatesPerLookup: 5,
+    });
+    expect(smallCapRegistry.lookupFuzzy(query).some((m) => m.record.id === realSmall.id)).toBe(
+      false,
+    );
+
+    // Same shape, default (generous) cap: the real match is found once
+    // enough of the candidate budget survives to reach it.
+    const { registry: defaultCapRegistry, real: realDefault } = buildRegistry({});
+    expect(defaultCapRegistry.lookupFuzzy(query).some((m) => m.record.id === realDefault.id)).toBe(
+      true,
+    );
+  });
+
   it('is unbounded by default — registering many records never evicts', () => {
     const registry = new InMemoryTaintRegistry();
     const first = registry.register(

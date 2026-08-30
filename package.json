@@ -38,6 +38,8 @@
   ],
   "files": [
     "dist",
+    "docs",
+    "examples",
     "README.md",
     "DESIGN.md",
     "GAPS.md",

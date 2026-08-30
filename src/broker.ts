@@ -12,6 +12,7 @@ import type {
   AuditSink,
   CallResult,
   PlanStep,
+  PolicyDecision,
   PolicyFn,
   ProvenanceTag,
   QuarantineFn,
@@ -31,7 +32,7 @@ import type {
   ToolCallBroker,
   ToolExecutor,
 } from './types.js';
-import { NOT_SENSITIVE, sinkClassOf } from './types.js';
+import { LEVEL_ORDER, NOT_SENSITIVE, sinkClassOf } from './types.js';
 import { InMemoryTaintRegistry } from './taint/registry.js';
 import {
   createScope,
@@ -46,6 +47,7 @@ import { defaultPolicy } from './policy/default-policy.js';
 import { createQuarantine, unconfiguredQuarantineImpl } from './quarantine.js';
 import { isReservedToolName, isUntrustedSource, recordTrivialAudit } from './internal-audit.js';
 import {
+  ArgsTooDeepError,
   DisallowedOutboundHostError,
   DualRoleToolError,
   NonCloneableArgsError,
@@ -59,6 +61,25 @@ import {
 } from './errors.js';
 
 export interface BrokerOptions {
+  /**
+   * Identifies this broker instance in ProvenanceTag/ToolCall/AuditEvent
+   * records. Defaults to a fresh `randomUUID()` — pass your own only if you
+   * need audit records to carry an externally-meaningful session id (e.g.
+   * to correlate with your own request-tracing).
+   *
+   * This is NOT a lookup key for sharing state across broker instances —
+   * two `createBroker()` calls given the same `sessionId` do not share a
+   * watermark, registry, or lock; each is a fully independent object with
+   * its own in-memory state (GAPS.md #19). One `Broker` instance IS one
+   * session: create exactly one per agent conversation/session and reuse
+   * it for that session's entire lifetime (across turns — via
+   * `startNewTurn()`/`resetScope`, never a new broker), and never share a
+   * single instance across two concurrent, unrelated sessions — every
+   * `call()` on one instance is serialized against every other `call()` on
+   * that SAME instance (§8's core guarantee), which is meaningless
+   * isolation between sessions if one instance is reused for more than
+   * one. See createBroker()'s own doc comment.
+   */
   sessionId?: string;
   /** 'session' (default) never resets until an explicit declassify(); 'turn' trades soundness for usability — GAPS.md #2. 'turn-decay' is a bounded middle ground — see turnDecayWindow. */
   resetScope?: ResetScope;
@@ -510,9 +531,28 @@ class Broker implements ToolCallBroker {
       // itself (GAPS.md #17), it cannot assume one is already held here.
       return this.reentrancyGuard.run({ lockHeld: false }, () => this.dispatch(toolName, args));
     }
-    return this.withLock(() =>
-      this.reentrancyGuard.run({ lockHeld: true }, () => this.dispatch(toolName, args)),
-    );
+    if (!tool || sinkClassOf(tool.capabilities.capabilities) === 'NONE') {
+      // Unknown tool name (dispatch() throws UnknownToolError inside the
+      // lock, same as always), or a non-exempt NONE-sinkClass call (an
+      // untrusted source, a readsPrivateData source, or a
+      // mayCallSummarize tool): serialize through the lock for the whole
+      // call, exactly as before this fix. Only the GATED path below gets
+      // multi-phase locking — a NONE-sinkClass call is never gated, so it
+      // has no REQUIRE_APPROVAL wait to release the lock around.
+      return this.withLock(() =>
+        this.reentrancyGuard.run({ lockHeld: true }, () => this.dispatch(toolName, args)),
+      );
+    }
+    // Gated (sinkClass !== 'NONE'): dispatch() delegates to dispatchGated(),
+    // which acquires and releases the broker lock itself across separate
+    // phases — notably, it releases the lock for a REQUIRE_APPROVAL wait —
+    // rather than one call()-level withLock() holding it for the whole,
+    // potentially human-timescale, operation (a prior liveness bug: every
+    // other gated call on this broker froze for the full approval wait).
+    // lockHeld:true here is only the initial value; dispatchGated()'s own
+    // phases immediately establish the accurate value for each phase — see
+    // its doc comment.
+    return this.reentrancyGuard.run({ lockHeld: true }, () => this.dispatch(toolName, args));
   }
 
   async callSafe(toolName: string, args: unknown): Promise<CallResult> {
@@ -543,13 +583,15 @@ class Broker implements ToolCallBroker {
     if (!tool) throw new UnknownToolError(toolName);
 
     // One snapshot used everywhere a caller-visible record of "what was
-    // requested" is needed (policy, approval, audit) — never the live
-    // object — plus a second, independent snapshot handed to execute().
-    // Otherwise a tool that mutates its own args in place (an entirely
-    // ordinary pattern) silently corrupts what the approval channel showed
-    // a human and what the audit log records as having executed, since
-    // both would share one mutable reference with whatever execute() did
-    // to it.
+    // requested" is needed (policy, approval, audit, AND execute()) — never
+    // the live `args` object. Every execute() call site below clones from
+    // this one frozen snapshot instead of re-deriving its own clone from
+    // the live `args`. Otherwise a tool that mutates its own args in place
+    // (an entirely ordinary pattern), or a caller that keeps mutating the
+    // object it passed to call() after calling it (e.g. across a
+    // REQUIRE_APPROVAL wait), could silently desync what the approval
+    // channel showed a human and what the audit log records from what
+    // actually executed.
     const argsSnapshot = this.cloneArgsOrThrow(toolName, args);
     const call: ToolCall = {
       id: randomUUID(),
@@ -558,8 +600,6 @@ class Broker implements ToolCallBroker {
       sessionId: this.sessionId,
     };
     const sinkClass = sinkClassOf(tool.capabilities.capabilities);
-
-    let result: unknown;
 
     if (sinkClass === 'NONE') {
       // Not a privileged sink: no gating. Source tools (fetch_url,
@@ -570,90 +610,322 @@ class Broker implements ToolCallBroker {
       // record — nothing safety-relevant happened. One that DOES raise the
       // watermark or the private-data flag is audited below, after those
       // effects are applied, so the recorded taint reflects the new state.
-      result = await tool.execute(this.cloneArgsOrThrow(toolName, args));
-    } else {
-      const { matches, floor } = scanArgsForTaint(argsSnapshot, this.registry);
-      const taint: TaintContext = {
-        matchedRecords: matches,
-        scopeLevel: this.currentScope.watermark.level,
-        argFingerprintFloor: floor,
-        privateDataSeen: this.currentScope.watermark.privateDataSeen,
-        sinkClass,
-      };
+      const result = await tool.execute(this.cloneArgsOrThrow(toolName, argsSnapshot));
+      return this.finishDispatch(tool, call, sinkClass, result);
+    }
 
-      // Plan-freeze strict mode (DESIGN.md §11), additive on top of the
-      // normal policy check below, never instead of it. Only engages once
-      // the scope has left CLEAN — a plan is inert until the first
-      // exposure, exactly matching "committed before any untrusted read".
-      if (this.plan !== undefined && this.currentScope.watermark.level !== 'CLEAN') {
-        const expected = this.plan[this.planCursor];
-        if (!expected || expected.toolName !== toolName) {
-          this.auditSink.record({
-            verdict: {
-              action: 'BLOCK',
-              reason: `Unplanned privileged action after exposure (plan-freeze strict mode): ${
-                expected ? `expected "${expected.toolName}"` : 'no steps left in the declared plan'
-              }.`,
-            },
-            call,
-            taint,
-            at: Date.now(),
-            executed: false,
-          });
-          throw new UnplannedPrivilegedActionError(toolName, expected?.toolName);
-        }
-        this.planCursor++;
+    // Gated (privileged sink): dispatchGated() manages its own multi-phase
+    // locking — see its doc comment for why.
+    return this.dispatchGated(tool, call, argsSnapshot, sinkClass);
+  }
+
+  /** Builds a fresh TaintContext from the CURRENT watermark — the same shape captured once at the top of the (former) gated dispatch path, now re-derivable on demand so it can be recomputed after an async gap. */
+  private buildTaintContext(argsSnapshot: unknown, sinkClass: SinkClass): TaintContext {
+    const { matches, floor } = scanArgsForTaint(argsSnapshot, this.registry);
+    return {
+      matchedRecords: matches,
+      scopeLevel: this.currentScope.watermark.level,
+      argFingerprintFloor: floor,
+      privateDataSeen: this.currentScope.watermark.privateDataSeen,
+      sinkClass,
+    };
+  }
+
+  /** Whether the CURRENT watermark is strictly more tainted than the snapshot captured in `taint` — either dimension moving counts (§3.2's two dimensions are independent escalators). */
+  private watermarkEscalatedSince(taint: TaintContext): boolean {
+    return (
+      LEVEL_ORDER[this.currentScope.watermark.level] > LEVEL_ORDER[taint.scopeLevel] ||
+      (this.currentScope.watermark.privateDataSeen && !taint.privateDataSeen)
+    );
+  }
+
+  /**
+   * Immediately before ever executing a gated tool call, re-checks the
+   * watermark against what it was when `decision` was computed. Closes two
+   * races at once, both stemming from the same root cause — an async gap
+   * (policy()'s own await, or the REQUIRE_APPROVAL wait) during which the
+   * watermark can move without the already-computed `decision` knowing:
+   *   - markContextExposure() (and its 3 specializations): a synchronous
+   *     escape hatch by design (GAPS.md #1) that never acquires the broker
+   *     lock, so it can land during either gap.
+   *   - a concurrently-dispatched source call raising the watermark during
+   *     the now-unlocked REQUIRE_APPROVAL wait (see dispatchGated()).
+   * If the watermark did NOT move, `decision` is still valid — proceed
+   * exactly as already decided. If it escalated, `decision` was computed
+   * against a stale, now-too-permissive taint context: re-decide against
+   * the CURRENT one instead of trusting it. Bounded to this single extra
+   * round — a fresh REQUIRE_APPROVAL is never re-prompted (there is no
+   * fresh human grant for it) and is conservatively treated as not
+   * approved rather than looping.
+   */
+  private async revalidateBeforeExecute(
+    call: ToolCall,
+    argsSnapshot: unknown,
+    sinkClass: SinkClass,
+    taint: TaintContext,
+    decision: PolicyDecision,
+  ): Promise<{ taint: TaintContext; decision: PolicyDecision; proceed: boolean }> {
+    if (!this.watermarkEscalatedSince(taint)) {
+      return { taint, decision, proceed: true };
+    }
+    // No ArgsTooDeepError handling needed here (contrast gateDecision()'s
+    // own try/catch around its first buildTaintContext() call): this scans
+    // the SAME frozen argsSnapshot gateDecision() already scanned once
+    // successfully — the walk is a pure, deterministic function of the
+    // (unchanged) argsSnapshot, so it cannot throw here having already
+    // succeeded there. dispatchGated() would never have reached this far
+    // otherwise.
+    const freshTaint = this.buildTaintContext(argsSnapshot, sinkClass);
+    const freshDecision = await this.policy(call, freshTaint);
+    const proceed =
+      freshDecision.action === 'ALLOW' || freshDecision.action === 'ALLOW_WITH_WARNING';
+    return { taint: freshTaint, decision: freshDecision, proceed };
+  }
+
+  /** Plan-freeze + outbound-host allowlist + policy() — everything needed to reach a gating decision, run once under the lock. */
+  private async gateDecision(
+    tool: ToolExecutor,
+    call: ToolCall,
+    argsSnapshot: unknown,
+    sinkClass: SinkClass,
+  ): Promise<{ taint: TaintContext; decision: PolicyDecision }> {
+    const toolName = call.toolName;
+    let taint: TaintContext;
+    try {
+      taint = this.buildTaintContext(argsSnapshot, sinkClass);
+    } catch (error) {
+      if (error instanceof ArgsTooDeepError) this.auditArgsTooDeep(call, sinkClass, error);
+      throw error;
+    }
+
+    // Plan-freeze strict mode (DESIGN.md §11), additive on top of the
+    // normal policy check below, never instead of it. Only engages once
+    // the scope has left CLEAN — a plan is inert until the first
+    // exposure, exactly matching "committed before any untrusted read".
+    if (this.plan !== undefined && this.currentScope.watermark.level !== 'CLEAN') {
+      const expected = this.plan[this.planCursor];
+      if (!expected || expected.toolName !== toolName) {
+        this.auditSink.record({
+          verdict: {
+            action: 'BLOCK',
+            reason: `Unplanned privileged action after exposure (plan-freeze strict mode): ${
+              expected ? `expected "${expected.toolName}"` : 'no steps left in the declared plan'
+            }.`,
+          },
+          call,
+          taint,
+          at: Date.now(),
+          executed: false,
+        });
+        throw new UnplannedPrivilegedActionError(toolName, expected?.toolName);
       }
+      this.planCursor++;
+    }
 
-      // Outbound-host allowlist (DESIGN.md §7.4), additive on top of the
-      // normal policy check below, never instead of it — a pure firewall
-      // rule that runs regardless of scope level, unlike everything else
-      // in this branch. Only ever examines EXFIL-class calls; a non-EXFIL
-      // sink with a URL-shaped argument (e.g. write_file writing a URL
-      // string to disk) is not egress and is out of scope for this check.
-      const allowlist = this.allowedOutboundHosts;
-      if (allowlist !== undefined && sinkClass === 'EXFIL') {
-        const disallowedHosts = findOutboundHosts(argsSnapshot).filter(
-          (host) => !isAllowedOutboundHost(host, allowlist),
-        );
-        if (disallowedHosts.length > 0) {
-          this.auditSink.record({
-            verdict: {
-              action: 'BLOCK',
-              reason: `Outbound host allowlist violation: ${disallowedHosts.map((h) => `"${h}"`).join(', ')} not in BrokerOptions.allowedOutboundHosts.`,
-            },
-            call,
-            taint,
-            at: Date.now(),
-            executed: false,
-          });
-          throw new DisallowedOutboundHostError(toolName, disallowedHosts);
-        }
+    // Outbound-host allowlist (DESIGN.md §7.4), additive on top of the
+    // normal policy check below, never instead of it — a pure firewall
+    // rule that runs regardless of scope level, unlike everything else
+    // in this branch. Only ever examines EXFIL-class calls; a non-EXFIL
+    // sink with a URL-shaped argument (e.g. write_file writing a URL
+    // string to disk) is not egress and is out of scope for this check.
+    const allowlist = this.allowedOutboundHosts;
+    if (allowlist !== undefined && sinkClass === 'EXFIL') {
+      let hosts: string[];
+      try {
+        // Defensive, not currently reachable via this call path: this
+        // walks the SAME argsSnapshot buildTaintContext() already walked
+        // above (scanArgsForTaint()), at the same depth bound (500, defined
+        // independently in each of scan.ts/egress.ts) — so a tree deep
+        // enough to make THIS throw would already have made the earlier
+        // buildTaintContext() call throw first, short-circuiting before
+        // execution ever reaches here. Kept anyway: it costs nothing, and
+        // it's the only thing standing between an integrator who changes
+        // one file's depth bound (or gateDecision()'s check order) without
+        // the other and reopening an unaudited RangeError right here.
+        hosts = findOutboundHosts(argsSnapshot);
+      } catch (error) {
+        if (error instanceof ArgsTooDeepError) this.auditArgsTooDeep(call, sinkClass, error);
+        throw error;
       }
-
-      const decision = await this.policy(call, taint);
-      let executed = false;
-
-      if (decision.action === 'ALLOW' || decision.action === 'ALLOW_WITH_WARNING') {
-        result = await tool.execute(this.cloneArgsOrThrow(toolName, args));
-        executed = true;
-      } else if (decision.action === 'REQUIRE_APPROVAL') {
-        const granted = this.approvalChannel
-          ? await this.approvalChannel.requestApproval(call, taint, decision)
-          : false;
-        if (granted) {
-          result = await tool.execute(this.cloneArgsOrThrow(toolName, args));
-          executed = true;
-        }
-      }
-      // BLOCK / QUARANTINE_AND_RETRY, or a denied REQUIRE_APPROVAL: never auto-executed (§7.2).
-
-      this.auditSink.record({ verdict: decision, call, taint, at: Date.now(), executed });
-      if (!executed) {
-        throw new ToolCallBlockedError(call, decision, blockedMessage(toolName, decision));
+      const disallowedHosts = hosts.filter((host) => !isAllowedOutboundHost(host, allowlist));
+      if (disallowedHosts.length > 0) {
+        this.auditSink.record({
+          verdict: {
+            action: 'BLOCK',
+            reason: `Outbound host allowlist violation: ${disallowedHosts.map((h) => `"${h}"`).join(', ')} not in BrokerOptions.allowedOutboundHosts.`,
+          },
+          call,
+          taint,
+          at: Date.now(),
+          executed: false,
+        });
+        throw new DisallowedOutboundHostError(toolName, disallowedHosts);
       }
     }
 
+    const decision = await this.policy(call, taint);
+    return { taint, decision };
+  }
+
+  /**
+   * Records a BLOCK audit event for an ArgsTooDeepError caught while
+   * computing this call's gating inputs (buildTaintContext()'s scan, or
+   * findOutboundHosts()'s egress scan) — the one structural rejection in
+   * gateDecision() that can happen before a real TaintContext exists to
+   * audit with. Uses the CURRENT scope watermark (still fully valid,
+   * unaffected by the failed scan) for scopeLevel/privateDataSeen, with
+   * matchedRecords empty and argFingerprintFloor CLEAN to honestly reflect
+   * that Layer 2 never got to run — never claiming a clean scan that didn't
+   * actually happen. See ArgsTooDeepError's doc comment (errors.ts).
+   */
+  private auditArgsTooDeep(call: ToolCall, sinkClass: SinkClass, error: ArgsTooDeepError): void {
+    const taint: TaintContext = {
+      matchedRecords: [],
+      scopeLevel: this.currentScope.watermark.level,
+      argFingerprintFloor: 'CLEAN',
+      privateDataSeen: this.currentScope.watermark.privateDataSeen,
+      sinkClass,
+    };
+    this.auditSink.record({
+      verdict: { action: 'BLOCK', reason: error.message },
+      call,
+      taint,
+      at: Date.now(),
+      executed: false,
+    });
+  }
+
+  /**
+   * Runs `decision`, waiting for human approval if required, revalidating
+   * against the current watermark immediately before ever executing, then
+   * auditing and returning the result — the tail half of the gated path,
+   * run under the lock again after dispatchGated()'s unlocked approval wait.
+   */
+  private async finalizeGated(
+    tool: ToolExecutor,
+    call: ToolCall,
+    argsSnapshot: unknown,
+    sinkClass: SinkClass,
+    taint: TaintContext,
+    decision: PolicyDecision,
+    approvedByHuman: boolean,
+  ): Promise<unknown> {
+    const toolName = call.toolName;
+    let result: unknown;
+    let executed = false;
+    let auditTaint = taint;
+    let auditDecision = decision;
+
+    const provisionallyApproved =
+      decision.action === 'ALLOW' ||
+      decision.action === 'ALLOW_WITH_WARNING' ||
+      (decision.action === 'REQUIRE_APPROVAL' && approvedByHuman);
+
+    if (provisionallyApproved) {
+      const revalidated = await this.revalidateBeforeExecute(
+        call,
+        argsSnapshot,
+        sinkClass,
+        taint,
+        decision,
+      );
+      auditTaint = revalidated.taint;
+      auditDecision = revalidated.decision;
+      if (revalidated.proceed) {
+        result = await tool.execute(this.cloneArgsOrThrow(toolName, argsSnapshot));
+        executed = true;
+      }
+    }
+    // BLOCK / QUARANTINE_AND_RETRY, a denied REQUIRE_APPROVAL, or a
+    // watermark escalation caught by revalidateBeforeExecute(): never
+    // auto-executed (§7.2).
+
+    this.auditSink.record({
+      verdict: auditDecision,
+      call,
+      taint: auditTaint,
+      at: Date.now(),
+      executed,
+    });
+    if (!executed) {
+      throw new ToolCallBlockedError(call, auditDecision, blockedMessage(toolName, auditDecision));
+    }
+
+    return this.finishDispatch(tool, call, sinkClass, result);
+  }
+
+  /**
+   * The gated (sinkClass !== 'NONE') dispatch path. In the common case
+   * (ALLOW / ALLOW_WITH_WARNING / BLOCK / QUARANTINE_AND_RETRY — no human
+   * in the loop), gateDecision() and finalizeGated() run inside ONE
+   * unbroken lock hold, exactly like the pre-fix single-lock dispatch: the
+   * lock must never be released between a call's decision and its
+   * execution when there is no async gap to release it across, or a call
+   * queued behind this one on the lock could interleave there and run out
+   * of turn (this is a real regression this fix hit and reverted — see the
+   * "gates correctly regardless of which call is listed first" test).
+   *
+   * Only a REQUIRE_APPROVAL decision splits into three phases, so the
+   * (potentially human-timescale) approval wait does not hold the
+   * broker-wide lock for its full duration:
+   *   1. gateDecision() under the lock — reach a decision against the
+   *      current watermark, atomically with respect to any concurrently-
+   *      dispatched source call.
+   *   2. Wait for the approval channel WITHOUT the lock held, so other
+   *      calls on this broker are not frozen for the wait.
+   *      markContextExposure() or another call's source tool can freely
+   *      raise the watermark during this window.
+   *   3. finalizeGated() under the lock again — revalidateBeforeExecute()
+   *      re-checks the watermark against phase 1's snapshot before ever
+   *      executing, closing the race phase 2's unlocked window (and,
+   *      independently, markContextExposure()'s always-unlocked nature)
+   *      would otherwise open.
+   */
+  private async dispatchGated(
+    tool: ToolExecutor,
+    call: ToolCall,
+    argsSnapshot: unknown,
+    sinkClass: SinkClass,
+  ): Promise<unknown> {
+    const phase1 = await this.withLock(async () => {
+      const { taint, decision } = await this.reentrancyGuard.run({ lockHeld: true }, () =>
+        this.gateDecision(tool, call, argsSnapshot, sinkClass),
+      );
+      if (decision.action !== 'REQUIRE_APPROVAL') {
+        const result = await this.reentrancyGuard.run({ lockHeld: true }, () =>
+          this.finalizeGated(tool, call, argsSnapshot, sinkClass, taint, decision, false),
+        );
+        return { needsApproval: false as const, result };
+      }
+      return { needsApproval: true as const, taint, decision };
+    });
+
+    if (!phase1.needsApproval) {
+      return phase1.result;
+    }
+    const { taint, decision } = phase1;
+
+    const approvedByHuman = this.approvalChannel
+      ? await this.reentrancyGuard.run({ lockHeld: false }, () =>
+          this.approvalChannel!.requestApproval(call, taint, decision),
+        )
+      : false;
+
+    return this.withLock(() =>
+      this.reentrancyGuard.run({ lockHeld: true }, () =>
+        this.finalizeGated(tool, call, argsSnapshot, sinkClass, taint, decision, approvedByHuman),
+      ),
+    );
+  }
+
+  /** Post-execution bookkeeping shared by both the NONE-sinkClass and gated dispatch paths — always runs under whatever lock the caller currently holds. */
+  private finishDispatch(
+    tool: ToolExecutor,
+    call: ToolCall,
+    sinkClass: SinkClass,
+    result: unknown,
+  ): unknown {
+    const toolName = call.toolName;
     this.applyPostExecutionEffects(tool, call, result);
 
     if (sinkClass === 'NONE' && (tool.capabilities.readsPrivateData || isUntrustedSource(tool))) {
@@ -941,6 +1213,30 @@ class Broker implements ToolCallBroker {
   }
 }
 
+/**
+ * Creates one taint-tracked tool-call broker. **One instance = one
+ * session** (GAPS.md #19): every safety guarantee this library makes —
+ * the scope watermark, the Layer 2 fingerprint registry, and `withLock`'s
+ * call-ordering serialization (§8) — is per-INSTANCE in-memory state, not
+ * shared across `createBroker()` calls (even ones given the same
+ * `BrokerOptions.sessionId` — that field is a label for audit records, not
+ * a lookup key). Concretely:
+ *   - DO create exactly one broker per agent conversation/session, and
+ *     reuse that same instance for the session's entire lifetime — across
+ *     turns too, via `startNewTurn()`/`resetScope`, never by constructing
+ *     a fresh broker mid-session (that silently resets the watermark to
+ *     CLEAN, discarding whatever taint state existed).
+ *   - DO NOT reuse a single broker instance across two concurrent,
+ *     unrelated sessions/users — `withLock`'s serialization only
+ *     guarantees ordering between calls on the SAME instance; sharing one
+ *     instance would either serialize unrelated users' calls against each
+ *     other (a availability bug) or, if you work around that by routing
+ *     calls loosely, silently mix one user's watermark/registry state into
+ *     another's (a soundness bug far worse than either).
+ *   - For persistence across PROCESS restarts of the SAME session, see
+ *     GAPS.md #12 and `persistence.ts` — that is a different, supported
+ *     concern from cross-session sharing.
+ */
 export function createBroker(opts: BrokerOptions = {}): ToolCallBroker {
   return new Broker(opts);
 }

@@ -12,6 +12,7 @@
 
 import type { TaintLevel, TaintMatch, TaintRegistry } from '../types.js';
 import { LEVEL_ORDER, maxLevel } from '../types.js';
+import { ArgsTooDeepError } from '../errors.js';
 import { isTaintedValue } from './wrapper.js';
 
 export interface ScanResult {
@@ -27,6 +28,18 @@ export interface ScanResult {
 // from `matches` afterward, so truncating this array can never affect a
 // policy verdict, only how many matched records an audit/approval UI sees.
 const MAX_SCAN_MATCHES = 50;
+
+// Bounds the args tree's nesting depth `visit()` will recurse into. Without
+// this, a sufficiently deep tree (nested objects/arrays forwarded as a tool
+// argument — e.g. a prior tool's own deeply-nested JSON result passed
+// straight through) recurses until the JS call stack overflows: an
+// unpredictable-depth RangeError instead of a clean, catchable, documented
+// failure. 500 is comfortably below any realistic JS engine's stack limit
+// for this function's frame size, while remaining far deeper than any
+// legitimate real-world JSON payload plausibly nests. Same value used in
+// taint/egress.ts and taint/counterfactual-diff.ts for consistency — see
+// ArgsTooDeepError's doc comment in errors.ts.
+const MAX_ARGS_TREE_DEPTH = 500;
 
 export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanResult {
   const matches: TaintMatch[] = [];
@@ -66,7 +79,8 @@ export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanRe
   // first visit, so skipping loses no coverage.
   const visited = new WeakSet<object>();
 
-  function visit(node: unknown, path: string): void {
+  function visit(node: unknown, path: string, depth: number): void {
+    if (depth > MAX_ARGS_TREE_DEPTH) throw new ArgsTooDeepError(MAX_ARGS_TREE_DEPTH);
     if (node === null || node === undefined) return;
     if (typeof node === 'object') {
       if (visited.has(node)) return;
@@ -82,7 +96,7 @@ export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanRe
         const record = registry.getById(tag.id);
         if (record) matches.push({ record, matchType: 'wrapper', argPath: path, score: 1 });
       }
-      visit(node.value, path);
+      visit(node.value, path, depth + 1);
       return;
     }
 
@@ -92,7 +106,7 @@ export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanRe
     }
 
     if (Array.isArray(node)) {
-      node.forEach((child, i) => visit(child, `${path}[${i}]`));
+      node.forEach((child, i) => visit(child, `${path}[${i}]`, depth + 1));
       return;
     }
 
@@ -103,12 +117,12 @@ export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanRe
         // string leaf too, not just what it maps to.
         const childPath = path ? `${path}.${key}` : key;
         checkStringLeaf(key, childPath);
-        visit(value, childPath);
+        visit(value, childPath, depth + 1);
       }
     }
   }
 
-  visit(args, '');
+  visit(args, '', 0);
   if (matches.length > MAX_SCAN_MATCHES) {
     // Level first, score second — same rationale as InMemoryTaintRegistry's
     // own per-lookup cap (registry.ts): `floor` above is already fixed by

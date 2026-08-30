@@ -234,3 +234,32 @@ export class DisallowedOutboundHostError extends TaintBrokerError {
     this.name = 'DisallowedOutboundHostError';
   }
 }
+
+/**
+ * Thrown when an argument tree's nesting depth exceeds a fixed bound during
+ * the mandatory taint scan (`scanArgsForTaint()`, `taint/scan.ts`), the
+ * outbound-host allowlist check (`findOutboundHosts()`, `taint/egress.ts`),
+ * or the standalone `diffProposedArgs()` utility
+ * (`taint/counterfactual-diff.ts`) — all three walk an args tree with a
+ * plain recursive function, and without a depth bound, a sufficiently deep
+ * tree (nested objects/arrays passed as a tool argument, or handed to
+ * `diffProposedArgs()` directly — e.g. forwarded from a prior tool's own
+ * deeply-nested JSON result) would recurse until the JS call stack
+ * overflows: an unpredictable-depth, easy-to-mishandle `RangeError` rather
+ * than a clean, documented, catchable failure at a fixed, generous bound.
+ *
+ * On the mandatory scan path (`broker.ts`'s `gateDecision()`), this fails
+ * CLOSED like every other structural rejection there (plan-freeze,
+ * `DisallowedOutboundHostError`): the call is `BLOCK`ed and audited, never
+ * silently allowed through on a partial/incomplete scan.
+ */
+export class ArgsTooDeepError extends TaintBrokerError {
+  constructor(maxDepth: number) {
+    super(
+      `Argument tree nesting exceeds the maximum supported depth (${maxDepth}). This is a fixed safety bound, not a ` +
+        'configurable option — without it, a sufficiently deep tree would recurse until the JS call stack overflows ' +
+        'instead of failing predictably. Flatten or restructure the argument shape if this is a legitimate deeply-nested payload.',
+    );
+    this.name = 'ArgsTooDeepError';
+  }
+}

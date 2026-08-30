@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ArgsTooDeepError,
   InMemoryTaintRegistry,
   NOT_SENSITIVE,
   scanArgsForTaint,
@@ -70,6 +71,20 @@ describe('scanArgsForTaint', () => {
     expect(floor).toBe('RAW_UNTRUSTED');
     // Visited once via `a`, skipped via `b` — still exactly one match, not zero.
     expect(matches.filter((m) => m.matchType === 'exact')).toHaveLength(1);
+  });
+
+  it('throws a clean, catchable ArgsTooDeepError instead of overflowing the call stack on a pathologically deep args tree', () => {
+    const registry = new InMemoryTaintRegistry();
+    let deep: unknown = 'bottom';
+    for (let i = 0; i < 10_000; i++) deep = { nested: deep };
+    expect(() => scanArgsForTaint({ payload: deep }, registry)).toThrow(ArgsTooDeepError);
+  });
+
+  it('does not reject an ordinary, realistically-nested args tree', () => {
+    const registry = new InMemoryTaintRegistry();
+    let ok: unknown = 'bottom';
+    for (let i = 0; i < 50; i++) ok = { nested: ok };
+    expect(() => scanArgsForTaint({ payload: ok }, registry)).not.toThrow();
   });
 
   it('caps the total returned matches across a large args tree without affecting the floor', () => {

@@ -20,8 +20,19 @@ describe('exactHash', () => {
 });
 
 describe('wordShingles', () => {
-  it('falls back to a single shingle for short text', () => {
-    expect(wordShingles('two words')).toEqual(['two words']);
+  it('a two-word text shingles as two overlapping unigrams, not one whole-text blob (GAPS.md #8)', () => {
+    expect(wordShingles('two words')).toEqual(['two', 'words']);
+  });
+
+  it('a short (< SHINGLE_WIDTH) text shingles at width-1, yielding multiple overlapping windows', () => {
+    expect(wordShingles('wire five hundred now')).toEqual([
+      'wire five hundred',
+      'five hundred now',
+    ]);
+  });
+
+  it('a single-word text has exactly one (unigram) shingle', () => {
+    expect(wordShingles('solo')).toEqual(['solo']);
   });
 
   it('produces overlapping windows for longer text', () => {
@@ -48,6 +59,18 @@ describe('overlapCoefficient', () => {
 
   it('is 0 when either side has no shingles', () => {
     expect(overlapCoefficient(new Uint32Array(), buildFingerprint(SOURCE).shingleHashes)).toBe(0);
+  });
+
+  it('detects overlap between two short (< SHINGLE_WIDTH), reordered near-duplicate texts — used to score exactly 0 (GAPS.md #8)', () => {
+    const a = buildFingerprint('wire hundred to attacker').shingleHashes; // 4 words
+    const b = buildFingerprint('attacker wire hundred to').shingleHashes; // last word moved to front
+    expect(overlapCoefficient(a, b)).toBeGreaterThan(0);
+  });
+
+  it('detects overlap between two short texts differing by a single word — used to score exactly 0 (GAPS.md #8)', () => {
+    const a = buildFingerprint('wire hundred to attacker').shingleHashes; // 4 words
+    const b = buildFingerprint('wire hundred to friend').shingleHashes; // last word swapped
+    expect(overlapCoefficient(a, b)).toBeGreaterThan(0);
   });
 });
 

@@ -48,14 +48,42 @@ export function fnv1a32(str: string, seed = 0x811c9dc5): number {
   return hash >>> 0;
 }
 
-/** Word-shingles of a normalized text. Short texts (< SHINGLE_WIDTH words) fall back to the whole text as one shingle. */
+/**
+ * Word-shingles of a normalized text, as overlapping `width`-word windows.
+ *
+ * Short texts (< `width` words) do NOT fall back to treating the whole
+ * text as a single shingle — that used to be this function's behavior, and
+ * it silently defeated the "survives reordering" and "survives one text
+ * being a substring of the other" properties the module doc comment above
+ * claims, for exactly the shortest, most common realistic payloads (a URL,
+ * an account number, a short instruction): two short texts differing only
+ * by word order, or by a single word, produced two completely different
+ * single-shingle strings and so scored ZERO overlap — a full miss, not a
+ * partial one — even though the texts were near-identical. Instead, a
+ * short text uses the largest narrower width that still yields at least 2
+ * overlapping windows (`words.length - 1`, floored at 1 for a single-word
+ * text), restoring partial-overlap detection for short-text near-
+ * duplicates and reorderings.
+ *
+ * This does NOT fix the separate, still-open cross-length case: a short
+ * excerpt narrow enough to hit this path, embedded verbatim in a MUCH
+ * longer document that itself is always shingled at the full `width`
+ * (never narrowed — see the `words.length >= width` branch below), still
+ * shares no shingle string with it, since a shingle is a whole joined
+ * n-gram string, not a bag of words — two different widths simply never
+ * produce equal strings. Doing so would require multi-width shingling on
+ * long documents too, at a real, roughly-multiplicative storage/indexing
+ * cost this library has not made (see GAPS.md #8's false-negative note and
+ * DESIGN.md's fixed-size-sketch implementation note for the related
+ * cost/accuracy tradeoff already measured and rejected once here).
+ */
 export function wordShingles(text: string, width: number = SHINGLE_WIDTH): string[] {
   const words = normalize(text).split(' ').filter(Boolean);
   if (words.length === 0) return [];
-  if (words.length < width) return [words.join(' ')];
+  const effectiveWidth = words.length >= width ? width : Math.max(1, words.length - 1);
   const shingles: string[] = [];
-  for (let i = 0; i <= words.length - width; i++) {
-    shingles.push(words.slice(i, i + width).join(' '));
+  for (let i = 0; i <= words.length - effectiveWidth; i++) {
+    shingles.push(words.slice(i, i + effectiveWidth).join(' '));
   }
   return shingles;
 }
