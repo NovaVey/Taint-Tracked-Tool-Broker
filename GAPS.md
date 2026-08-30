@@ -48,7 +48,7 @@ Benign boilerplate, disclaimers, or common phrasing shared between trusted and u
 
 ## 10. Sink/capability misclassification is the integrator's responsibility, unverified by the library
 
-A tool that actually performs exfiltration (a DNS lookup embedded in an argument, a "read-only" API call with a logging side-channel) but is registered with an empty or wrong `capabilities` array is invisible to every policy check. Likewise a tool wrongly omitting `isSource`/`readsPrivateData` silently breaks watermark-raising or the private-data escalator.
+A tool that actually performs exfiltration (a DNS lookup embedded in an argument, a "read-only" API call with a logging side-channel) but is registered with an empty or wrong `capabilities` array is invisible to every policy check. Likewise a tool wrongly omitting `isSource`/`readsPrivateData` silently breaks watermark-raising or the private-data escalator. `docs/classifying-tools.md` is a checklist and worked examples (a filesystem MCP server, a RAG retrieval tool, a "read-only" API with a logging side channel, a code-interpreter tool) for the less-obvious cases — it reduces how often this goes wrong, it cannot verify a declaration against what a tool's `execute()` actually does.
 
 ## 11. The broker is only as sound as its position as the sole path to execution
 
