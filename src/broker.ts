@@ -118,8 +118,12 @@ class Broker implements ToolCallBroker {
     if (opts.initialWatermark) {
       this.currentScope.watermark = { ...opts.initialWatermark, sources: [...opts.initialWatermark.sources] };
     }
-    this.summarize = createQuarantine(opts.quarantineImpl ?? unconfiguredQuarantineImpl, this.registry, (tag) =>
-      raiseWatermark(this.currentScope, 'DERIVED_UNTRUSTED', tag),
+    this.summarize = createQuarantine(
+      opts.quarantineImpl ?? unconfiguredQuarantineImpl,
+      this.registry,
+      (tag) => raiseWatermark(this.currentScope, 'DERIVED_UNTRUSTED', tag),
+      () => this.currentScope.watermark,
+      this.auditSink,
     );
   }
 
@@ -203,9 +207,14 @@ class Broker implements ToolCallBroker {
     let result: unknown;
 
     if (sinkClass === 'NONE') {
-      // Not a privileged sink: no gating, no audit record. Source tools
-      // (fetch_url, read_email, ...) typically land here — their taint
-      // effects are applied below, after execution, regardless of sinkClass.
+      // Not a privileged sink: no gating. Source tools (fetch_url,
+      // read_email, ...) typically land here — their taint effects are
+      // applied below, after execution, regardless of sinkClass. A NONE-
+      // sinkClass call with no side effect on the watermark/private-data
+      // flag (an ordinary noop, or a trusted source) still gets no audit
+      // record — nothing safety-relevant happened. One that DOES raise the
+      // watermark or the private-data flag is audited below, after those
+      // effects are applied, so the recorded taint reflects the new state.
       result = await tool.execute(this.cloneArgsOrThrow(toolName, args));
     } else {
       const { matches, floor } = scanArgsForTaint(argsSnapshot, this.registry);
@@ -263,17 +272,54 @@ class Broker implements ToolCallBroker {
     }
 
     this.applyPostExecutionEffects(tool, call, result);
+
+    if (sinkClass === 'NONE' && (tool.capabilities.readsPrivateData || (tool.isSource && !tool.trusted))) {
+      const reasons: string[] = [];
+      if (tool.isSource && !tool.trusted) reasons.push(`untrusted source call raised the scope watermark to ${this.currentScope.watermark.level}.`);
+      if (tool.capabilities.readsPrivateData) reasons.push('private data was read this scope (lethal-trifecta escalator, §3.2).');
+      this.auditSink.record({
+        verdict: { action: 'ALLOW_WITH_WARNING', reason: reasons.join(' ') },
+        call,
+        taint: {
+          matchedRecords: [],
+          scopeLevel: this.currentScope.watermark.level,
+          argFingerprintFloor: 'CLEAN',
+          privateDataSeen: this.currentScope.watermark.privateDataSeen,
+          sinkClass: 'NONE',
+        },
+        at: Date.now(),
+        executed: true,
+      });
+    }
+
     return result;
   }
 
   markContextExposure(source: { toolName?: string; note: string }, level: TaintLevel = 'RAW_UNTRUSTED'): void {
-    raiseWatermark(this.currentScope, level, {
+    const provenance = {
       id: randomUUID(),
       sourceCallId: `context-exposure:${randomUUID()}`,
       toolName: source.toolName ?? '__untracked_context__',
       sessionId: this.sessionId,
       capturedAt: Date.now(),
       note: source.note,
+    };
+    raiseWatermark(this.currentScope, level, provenance);
+    this.auditSink.record({
+      verdict: {
+        action: 'ALLOW_WITH_WARNING',
+        reason: `markContextExposure(): untrusted content reached the model outside any tracked tool call (${provenance.toolName}) — "${source.note}". This is the manual escape hatch for GAPS.md #1; the library could not detect this exposure on its own.`,
+      },
+      call: { id: provenance.sourceCallId, toolName: '__tttb_context_exposure', args: { toolName: source.toolName, note: source.note, level }, sessionId: this.sessionId },
+      taint: {
+        matchedRecords: [],
+        scopeLevel: this.currentScope.watermark.level,
+        argFingerprintFloor: 'CLEAN',
+        privateDataSeen: this.currentScope.watermark.privateDataSeen,
+        sinkClass: 'NONE',
+      },
+      at: Date.now(),
+      executed: true,
     });
   }
 
@@ -285,11 +331,28 @@ class Broker implements ToolCallBroker {
   }
 
   declassify(reason: string, approvedBy: string): void {
+    // Snapshot the watermark's VALUES before clearing it — declassifyScope()
+    // mutates this.currentScope.watermark in place, so a plain reference
+    // taken beforehand would already read back as CLEAN afterward. Recording
+    // what was actually cleared (not just "declassify happened, now CLEAN",
+    // which is true of every declassify() call and so tells an investigator
+    // nothing) is the point of auditing this action at all.
+    const priorLevel = this.currentScope.watermark.level;
+    const priorPrivateDataSeen = this.currentScope.watermark.privateDataSeen;
     declassifyScope(this.currentScope);
     this.auditSink.record({
-      verdict: { action: 'ALLOW' },
+      verdict: {
+        action: 'ALLOW_WITH_WARNING',
+        reason: `declassify(): watermark manually cleared from ${priorLevel} — reason: "${reason}"; approved by ${approvedBy}.`,
+      },
       call: { id: randomUUID(), toolName: '__tttb_declassify', args: { reason, approvedBy }, sessionId: this.sessionId },
-      taint: { matchedRecords: [], scopeLevel: 'CLEAN', argFingerprintFloor: 'CLEAN', privateDataSeen: false, sinkClass: 'NONE' },
+      taint: {
+        matchedRecords: [],
+        scopeLevel: priorLevel,
+        argFingerprintFloor: 'CLEAN',
+        privateDataSeen: priorPrivateDataSeen,
+        sinkClass: 'NONE',
+      },
       at: Date.now(),
       executed: true,
     });
