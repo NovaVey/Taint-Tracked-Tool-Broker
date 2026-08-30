@@ -129,9 +129,48 @@ export interface BrokerOptions {
    * check; it is not a general egress-classification mechanism).
    */
   allowedOutboundHosts?: readonly string[] | ((hostname: string) => boolean);
+  /**
+   * Opt-in advisory heuristic for GAPS.md #10, mirroring
+   * `warnOnLikelyUnmarkedSource` above: when `register()`/`wrap()` is
+   * called for a tool declaring NO sink capabilities (`sinkClass === 'NONE'`
+   * — invisible to every policy check) whose `name` contains a keyword that
+   * often indicates a mutating/dangerous action, an `ALLOW_WITH_WARNING`
+   * `AuditEvent` flags it at registration time. The most probable real-world
+   * way #10 bites isn't a deliberately-deceptive tool (this heuristic
+   * cannot catch that — a genuinely deceptive tool wouldn't be named
+   * `delete_row` in the first place) — it's an ordinary tool (a
+   * `write_file`, a `send_email`, a `delete_row`) whose `capabilities` array
+   * was simply left empty or wrong by mistake. Purely advisory: never
+   * changes what's registered or gates anything, and can false-positive on
+   * a genuinely inert tool whose name happens to contain a matched keyword
+   * — tune the keyword list (or leave this unset) per how noisy that is for
+   * your tools. `true` uses a default keyword list (`write`, `delete`,
+   * `remove`, `exec`, `execute`, `send`, `post`, `purchase`, `pay`,
+   * `transfer`, `email`, `publish`, `deploy`, `shell`, `upload`); an array
+   * sets your own (case-insensitive substring match against the tool name).
+   */
+  warnOnLikelyUnclassifiedSink?: boolean | readonly string[];
 }
 
 const DEFAULT_UNMARKED_SOURCE_WARN_THRESHOLD = 200;
+
+const DEFAULT_UNCLASSIFIED_SINK_KEYWORDS: readonly string[] = [
+  'write',
+  'delete',
+  'remove',
+  'exec',
+  'execute',
+  'send',
+  'post',
+  'purchase',
+  'pay',
+  'transfer',
+  'email',
+  'publish',
+  'deploy',
+  'shell',
+  'upload',
+];
 
 const NOOP_AUDIT: AuditSink = { record() {} };
 
@@ -158,6 +197,7 @@ class Broker implements ToolCallBroker {
   private readonly warnOnLikelyUnmarkedSource: number | undefined;
   private readonly allowedOutboundHosts:
     readonly string[] | ((hostname: string) => boolean) | undefined;
+  private readonly warnOnLikelyUnclassifiedSink: readonly string[] | undefined;
   private readonly tools = new Map<string, ToolExecutor>();
   private currentScope: TaintScope;
 
@@ -214,6 +254,13 @@ class Broker implements ToolCallBroker {
           ? undefined
           : opts.warnOnLikelyUnmarkedSource;
     this.allowedOutboundHosts = opts.allowedOutboundHosts;
+    this.warnOnLikelyUnclassifiedSink =
+      opts.warnOnLikelyUnclassifiedSink === true
+        ? DEFAULT_UNCLASSIFIED_SINK_KEYWORDS
+        : opts.warnOnLikelyUnclassifiedSink === false ||
+            opts.warnOnLikelyUnclassifiedSink === undefined
+          ? undefined
+          : opts.warnOnLikelyUnclassifiedSink;
     this.registry = opts.registry ?? new InMemoryTaintRegistry();
     this.currentScope = createScope(this.resetScopeMode, this.sessionId);
     if (opts.initialWatermark) {
@@ -305,6 +352,38 @@ class Broker implements ToolCallBroker {
       // resolves. Rejected at registration time — see errors.ts and
       // GAPS.md.
       throw new DualRoleToolError(tool.name);
+    }
+    if (this.warnOnLikelyUnclassifiedSink !== undefined && sinkClass === 'NONE') {
+      // Opt-in, purely advisory (GAPS.md #10): the most probable real-world
+      // way #10 bites isn't a deliberately-deceptive tool (this cannot catch
+      // that — see BrokerOptions' own doc comment), it's an ordinary tool
+      // (a write_file, a send_email, a delete_row) whose capabilities array
+      // was simply left empty or wrong by mistake, the same "integrator
+      // forgot the declaration" shape warnOnLikelyUnmarkedSource catches for
+      // GAPS.md #1. Checked once at registration time (a static property of
+      // the declaration), not per-call like warnOnLikelyUnmarkedSource
+      // (which needs the actual returned text length, a runtime property).
+      const nameLower = tool.name.toLowerCase();
+      const matchedKeyword = this.warnOnLikelyUnclassifiedSink.find((kw) =>
+        nameLower.includes(kw.toLowerCase()),
+      );
+      if (matchedKeyword !== undefined) {
+        recordTrivialAudit(
+          this.auditSink,
+          {
+            action: 'ALLOW_WITH_WARNING',
+            reason: `Advisory: tool "${tool.name}" declares no sink capabilities (capabilities: []) but its name contains "${matchedKeyword}", which often indicates a mutating/dangerous action (GAPS.md #10). If this tool actually performs exec/write/exfil, it likely needs a non-empty capabilities array — this warning never changes what's registered or gates anything on its own.`,
+          },
+          {
+            id: randomUUID(),
+            toolName: '__tttb_registration_warning',
+            args: { toolName: tool.name, matchedKeyword },
+            sessionId: this.sessionId,
+          },
+          this.currentScope.watermark,
+          true,
+        );
+      }
     }
     this.tools.set(tool.name, tool);
   }
