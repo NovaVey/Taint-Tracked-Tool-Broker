@@ -78,6 +78,8 @@ Runs [`corpus/cases.ts`](./corpus/cases.ts): 14 cases across 12 attack classes �
 
 This library does not achieve information-flow-control soundness — it achieves a conservative, structural approximation with named, honest limits. It gates on "was untrusted content live in this scope's tracked context," which is a sound proxy for "did the model act on it," not proof of causal influence. See [`GAPS.md`](./GAPS.md) for the full list, including the two true known gaps the corpus asserts rather than papers over.
 
+Every gate rests on how you declare your own tools (`isSource`, `trusted`, `capabilities`, `readsPrivateData`) — get one wrong and that tool isn't gated incorrectly, it isn't gated at all, silently. See [`docs/classifying-tools.md`](./docs/classifying-tools.md) for a checklist and worked examples for the less-obvious cases.
+
 Found a way past the gating logic that isn't already in that list? See [`SECURITY.md`](./SECURITY.md).
 
 ## Development
