@@ -50,6 +50,16 @@
  * which is what soundness actually rests on — an evicted record can only
  * cost some future attribution precision or fingerprint-tightening
  * opportunity (GAPS.md #8), never open a hole in the core gate.
+ *
+ * `maxEntries` bounds record *count*; per-record memory (`shingleHashes`)
+ * is still proportional to document length, unbounded regardless of
+ * `maxEntries`. Before reaching for a fixed-size sketch (e.g. MinHash) to
+ * bound that too, read DESIGN.md's implementation note and
+ * `bench/minhash-sketch-tradeoff.ts` — that idea was prototyped and
+ * measured, not just proposed, and found to regress the "short excerpt
+ * embedded in a large document" detection this registry's own corpus case
+ * tests, by a wide and size-dependent margin even at generous sketch
+ * sizes. Not shipped; the numbers are real and reproducible.
  */
 
 import type { Fingerprint, FuzzyLookupOpts, ProvenanceTag, SensitivityLabel, TaintLevel, TaintMatch, TaintRecord, TaintRegistry } from '../types.js';

@@ -53,7 +53,11 @@
     "example": "tsx examples/basic-usage.ts",
     "example:mcp": "tsx examples/mcp-integration.ts",
     "example:tool-loop": "tsx examples/anthropic-tool-loop.ts",
+    "example:langchain": "tsx examples/langchain-integration.ts",
+    "example:vercel-ai": "tsx examples/vercel-ai-sdk-integration.ts",
+    "example:openai-agents": "tsx examples/openai-agents-sdk-integration.ts",
     "bench": "tsx bench/args-clone.ts",
+    "bench:minhash": "tsx bench/minhash-sketch-tradeoff.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
