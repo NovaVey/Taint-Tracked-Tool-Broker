@@ -1,0 +1,49 @@
+name: Bug report
+description: Something behaves differently from what DESIGN.md/README.md/GAPS.md say it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: if this is a way to get a privileged (`EXEC`/`MUTATE`/`EXFIL`-class) tool call through *without* correct gating — a security bypass rather than an ordinary bug — please use [private vulnerability reporting](https://github.com/NovaVey/Taint-Tracked-Tool-Broker/security/advisories/new) instead, per `SECURITY.md`. Everything else (crashes, wrong types, incorrect non-security behavior, docs that don't match the code) belongs here.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did the library actually do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: What should have happened, and where (README.md/DESIGN.md/GAPS.md/a doc comment) does it say so?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: A minimal, runnable snippet — ideally shaped like `examples/basic-usage.ts` or a `corpus/cases.ts` entry. Include the exact `ToolExecutor` declarations involved (isSource/capabilities/readsPrivateData) — most real bugs here turn out to hinge on those.
+      render: typescript
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Package version
+      description: Output of `npm ls taint-tracked-tool-broker`, or the commit SHA if installed from source.
+    validations:
+      required: true
+
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js version
+      description: Output of `node --version`.
+    validations:
+      required: true
