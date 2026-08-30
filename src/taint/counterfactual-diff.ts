@@ -39,6 +39,18 @@
  * just flat strings.
  */
 
+import { ArgsTooDeepError } from '../errors.js';
+
+// Same bound and rationale as taint/scan.ts's MAX_ARGS_TREE_DEPTH — see
+// ArgsTooDeepError's doc comment in errors.ts. Even though this utility
+// never touches the broker or any gating decision (see the module doc
+// comment above), an unbounded walk() here is just as exploitable/fragile
+// against a deeply-nested `actual`/`counterfactual` tree as the mandatory
+// scan path is — a caller passing through a prior tool's own deeply-nested
+// result deserves the same clean, catchable failure instead of an
+// unpredictable-depth RangeError.
+const MAX_ARGS_TREE_DEPTH = 500;
+
 /** One point where `actual` and `counterfactual` diverge. */
 export interface ArgDiff {
   /**
@@ -115,7 +127,8 @@ export function diffProposedArgs(actual: unknown, counterfactual: unknown): ArgD
   const visitedActual = new WeakSet<object>();
   const visitedCounterfactual = new WeakSet<object>();
 
-  function walk(a: unknown, b: unknown, path: string): void {
+  function walk(a: unknown, b: unknown, path: string, depth: number): void {
+    if (depth > MAX_ARGS_TREE_DEPTH) throw new ArgsTooDeepError(MAX_ARGS_TREE_DEPTH);
     const shapeA = shapeOf(a);
     const shapeB = shapeOf(b);
 
@@ -141,7 +154,7 @@ export function diffProposedArgs(actual: unknown, counterfactual: unknown): ArgD
       const bArr = b as unknown[];
       const len = Math.max(aArr.length, bArr.length);
       for (let i = 0; i < len; i++) {
-        walk(aArr[i], bArr[i], `${path}[${i}]`);
+        walk(aArr[i], bArr[i], `${path}[${i}]`, depth + 1);
       }
       return;
     }
@@ -157,10 +170,10 @@ export function diffProposedArgs(actual: unknown, counterfactual: unknown): ArgD
     const bRec = bObj as Record<string, unknown>;
     const keys = new Set([...Object.keys(aRec), ...Object.keys(bRec)]);
     for (const key of keys) {
-      walk(aRec[key], bRec[key], path ? `${path}.${key}` : key);
+      walk(aRec[key], bRec[key], path ? `${path}.${key}` : key, depth + 1);
     }
   }
 
-  walk(actual, counterfactual, '');
+  walk(actual, counterfactual, '', 0);
   return diffs;
 }

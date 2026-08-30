@@ -141,4 +141,5 @@ export {
   ReservedToolNameError,
   QuarantineSourceUnavailableError,
   DisallowedOutboundHostError,
+  ArgsTooDeepError,
 } from './errors.js';

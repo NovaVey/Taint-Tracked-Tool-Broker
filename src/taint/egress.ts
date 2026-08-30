@@ -17,6 +17,15 @@
  * exactly what this does and doesn't catch.
  */
 
+import { ArgsTooDeepError } from '../errors.js';
+
+// Same bound and rationale as taint/scan.ts's MAX_ARGS_TREE_DEPTH — see
+// ArgsTooDeepError's doc comment in errors.ts. This walk runs on the same
+// mandatory gating path (broker.ts's gateDecision(), for EXFIL-class calls
+// when allowedOutboundHosts is configured), so it needs the same protection
+// against a sufficiently deep argument tree overflowing the JS call stack.
+const MAX_ARGS_TREE_DEPTH = 500;
+
 function asHttpUrl(value: string): URL | undefined {
   try {
     const url = new URL(value);
@@ -56,7 +65,8 @@ export function findOutboundHosts(args: unknown): string[] {
   const hosts: string[] = [];
   const visited = new WeakSet<object>();
 
-  function visit(node: unknown): void {
+  function visit(node: unknown, depth: number): void {
+    if (depth > MAX_ARGS_TREE_DEPTH) throw new ArgsTooDeepError(MAX_ARGS_TREE_DEPTH);
     if (node === null || node === undefined) return;
     if (typeof node === 'string') {
       const url = asHttpUrl(node);
@@ -72,13 +82,13 @@ export function findOutboundHosts(args: unknown): string[] {
     if (visited.has(node)) return;
     visited.add(node);
     if (Array.isArray(node)) {
-      for (const child of node) visit(child);
+      for (const child of node) visit(child, depth + 1);
       return;
     }
-    for (const value of Object.values(node)) visit(value);
+    for (const value of Object.values(node)) visit(value, depth + 1);
   }
 
-  visit(args);
+  visit(args, 0);
   return hosts;
 }
 

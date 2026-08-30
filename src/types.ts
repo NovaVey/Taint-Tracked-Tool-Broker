@@ -272,7 +272,38 @@ export interface ToolExecutor<A = unknown, R = unknown> {
   capabilities: SinkCapabilities;
   /** Does a successful call raise the watermark to RAW_UNTRUSTED? */
   isSource?: boolean;
-  /** Deterministic/pure tools may opt out of raising even if isSource is set. */
+  /**
+   * Exempts an `isSource: true` tool from raising the watermark AND from
+   * Layer 2 fingerprint registration (`isUntrustedSource()`,
+   * `internal-audit.ts`) — its result is treated as though it never
+   * happened, safety-wise. `true` only when you have reviewed the actual
+   * code path and every possible result is either hardcoded, deterministic,
+   * or otherwise something no external party can shape — e.g. a local
+   * deploy-config file your own build process writes.
+   *
+   * The right question is "is the CONTENT genuinely not
+   * attacker-influenceable", not "is this function deterministic/pure" —
+   * those are not the same thing, and confusing them is the most likely way
+   * this field gets misused. A perfectly deterministic, side-effect-free
+   * function can still return attacker-influenceable content (e.g. one that
+   * pure-functionally fills a fixed template with a caller-supplied or
+   * otherwise externally-sourced argument — deterministic, but the
+   * TEMPLATE'S FILLED-IN VALUE can still carry an injected instruction).
+   * Conversely, "an internal API my company controls" is usually NOT a
+   * reasonable case for `trusted: true` unless you've also verified nothing
+   * upstream of it (another team's service, a partner integration,
+   * user-submitted content stored earlier) can reach it.
+   *
+   * This is the single most consequential yes/no in a `ToolExecutor`
+   * declaration — unlike every other gate here, a wrong `trusted: true`
+   * doesn't just misclassify a call, it makes the content permanently
+   * invisible to BOTH the watermark (Layer 0) and fingerprint matching
+   * (Layer 2), with no error and no audit trail hinting anything is
+   * missing (the same "integrator declares, library enforces" trust
+   * boundary as GAPS.md #10). When genuinely unsure, leave this unset
+   * (defaults to untrusted) — see `docs/classifying-tools.md`'s question 2
+   * for the full checklist and worked examples.
+   */
   trusted?: boolean;
   /**
    * Declare `true` if this tool's `execute()` calls `broker.summarize()`
@@ -436,6 +467,14 @@ export interface QuarantineSourceResult {
   taintRecordId: string;
 }
 
+/**
+ * One instance = one session (GAPS.md #19) — see `createBroker()`'s own
+ * doc comment in broker.ts for the full explanation. In short: the
+ * watermark, registry, and call-ordering lock this interface's guarantees
+ * rest on are all per-instance in-memory state, never shared across
+ * separate `createBroker()` calls; construct one per session and never
+ * reuse a single instance across two concurrent, unrelated sessions.
+ */
 export interface ToolCallBroker {
   register(tool: ToolExecutor): void;
   /** Registers `executor` and returns an interposed drop-in replacement whose execute() routes through call(). */

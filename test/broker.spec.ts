@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  ArgsTooDeepError,
   createBroker,
   DisallowedOutboundHostError,
   DualRoleToolError,
@@ -1532,6 +1533,39 @@ describe('args snapshotting', () => {
     expect(original.body).toBe('Original body the approver reviewed.');
   });
 
+  it('a caller mutating the object it passed to call() AFTER calling it (e.g. during a REQUIRE_APPROVAL wait) does not change what actually executes — execute() clones from the frozen snapshot taken at dispatch, never from the live object', async () => {
+    const executedArgs: unknown[] = [];
+    const liveArgs = { to: 'boss@example.com', body: 'Original body the approver reviewed.' };
+    const broker = createBroker({
+      approvalChannel: {
+        requestApproval: async () => {
+          // The caller keeps a reference to what it passed to call() and
+          // mutates it while the approval wait is still in flight — an
+          // entirely realistic pattern (e.g. reusing a request object
+          // across retries). This must never reach execute().
+          liveArgs.body = 'TAMPERED body the approver never saw';
+          return true;
+        },
+      },
+    });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register({
+      name: 'send_email',
+      capabilities: { capabilities: ['net:email'] },
+      async execute(args) {
+        executedArgs.push(args);
+        return 'sent';
+      },
+    });
+    await broker.call('fetch_url', {});
+    await broker.call('send_email', liveArgs);
+
+    expect(executedArgs[0]).toEqual({
+      to: 'boss@example.com',
+      body: 'Original body the approver reviewed.',
+    });
+  });
+
   it('passes the full REQUIRE_APPROVAL decision (including approvalToken) to the approval channel', async () => {
     let seenToken: string | undefined;
     const broker = createBroker({
@@ -1576,6 +1610,150 @@ describe('args snapshotting', () => {
     await expect(broker.call('shell_exec', { cmd: 'echo hi' })).rejects.toBeInstanceOf(
       NonCloneableArgsError,
     );
+  });
+});
+
+// Regression coverage for a real race: a gated call's decision is computed
+// against a taint snapshot, but the watermark can move during any async gap
+// between that snapshot and execute() actually running — a slow custom
+// PolicyFn's own await, or a REQUIRE_APPROVAL wait. markContextExposure()
+// (and its 3 specializations) never acquires the broker lock by design
+// (GAPS.md #1's synchronous escape hatch), so it — or a concurrently-
+// dispatched source call, once the lock is released around a
+// REQUIRE_APPROVAL wait — can land in either gap. revalidateBeforeExecute()
+// re-checks the watermark immediately before ever executing and re-decides
+// against the current state rather than trusting a now-stale decision.
+describe('revalidation before execute (async-gap watermark escalation)', () => {
+  it('an escalation landing during a REQUIRE_APPROVAL wait blocks execution instead of trusting the now-stale approved decision', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      auditSink: { record: (e) => events.push(e) },
+      approvalChannel: {
+        requestApproval: async () => {
+          // Raw untrusted content reaches the model mid-wait — e.g. a
+          // concurrent turn's tool result, or a poisoned tool description
+          // read while the human was still looking at the approval prompt.
+          broker.markContextExposure({ note: 'poisoned content arrives mid-approval-wait' });
+          return true; // approves what they were shown — DERIVED_UNTRUSTED, not RAW_UNTRUSTED
+        },
+      },
+    });
+    let shellRan = false;
+    broker.register({
+      name: 'shell_exec',
+      capabilities: { capabilities: ['exec:shell'] },
+      async execute() {
+        shellRan = true;
+        return 'ran';
+      },
+    });
+    broker.markContextExposure({ note: 'quarantine-derived content' }, 'DERIVED_UNTRUSTED');
+
+    await expect(broker.call('shell_exec', { cmd: 'echo hi' })).rejects.toBeInstanceOf(
+      ToolCallBlockedError,
+    );
+    expect(shellRan).toBe(false);
+    expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+    const last = events[events.length - 1]!;
+    expect(last.executed).toBe(false);
+    // The audited verdict reflects the ESCALATED taint's fresh decision
+    // (EXEC @ RAW_UNTRUSTED is an unconditional BLOCK), not the stale
+    // REQUIRE_APPROVAL the human actually approved.
+    expect(last.verdict.action).toBe('BLOCK');
+    expect(last.taint.scopeLevel).toBe('RAW_UNTRUSTED');
+  });
+
+  it("an escalation landing during a slow custom PolicyFn's own await — no approval channel involved at all — is caught the same way", async () => {
+    // `broker` is declared ahead of createBroker() (and assigned separately,
+    // rather than as `const broker = createBroker(...)`) so the policy
+    // closure below can reference the broker being constructed — it's only
+    // invoked later, on broker.call(), by which point the assignment below
+    // has completed.
+    let broker: ReturnType<typeof createBroker>;
+    let policyCallCount = 0;
+    // eslint-disable-next-line prefer-const -- see the declaration's comment above
+    broker = createBroker({
+      policy: async (call, taint) => {
+        policyCallCount++;
+        if (taint.scopeLevel === 'CLEAN') {
+          // First (stale) decision: computed while genuinely CLEAN, so a
+          // MUTATE sink is unconditionally ALLOW — but the exposure below
+          // lands before this async policy call even resolves.
+          broker.markContextExposure({ note: 'poisoned content arrives mid-policy-await' });
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return { action: 'ALLOW' };
+        }
+        // Revalidation's fresh call: taint now reflects the escalation.
+        return { action: 'BLOCK', reason: 'no longer clean' };
+      },
+    });
+    let wroteFile = false;
+    broker.register({
+      name: 'write_file',
+      capabilities: { capabilities: ['write:fs'] },
+      async execute() {
+        wroteFile = true;
+        return 'written';
+      },
+    });
+
+    await expect(broker.call('write_file', { path: '/tmp/x' })).rejects.toBeInstanceOf(
+      ToolCallBlockedError,
+    );
+    expect(wroteFile).toBe(false);
+    // Called twice: the original (stale) decision, then revalidateBeforeExecute()'s fresh one.
+    expect(policyCallCount).toBe(2);
+  });
+
+  it('no escalation during the wait: an ordinary REQUIRE_APPROVAL call still executes normally once granted (non-regression)', async () => {
+    const broker = createBroker({ approvalChannel: { requestApproval: async () => true } });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register(sendEmail());
+    await broker.call('fetch_url', {});
+    const result = await broker.call('send_email', { to: 'ops@example.com', body: 'hi' });
+    expect(result).toContain('sent:');
+  });
+});
+
+// Regression coverage for a liveness bug: REQUIRE_APPROVAL used to hold the
+// broker-wide lock for the approval channel's ENTIRE (potentially
+// human-timescale) wait, freezing every other gated call on the broker for
+// that whole duration. dispatchGated() now releases the lock around the
+// wait itself (see its doc comment) — a second, independently-gated call
+// queued behind a slow approval must reach its OWN approval prompt without
+// waiting for the first one to resolve.
+describe('REQUIRE_APPROVAL does not hold the broker lock for the whole wait (liveness)', () => {
+  it('a slow REQUIRE_APPROVAL wait for one call does not block a second gated call from reaching its own approval prompt', async () => {
+    const order: string[] = [];
+    const broker = createBroker({
+      approvalChannel: {
+        requestApproval: async (call) => {
+          order.push(`requested:${call.toolName}`);
+          if (call.toolName === 'send_email') {
+            await new Promise((resolve) => setTimeout(resolve, 60));
+          }
+          order.push(`resolved:${call.toolName}`);
+          return true;
+        },
+      },
+    });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register(sendEmail());
+    broker.register(netPost());
+    await broker.call('fetch_url', {}); // raises the watermark so both sinks below need approval
+
+    const [emailOutcome, postOutcome] = await Promise.allSettled([
+      broker.call('send_email', { to: 'a@example.com', body: 'hi' }),
+      broker.call('net_post', { url: 'https://example.com' }),
+    ]);
+
+    expect(emailOutcome.status).toBe('fulfilled');
+    expect(postOutcome.status).toBe('fulfilled');
+    // net_post's own approval prompt was reached (and resolved) WHILE
+    // send_email's slower approval wait was still in flight — proof the
+    // broker-wide lock was released around send_email's wait rather than
+    // holding every other gated call frozen for its full duration.
+    expect(order.indexOf('requested:net_post')).toBeLessThan(order.indexOf('resolved:send_email'));
   });
 });
 
@@ -1783,5 +1961,75 @@ describe('allowedOutboundHosts (opt-in egress allowlist, DESIGN.md §7.4)', () =
     expect(events).toHaveLength(1);
     expect(events[0]?.verdict.action).toBe('BLOCK');
     expect(events[0]?.executed).toBe(false);
+  });
+});
+
+// Regression coverage for a real DoS shape: scanArgsForTaint()'s mandatory
+// tree walk (and findOutboundHosts()'s, when allowedOutboundHosts is set)
+// had no recursion-depth bound, so a sufficiently deep args tree — nested
+// objects/arrays forwarded from, say, a prior tool's own deeply-nested JSON
+// result — would recurse until the JS call stack overflowed: an
+// unpredictable-depth RangeError instead of a clean, documented, catchable,
+// AUDITED failure.
+describe('ArgsTooDeepError (unbounded args-tree recursion)', () => {
+  function deepArgs(depth: number, bottom: unknown = 'bottom'): unknown {
+    let node = bottom;
+    for (let i = 0; i < depth; i++) node = { nested: node };
+    return { payload: node };
+  }
+
+  // 800: comfortably above scanArgsForTaint's own MAX_ARGS_TREE_DEPTH (500,
+  // so it reliably trips), and comfortably below the depth at which
+  // structuredClone() itself (broker.ts's cloneArgsOrThrow(), which always
+  // runs first, before any scan) starts throwing its own RangeError — which
+  // cloneArgsOrThrow already turns into NonCloneableArgsError regardless of
+  // this fix (GAPS.md #16), so a depth deep enough to hit THAT first would
+  // not actually be exercising scanArgsForTaint's own bound at all.
+  const TOO_DEEP = 800;
+
+  it('a pathologically deep args tree on a gated call throws ArgsTooDeepError, not a raw stack-overflow RangeError', async () => {
+    const broker = createBroker();
+    broker.register(shellExec());
+    await expect(broker.call('shell_exec', deepArgs(TOO_DEEP))).rejects.toBeInstanceOf(
+      ArgsTooDeepError,
+    );
+  });
+
+  it('records a BLOCK AuditEvent for it — this used to produce zero audit trail', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.register(shellExec());
+    await expect(broker.call('shell_exec', deepArgs(TOO_DEEP))).rejects.toBeInstanceOf(
+      ArgsTooDeepError,
+    );
+    expect(events).toHaveLength(1);
+    expect(events[0]?.verdict.action).toBe('BLOCK');
+    expect(events[0]?.executed).toBe(false);
+  });
+
+  it('a deep args tree on an EXFIL call with allowedOutboundHosts configured also throws ArgsTooDeepError end-to-end, not a raw RangeError', async () => {
+    // Caught by the same buildTaintContext() bound as the plain shell_exec
+    // case above (it always runs first in gateDecision(), before the
+    // outbound-host check ever gets a chance to run its own — see that
+    // check's own doc comment) — this asserts the end-to-end behavior for
+    // an allowedOutboundHosts-configured broker specifically, not a
+    // different code path.
+    const broker = createBroker({ allowedOutboundHosts: ['approved.example'] });
+    broker.register(netPost());
+    await expect(broker.call('net_post', deepArgs(TOO_DEEP))).rejects.toBeInstanceOf(
+      ArgsTooDeepError,
+    );
+  });
+
+  it('does not reject an ordinary, realistically-nested gated call', async () => {
+    const broker = createBroker();
+    broker.register(shellExec());
+    await expect(broker.call('shell_exec', deepArgs(50))).resolves.toBeDefined();
+  });
+
+  it('a NONE-sinkClass (ungated) call is never scanned at all, so a deep-but-still-cloneable args tree does not affect it', async () => {
+    const broker = createBroker();
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await expect(broker.call('fetch_url', deepArgs(TOO_DEEP))).resolves.toBe(MALICIOUS_PAGE);
   });
 });

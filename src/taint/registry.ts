@@ -25,7 +25,13 @@
  * Either index only narrows *which* records get the real, exact
  * hammingDistance()/overlapCoefficient() comparison below — scoring and
  * thresholding are byte-for-byte the same as a linear scan; only the
- * candidate set that has to be evaluated shrinks.
+ * candidate set that has to be evaluated shrinks. That narrowing is itself
+ * bounded by `maxFuzzyCandidatesPerLookup` (default 2000, see its own doc
+ * comment): a registry containing a large cluster of near-duplicate or
+ * coincidentally-shingle-colliding records can otherwise make a single
+ * band/shingle bucket collect a large fraction of the whole registry,
+ * silently degrading a lookup back toward the O(registry size) cost this
+ * indexing exists to avoid.
  *
  * Optional `maxEntries` bounds memory for long-running sessions (the
  * "pruning/retention policy" half of GAPS.md #13) by evicting the
@@ -79,6 +85,7 @@ const DEFAULT_SIMHASH_MAX_DISTANCE = 3; // out of 64 bits
 const DEFAULT_OVERLAP_MIN = 0.6;
 const MIN_TEXT_LEN_FOR_FUZZY = 40; // §4.2: "≥40-char substring window"
 const DEFAULT_MAX_FUZZY_MATCHES = 20; // FuzzyLookupOpts.maxMatches default — see its doc comment in types.ts
+const DEFAULT_MAX_FUZZY_CANDIDATES = 2000; // InMemoryTaintRegistryOpts.maxFuzzyCandidatesPerLookup default — see its doc comment
 
 const SIMHASH_BANDS = 8; // 64 / 8 = 8 bits/band; guarantees candidate recall for any simhashMaxDistance < 8 (see file header)
 const SIMHASH_BAND_BITS = 64 / SIMHASH_BANDS;
@@ -93,6 +100,25 @@ function simhashBands(simhash: bigint): number[] {
   return bands;
 }
 
+/**
+ * Adds ids from `source` into `into` until `into` reaches `cap`, then stops.
+ * Returns whether the cap was reached (so the caller can stop consulting
+ * further candidate sources too) — see fuzzyMatchesForFingerprint()'s
+ * candidate-gathering loop and maxFuzzyCandidatesPerLookup's doc comment.
+ */
+function addCandidatesUpTo(
+  source: Set<string> | undefined,
+  into: Set<string>,
+  cap: number,
+): boolean {
+  if (!source) return into.size >= cap;
+  for (const id of source) {
+    if (into.size >= cap) return true;
+    into.add(id);
+  }
+  return into.size >= cap;
+}
+
 export interface InMemoryTaintRegistryOpts {
   /**
    * Evict the oldest-registered record once a new registration would push
@@ -102,10 +128,40 @@ export interface InMemoryTaintRegistryOpts {
    * this).
    */
   maxEntries?: number;
+  /**
+   * Caps how many candidate records a single lookupFuzzy()/lookupCombined()
+   * call will exact-score (hammingDistance()/overlapCoefficient()), across
+   * BOTH the simhash-LSH-band and shingle-inverted-index candidate sources
+   * combined. This file's own header documents why the index narrows the
+   * candidate set in the common case — but a registry containing a large
+   * cluster of near-duplicate or coincidentally-shingle-colliding records
+   * (a realistic adversarial shape: many attacker-influenced pages sharing
+   * boilerplate text or phrasing) can make a single band or shingle bucket
+   * collect a large fraction of the whole registry, silently degrading a
+   * lookup back toward the O(registry size) per-call cost the indexing
+   * exists to avoid — and unlike `FuzzyLookupOpts.maxMatches`/
+   * `scanArgsForTaint`'s tree-wide cap (GAPS.md #13), which only bound the
+   * *returned* match list, nothing previously bounded the *candidate* set
+   * scored to produce it. This restores a hard ceiling on that cost
+   * regardless of how adversarial the registry's content becomes.
+   *
+   * Once the cap is hit, further candidates from either source are simply
+   * not considered for that lookup — a real match sitting outside the
+   * bound can be missed. This is the same already-documented "Layer 2 is
+   * approximate, never load-bearing for safety" territory as GAPS.md
+   * #8/#14 (a lower `simhashMaxDistance`/higher `jaccardMin` has the same
+   * tradeoff), not a new soundness concern: a missed fuzzy match can only
+   * cost attribution precision or a floor-raising tightening opportunity,
+   * never open a hole in the Layer 0 watermark gate. Defaults to 2000 —
+   * generous for legitimate workloads and never reached by any of this
+   * library's own corpus/test registries.
+   */
+  maxFuzzyCandidatesPerLookup?: number;
 }
 
 export class InMemoryTaintRegistry implements TaintRegistry {
   private readonly maxEntries: number | undefined;
+  private readonly maxFuzzyCandidatesPerLookup: number;
   /** Also the source of truth for insertion order — Map preserves it, and FIFO eviction reads straight off it. */
   private readonly byExactHash = new Map<string, TaintRecord>();
   /** band index -> band value -> candidate record ids sharing that band. */
@@ -125,7 +181,17 @@ export class InMemoryTaintRegistry implements TaintRegistry {
         `InMemoryTaintRegistry maxEntries must be a positive integer, got ${opts.maxEntries}.`,
       );
     }
+    if (
+      opts.maxFuzzyCandidatesPerLookup !== undefined &&
+      (!Number.isInteger(opts.maxFuzzyCandidatesPerLookup) || opts.maxFuzzyCandidatesPerLookup < 1)
+    ) {
+      throw new RangeError(
+        `InMemoryTaintRegistry maxFuzzyCandidatesPerLookup must be a positive integer, got ${opts.maxFuzzyCandidatesPerLookup}.`,
+      );
+    }
     this.maxEntries = opts.maxEntries;
+    this.maxFuzzyCandidatesPerLookup =
+      opts.maxFuzzyCandidatesPerLookup ?? DEFAULT_MAX_FUZZY_CANDIDATES;
   }
 
   get size(): number {
@@ -282,15 +348,21 @@ export class InMemoryTaintRegistry implements TaintRegistry {
     // this simhash, plus every record sharing at least one shingle. Exact
     // scoring below is unchanged from a full linear scan — only evaluated
     // against this narrowed set instead of every record in the registry.
+    // Bounded at maxFuzzyCandidatesPerLookup: a registry with a large
+    // cluster of near-duplicate/colliding records can otherwise make this
+    // "narrowed" set balloon back toward the whole registry — see that
+    // option's doc comment. Once the cap is hit, remaining sources are
+    // simply not consulted for this lookup.
     const candidateIds = new Set<string>();
+    const cap = this.maxFuzzyCandidatesPerLookup;
+    let capped = false;
     const bands = simhashBands(fp.simhash);
-    for (let i = 0; i < SIMHASH_BANDS; i++) {
-      const ids = this.simhashIndex[i]!.get(bands[i]!);
-      if (ids) for (const id of ids) candidateIds.add(id);
+    for (let i = 0; i < SIMHASH_BANDS && !capped; i++) {
+      capped = addCandidatesUpTo(this.simhashIndex[i]!.get(bands[i]!), candidateIds, cap);
     }
     for (const shingle of fp.shingleHashes) {
-      const ids = this.shingleIndex.get(shingle);
-      if (ids) for (const id of ids) candidateIds.add(id);
+      if (capped) break;
+      capped = addCandidatesUpTo(this.shingleIndex.get(shingle), candidateIds, cap);
     }
 
     const matches: TaintMatch[] = [];

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { diffProposedArgs } from '../src/index.js';
+import { ArgsTooDeepError, diffProposedArgs } from '../src/index.js';
 
 describe('diffProposedArgs', () => {
   it('returns no diffs for two identical plain-object trees', () => {
@@ -93,6 +93,26 @@ describe('diffProposedArgs', () => {
     counterfactual.self = counterfactual;
     const diffs = diffProposedArgs(actual, counterfactual);
     expect(diffs).toContainEqual({ path: 'x', actual: 1, counterfactual: 2 });
+  });
+
+  it('throws a clean, catchable ArgsTooDeepError instead of overflowing the call stack on a pathologically deep tree', () => {
+    let deepActual: unknown = 'bottom';
+    let deepCounterfactual: unknown = 'different';
+    for (let i = 0; i < 10_000; i++) {
+      deepActual = { nested: deepActual };
+      deepCounterfactual = { nested: deepCounterfactual };
+    }
+    expect(() => diffProposedArgs(deepActual, deepCounterfactual)).toThrow(ArgsTooDeepError);
+  });
+
+  it('does not reject an ordinary, realistically-nested tree', () => {
+    let a: unknown = 'bottom';
+    let b: unknown = 'bottom';
+    for (let i = 0; i < 50; i++) {
+      a = { nested: a };
+      b = { nested: b };
+    }
+    expect(() => diffProposedArgs(a, b)).not.toThrow();
   });
 
   it('compares two Date instances by time value, not by silently treating them as structurally equal empty objects', () => {
