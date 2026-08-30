@@ -4,6 +4,10 @@ All notable changes to this project are documented here. Format loosely follows 
 
 ## [Unreleased]
 
+### Added
+
+- **`.github/workflows/release.yml` now creates an actual GitHub Release**, not just a git tag, after a successful npm publish — a plain tag never got the repo's Releases page "Latest" badge, since that's a separate GitHub object a tag alone doesn't create. Uses the runner's preinstalled `gh` CLI (no new third-party Action) with `--generate-notes`; `permissions.contents` bumped from `read` to `write` accordingly.
+
 ## [0.2.0] - 2026-08-30
 
 ### Added
