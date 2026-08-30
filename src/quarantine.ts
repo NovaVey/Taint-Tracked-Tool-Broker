@@ -10,7 +10,17 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import type { ProvenanceTag, QuarantineFn, QuarantineImpl, QuarantineOpts, QuarantineResult, TaintRegistry } from './types.js';
+import type {
+  AuditSink,
+  ProvenanceTag,
+  QuarantineFn,
+  QuarantineImpl,
+  QuarantineOpts,
+  QuarantineResult,
+  TaintLevel,
+  TaintRegistry,
+  ToolCall,
+} from './types.js';
 import { buildFingerprint, exactHash, shingleIntersectionSize, toRegistrableText } from './taint/fingerprint.js';
 import { QuarantineInputMismatchError, QuarantineInputUnknownError } from './errors.js';
 
@@ -45,23 +55,69 @@ const MAX_LENGTH_EXPANSION = 2; // text may be at most this many times longer th
 // same-sized-but-unrelated text.
 const MIN_SOURCE_COVERAGE = 0.3; // fraction of text's own shingles that must trace back to the source
 
-export function createQuarantine(impl: QuarantineImpl, registry: TaintRegistry, raiseToDerivedUntrusted: (tag: ProvenanceTag) => void): QuarantineFn {
+export function createQuarantine(
+  impl: QuarantineImpl,
+  registry: TaintRegistry,
+  raiseToDerivedUntrusted: (tag: ProvenanceTag) => void,
+  getScope: () => { level: TaintLevel; privateDataSeen: boolean },
+  auditSink: AuditSink,
+): QuarantineFn {
   return async function summarize<S = string>(text: string, opts: QuarantineOpts<S>): Promise<QuarantineResult<S>> {
+    // §6.2 says this path is "auditable and policy-visible like any other
+    // call" (DESIGN.md). It isn't policy-gated — summarize() has no
+    // sinkClass to gate — but every branch below (both rejections and the
+    // success path) now genuinely reaches auditSink, closing what was
+    // previously a silent blind spot on one of the most safety-relevant
+    // control points in the design (the sanctioned way to relax gating).
+    const call: ToolCall = {
+      id: randomUUID(),
+      toolName: '__tttb_summarize',
+      args: { text, sourceTaintRecordId: opts.sourceTaintRecordId, hasSchema: opts.schema !== undefined },
+      sessionId: opts.sessionId,
+    };
+
     const sourceRecord = registry.getById(opts.sourceTaintRecordId);
     if (!sourceRecord) {
+      auditSink.record({
+        verdict: { action: 'BLOCK', reason: `summarize() input references unknown taint record "${opts.sourceTaintRecordId}" — see GAPS.md #4, DESIGN.md §6.2.` },
+        call,
+        taint: { matchedRecords: [], scopeLevel: getScope().level, argFingerprintFloor: 'CLEAN', privateDataSeen: getScope().privateDataSeen, sinkClass: 'NONE' },
+        at: Date.now(),
+        executed: false,
+      });
       throw new QuarantineInputUnknownError(opts.sourceTaintRecordId);
     }
 
     if (exactHash(text) !== sourceRecord.id) {
+      let mismatch = false;
+      let coverage = 0;
       if (text.length > sourceRecord.fingerprint.length * MAX_LENGTH_EXPANSION) {
-        throw new QuarantineInputMismatchError(opts.sourceTaintRecordId);
+        mismatch = true;
+      } else {
+        const inputFingerprint = buildFingerprint(text);
+        coverage =
+          inputFingerprint.shingleHashes.length === 0
+            ? 0
+            : shingleIntersectionSize(inputFingerprint.shingleHashes, sourceRecord.fingerprint.shingleHashes) / inputFingerprint.shingleHashes.length;
+        if (coverage < MIN_SOURCE_COVERAGE) mismatch = true;
       }
-      const inputFingerprint = buildFingerprint(text);
-      const coverage =
-        inputFingerprint.shingleHashes.length === 0
-          ? 0
-          : shingleIntersectionSize(inputFingerprint.shingleHashes, sourceRecord.fingerprint.shingleHashes) / inputFingerprint.shingleHashes.length;
-      if (coverage < MIN_SOURCE_COVERAGE) {
+      if (mismatch) {
+        auditSink.record({
+          verdict: {
+            action: 'BLOCK',
+            reason: `summarize() input text does not resemble the content of taint record "${sourceRecord.id}" (source-coverage check failed) — see GAPS.md #4, DESIGN.md §6.2.`,
+          },
+          call,
+          taint: {
+            matchedRecords: [{ record: sourceRecord, matchType: 'quarantine-derived', argPath: '', score: coverage }],
+            scopeLevel: getScope().level,
+            argFingerprintFloor: 'CLEAN',
+            privateDataSeen: getScope().privateDataSeen,
+            sinkClass: 'NONE',
+          },
+          at: Date.now(),
+          executed: false,
+        });
         throw new QuarantineInputMismatchError(opts.sourceTaintRecordId);
       }
     }
@@ -92,6 +148,23 @@ export function createQuarantine(impl: QuarantineImpl, registry: TaintRegistry, 
     // tier, not a clean bill of health, and (being monotonic, §4.1) cannot
     // undo an already-RAW_UNTRUSTED scope.
     raiseToDerivedUntrusted(provenance);
+
+    auditSink.record({
+      verdict: {
+        action: 'ALLOW_WITH_WARNING',
+        reason: `Quarantine/summarize: condensed untrusted content from taint record "${sourceRecord.id}" to a new DERIVED_UNTRUSTED record "${record.id}" (see DESIGN.md §6.2).`,
+      },
+      call: { ...call, args: { ...(call.args as Record<string, unknown>), outputTaintRecordId: record.id } },
+      taint: {
+        matchedRecords: [{ record: sourceRecord, matchType: 'quarantine-derived', argPath: '', score: 1 }],
+        scopeLevel: getScope().level,
+        argFingerprintFloor: sourceRecord.level,
+        privateDataSeen: getScope().privateDataSeen,
+        sinkClass: 'NONE',
+      },
+      at: Date.now(),
+      executed: true,
+    });
 
     return { text: outText, value, taintRecordId: record.id, level: 'DERIVED_UNTRUSTED' };
   };

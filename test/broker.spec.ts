@@ -63,6 +63,26 @@ describe('ToolCallBroker.call()', () => {
     expect(broker.scope.watermark.level).toBe('CLEAN');
   });
 
+  it('audits a source call that raises the watermark, unlike an ordinary NONE-sink call', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    expect(events).toHaveLength(1);
+    expect(events[0]?.verdict.action).toBe('ALLOW_WITH_WARNING');
+    expect(events[0]?.executed).toBe(true);
+    expect(events[0]?.call.toolName).toBe('fetch_url');
+    expect(events[0]?.taint.scopeLevel).toBe('RAW_UNTRUSTED');
+  });
+
+  it('does not audit a trusted source call — nothing safety-relevant happened', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.register(fetchUrl('benign content', { trusted: true }));
+    await broker.call('fetch_url', {});
+    expect(events).toEqual([]);
+  });
+
   it('BLOCK throws ToolCallBlockedError and never executes the tool', async () => {
     let executed = false;
     const broker = createBroker();
@@ -111,6 +131,23 @@ describe('ToolCallBroker.call()', () => {
     expect(broker.scope.watermark.privateDataSeen).toBe(true);
   });
 
+  it('audits a NONE-sink call that reads private data even when it is not a source', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.register({
+      name: 'lookup_profile',
+      capabilities: { capabilities: [], readsPrivateData: { categories: ['pii'] } },
+      async execute() {
+        return 'Jane Doe, 123 Main St';
+      },
+    });
+    await broker.call('lookup_profile', {});
+    expect(broker.scope.watermark.privateDataSeen).toBe(true);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.verdict.action).toBe('ALLOW_WITH_WARNING');
+    expect(events[0]?.taint.privateDataSeen).toBe(true);
+  });
+
   it('wrap() returns a drop-in executor whose execute() is interposed through the broker', async () => {
     const broker = createBroker();
     const wrapped = broker.wrap(fetchUrl(MALICIOUS_PAGE));
@@ -129,6 +166,17 @@ describe('markContextExposure', () => {
     broker.markContextExposure({ note: 'poisoned MCP tool description' });
     expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
     await expect(broker.call('shell_exec', { cmd: 'anything' })).rejects.toBeInstanceOf(ToolCallBlockedError);
+  });
+
+  it('records an audit event — the manual escape hatch for GAPS.md #1 must itself be observable', () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.markContextExposure({ toolName: 'some_mcp_tool', note: 'poisoned tool description' });
+    expect(events).toHaveLength(1);
+    expect(events[0]?.executed).toBe(true);
+    expect(events[0]?.verdict.action).toBe('ALLOW_WITH_WARNING');
+    expect(events[0]?.call.toolName).toBe('__tttb_context_exposure');
+    expect(events[0]?.taint.scopeLevel).toBe('RAW_UNTRUSTED');
   });
 });
 
@@ -156,6 +204,24 @@ describe('startNewTurn / declassify', () => {
     await broker.call('fetch_url', {});
     expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
     broker.declassify('reviewed and cleared by a human', 'alice@example.com');
+    expect(broker.scope.watermark.level).toBe('CLEAN');
+  });
+
+  it("declassify()'s audit event records what was cleared, not just that clearing happened", async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    events.length = 0; // drop the fetch_url source-call's own audit event; isolate declassify()'s
+
+    broker.declassify('reviewed and cleared by a human', 'alice@example.com');
+    expect(events).toHaveLength(1);
+    expect(events[0]?.call.toolName).toBe('__tttb_declassify');
+    // The prior (about-to-be-cleared) level, not the resulting CLEAN — that
+    // part is true of every declassify() call and would tell an
+    // investigator nothing about what was actually declassified.
+    expect(events[0]?.taint.scopeLevel).toBe('RAW_UNTRUSTED');
+    expect(events[0]?.verdict.action).toBe('ALLOW_WITH_WARNING');
     expect(broker.scope.watermark.level).toBe('CLEAN');
   });
 });
@@ -225,6 +291,62 @@ describe('broker.summarize() (quarantine path)', () => {
     await expect(broker.summarize(MALICIOUS_PAGE, { sessionId: 's', sourceTaintRecordId: record.id })).resolves.toMatchObject({
       level: 'DERIVED_UNTRUSTED',
     });
+  });
+
+  // DESIGN.md §6.2 says this path is "auditable ... like any other call" —
+  // these three regression-test that every branch (both rejections and the
+  // success path) actually reaches the audit sink, not just the ones a
+  // human happens to eyeball in a demo.
+  it('audits a rejected summarize() call — unknown source record', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ quarantineImpl: stubQuarantineImpl, auditSink: { record: (e) => events.push(e) } });
+    await expect(broker.summarize('text', { sessionId: 's', sourceTaintRecordId: 'unknown-id' })).rejects.toBeInstanceOf(
+      QuarantineInputUnknownError,
+    );
+    expect(events).toHaveLength(1);
+    expect(events[0]?.verdict.action).toBe('BLOCK');
+    expect(events[0]?.executed).toBe(false);
+    expect(events[0]?.call.toolName).toBe('__tttb_summarize');
+  });
+
+  it('audits a rejected summarize() call — input does not resemble the claimed source', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ quarantineImpl: stubQuarantineImpl, auditSink: { record: (e) => events.push(e) } });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    const record = broker.registry.lookupExact(MALICIOUS_PAGE);
+    if (!record) throw new Error('setup failed: source not registered');
+    events.length = 0; // drop the fetch_url source-call's own audit event; isolate summarize()'s
+
+    await expect(
+      broker.summarize('a completely unrelated string about quarterly revenue growth in the northeast region', {
+        sessionId: 's',
+        sourceTaintRecordId: record.id,
+      }),
+    ).rejects.toBeInstanceOf(QuarantineInputMismatchError);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.verdict.action).toBe('BLOCK');
+    expect(events[0]?.executed).toBe(false);
+  });
+
+  it('audits a successful summarize() call, tying it back to the source record', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ quarantineImpl: stubQuarantineImpl, auditSink: { record: (e) => events.push(e) } });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    const record = broker.registry.lookupExact(MALICIOUS_PAGE);
+    if (!record) throw new Error('setup failed: source not registered');
+    events.length = 0;
+
+    const result = await broker.summarize(MALICIOUS_PAGE, { sessionId: 's', sourceTaintRecordId: record.id });
+    expect(events).toHaveLength(1);
+    expect(events[0]?.verdict.action).toBe('ALLOW_WITH_WARNING');
+    expect(events[0]?.executed).toBe(true);
+    expect(events[0]?.call.toolName).toBe('__tttb_summarize');
+    expect(events[0]?.taint.matchedRecords[0]?.record.id).toBe(record.id);
+    expect(events[0]?.taint.matchedRecords[0]?.matchType).toBe('quarantine-derived');
+    expect(events[0]?.taint.scopeLevel).toBe('RAW_UNTRUSTED');
+    expect(result.taintRecordId).toBeDefined();
   });
 });
 
