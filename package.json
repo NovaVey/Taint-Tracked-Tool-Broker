@@ -6,11 +6,42 @@
   "license": "Apache-2.0",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NovaVey/Taint-Tracked-Tool-Broker.git"
+  },
+  "bugs": {
+    "url": "https://github.com/NovaVey/Taint-Tracked-Tool-Broker/issues"
+  },
+  "homepage": "https://github.com/NovaVey/Taint-Tracked-Tool-Broker#readme",
+  "keywords": [
+    "llm",
+    "agent",
+    "agentic",
+    "tool-calling",
+    "prompt-injection",
+    "taint-tracking",
+    "security",
+    "ai-safety",
+    "mcp",
+    "sandboxing"
+  ],
   "files": [
     "dist",
     "README.md",
     "DESIGN.md",
     "GAPS.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {

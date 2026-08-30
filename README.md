@@ -95,6 +95,8 @@ npm run build       # emit dist/
 npm run bench       # structuredClone vs jsonSafeClone args-cloning benchmark
 ```
 
+See [`CHANGELOG.md`](./CHANGELOG.md) for what's changed.
+
 ## License
 
 Apache-2.0 — see [`LICENSE`](./LICENSE).
