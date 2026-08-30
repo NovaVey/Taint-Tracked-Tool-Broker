@@ -7,8 +7,9 @@ export class TaintBrokerError extends Error {}
  * Thrown by register()/wrap() when a tool's name starts with the
  * `__tttb_` prefix TTTB reserves for its own internal/administrative
  * audit-only events (declassify(), startNewTurn(), markContextExposure(),
- * summarize()). Registering a real tool under this prefix would make its
- * audit events indistinguishable from one of those library-generated ones.
+ * summarize(), the warnOnLikelyUnclassifiedSink registration advisory).
+ * Registering a real tool under this prefix would make its audit events
+ * indistinguishable from one of those library-generated ones.
  */
 export class ReservedToolNameError extends TaintBrokerError {
   constructor(toolName: string) {
@@ -180,22 +181,35 @@ export class QuarantineSourceUnavailableError extends TaintBrokerError {
 
 /**
  * Thrown when broker.call() is invoked reentrantly — from within a tool's
- * own execute() (or anything it awaited) on the SAME broker instance,
- * before the outer call has finished. Reentrant calls would deadlock the
- * per-broker serialization lock that makes watermark raises atomic with
- * respect to concurrently-dispatched calls (see DESIGN.md's concurrency
- * implementation note). If a tool genuinely needs to invoke another
- * registered tool, call that tool's own execute() directly and take
+ * own execute() (or anything it awaited), OR from within a broker.summarize()
+ * quarantine callback (or anything IT awaited), on the SAME broker instance,
+ * before the outer call/summarize() has finished. Reentrant calls would
+ * deadlock the per-broker serialization lock that makes watermark raises
+ * atomic with respect to concurrently-dispatched calls (see DESIGN.md's
+ * concurrency implementation note). If a tool genuinely needs to invoke
+ * another registered tool, call that tool's own execute() directly and take
  * responsibility for its policy implications yourself.
+ *
+ * A useful side effect of this, not its original purpose: it also means a
+ * `QuarantineImpl` (the Q-LLM callback `broker.summarize()` invokes) cannot
+ * itself call `broker.call()` — the reentrancy guard is active for the
+ * callback's entire execution window, whether summarize() was called
+ * top-level or nested inside a tool's own execute(). This is one piece
+ * (not the whole) of the "quarantined model has no tool access" property
+ * DESIGN.md §6.2's dual-model-split note describes — structurally enforced,
+ * not merely a documented calling convention. See that note for exactly
+ * what this does and does not cover.
  */
 export class ReentrantCallError extends TaintBrokerError {
   constructor(toolName: string) {
     super(
-      `Reentrant broker.call("${toolName}", ...) detected: a tool's execute() (or something it awaited) called ` +
-        'broker.call() again on the same broker instance before the outer call finished. This is not supported — it ' +
-        'would deadlock the serialization lock that makes watermark raises atomic across concurrently-dispatched ' +
-        "calls. If a tool needs another registered tool's behavior, call its execute() directly instead of going " +
-        'back through the broker.',
+      `Reentrant broker.call("${toolName}", ...) detected: a tool's execute() (or something it awaited), or a ` +
+        'broker.summarize() quarantine callback (or something it awaited), called broker.call() again on the same ' +
+        'broker instance before the outer call/summarize() finished. This is not supported — it would deadlock the ' +
+        'serialization lock that makes watermark raises atomic across concurrently-dispatched calls. If a tool needs ' +
+        "another registered tool's behavior, call its execute() directly instead of going back through the broker. " +
+        'If this was a quarantine callback: a QuarantineImpl must be capability-less (DESIGN.md §6.2) — it cannot ' +
+        'invoke tools at all, by design.',
     );
     this.name = 'ReentrantCallError';
   }

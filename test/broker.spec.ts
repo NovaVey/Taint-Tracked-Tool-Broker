@@ -389,6 +389,129 @@ describe('warnOnLikelyUnmarkedSource (opt-in advisory heuristic, GAPS.md #1)', (
   });
 });
 
+describe('warnOnLikelyUnclassifiedSink (opt-in advisory heuristic, GAPS.md #10)', () => {
+  it('is off by default — a suspiciously-named unclassified tool is never flagged', () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.register({
+      name: 'write_file',
+      capabilities: { capabilities: [] },
+      async execute() {
+        return 'ok';
+      },
+    });
+    expect(events).toEqual([]);
+  });
+
+  it('flags, at registration time, a tool with empty capabilities whose name contains a default keyword', () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      warnOnLikelyUnclassifiedSink: true,
+      auditSink: { record: (e) => events.push(e) },
+    });
+    broker.register({
+      name: 'write_file',
+      capabilities: { capabilities: [] },
+      async execute() {
+        return 'ok';
+      },
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]?.verdict.action).toBe('ALLOW_WITH_WARNING');
+    expect(events[0]?.call.toolName).toBe('__tttb_registration_warning');
+    expect(events[0]?.executed).toBe(true);
+  });
+
+  it('matches case-insensitively', () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      warnOnLikelyUnclassifiedSink: true,
+      auditSink: { record: (e) => events.push(e) },
+    });
+    broker.register({
+      name: 'SEND_Email',
+      capabilities: { capabilities: [] },
+      async execute() {
+        return 'ok';
+      },
+    });
+    expect(events).toHaveLength(1);
+  });
+
+  it('does not flag a tool whose name matches no keyword', () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      warnOnLikelyUnclassifiedSink: true,
+      auditSink: { record: (e) => events.push(e) },
+    });
+    broker.register({
+      name: 'read_config',
+      capabilities: { capabilities: [] },
+      async execute() {
+        return 'ok';
+      },
+    });
+    expect(events).toEqual([]);
+  });
+
+  it('does not flag a correctly-classified tool, even with a matching name', () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      warnOnLikelyUnclassifiedSink: true,
+      auditSink: { record: (e) => events.push(e) },
+    });
+    broker.register({
+      name: 'write_file',
+      capabilities: { capabilities: ['write:fs'] }, // correctly declared -> sinkClass !== 'NONE'
+      async execute() {
+        return 'ok';
+      },
+    });
+    expect(events).toEqual([]);
+  });
+
+  it('honors a custom keyword list instead of the default one', () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      warnOnLikelyUnclassifiedSink: ['frobnicate'],
+      auditSink: { record: (e) => events.push(e) },
+    });
+    broker.register({
+      name: 'write_file', // matches a DEFAULT keyword, but not the custom list
+      capabilities: { capabilities: [] },
+      async execute() {
+        return 'ok';
+      },
+    });
+    expect(events).toEqual([]);
+
+    broker.register({
+      name: 'frobnicate_widget',
+      capabilities: { capabilities: [] },
+      async execute() {
+        return 'ok';
+      },
+    });
+    expect(events).toHaveLength(1);
+  });
+
+  it('wrap() (which calls register() internally) is flagged the same way', () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      warnOnLikelyUnclassifiedSink: true,
+      auditSink: { record: (e) => events.push(e) },
+    });
+    broker.wrap({
+      name: 'delete_record',
+      capabilities: { capabilities: [] },
+      async execute() {
+        return 'ok';
+      },
+    });
+    expect(events).toHaveLength(1);
+  });
+});
+
 describe('startNewTurn / declassify', () => {
   it("resetScope:'turn' clears the watermark on startNewTurn()", async () => {
     const broker = createBroker({ resetScope: 'turn' });
@@ -806,6 +929,104 @@ describe('broker.summarize() (quarantine path)', () => {
     expect(events[0]?.taint.matchedRecords[0]?.matchType).toBe('quarantine-derived');
     expect(events[0]?.taint.scopeLevel).toBe('RAW_UNTRUSTED');
     expect(result.taintRecordId).toBeDefined();
+  });
+
+  // DESIGN.md §6.2's dual-model-split note names "the quarantined model has
+  // no tool access" as a property the full CaMeL-style split has that
+  // summarize() alone doesn't claim to replicate. These two tests establish
+  // that one specific piece of it — a QuarantineImpl cannot itself call
+  // broker.call() — is not just a documented convention but is actually
+  // structurally enforced, as a side effect of the same reentrancy guard
+  // GAPS.md #17 added for lock-safety reasons. Covers both ways summarize()
+  // can be invoked (top-level, and nested inside a tool's own execute() —
+  // the composite fetch-and-quarantine pattern), since summarize()'s own
+  // wrapper (broker.ts) takes a different internal branch for each.
+  it('a quarantineImpl (Q-LLM) callback cannot call broker.call() — top-level summarize()', async () => {
+    let sinkRan = false;
+    let sawError: unknown;
+    const broker = createBroker({
+      quarantineImpl: async function <S = string>(text: string): Promise<S> {
+        try {
+          await broker.call('evil_sink', { text });
+        } catch (err) {
+          sawError = err;
+        }
+        return text as S;
+      },
+    });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register({
+      name: 'evil_sink',
+      capabilities: { capabilities: ['exec:shell'] },
+      async execute() {
+        sinkRan = true;
+        return 'pwned';
+      },
+    });
+    await broker.call('fetch_url', {});
+    const record = broker.registry.lookupExact(MALICIOUS_PAGE);
+    if (!record) throw new Error('setup failed: source not registered');
+
+    await broker.summarize(MALICIOUS_PAGE, { sessionId: 's', sourceTaintRecordId: record.id });
+
+    expect(sawError).toBeInstanceOf(ReentrantCallError);
+    expect(sinkRan).toBe(false); // the attempted privilege escalation never ran
+  });
+
+  it("a quarantineImpl (Q-LLM) callback cannot call broker.call() — summarize() nested inside a composite tool's execute()", async () => {
+    let sinkRan = false;
+    let sawError: unknown;
+    const broker = createBroker({
+      quarantineImpl: async function <S = string>(text: string): Promise<S> {
+        try {
+          await broker.call('evil_sink', { text });
+        } catch (err) {
+          sawError = err;
+        }
+        return text as S;
+      },
+    });
+    broker.register({
+      name: 'evil_sink',
+      capabilities: { capabilities: ['exec:shell'] },
+      async execute() {
+        sinkRan = true;
+        return 'pwned';
+      },
+    });
+    broker.register({
+      // Declares mayCallSummarize: true (DESIGN.md §6.2's composite
+      // fetch-and-quarantine pattern) so this tool is never barrier-exempt
+      // and runs inside the same lock-holding dispatch() its own nested
+      // summarize() call reuses — the OTHER branch of summarize()'s wrapper
+      // in broker.ts, distinct from the top-level test above.
+      name: 'fetch_and_quarantine',
+      capabilities: { capabilities: [] },
+      mayCallSummarize: true,
+      async execute() {
+        const record = broker.registry.register(
+          MALICIOUS_PAGE,
+          {
+            id: exactHash(MALICIOUS_PAGE),
+            sourceCallId: 'internal-fetch',
+            toolName: 'fetch_and_quarantine',
+            sessionId: 's',
+            capturedAt: 0,
+          },
+          'RAW_UNTRUSTED',
+          NOT_SENSITIVE,
+        );
+        return broker.summarize(MALICIOUS_PAGE, {
+          sessionId: 's',
+          sourceTaintRecordId: record.id,
+        });
+      },
+    });
+
+    await broker.call('fetch_and_quarantine', {});
+
+    expect(sawError).toBeInstanceOf(ReentrantCallError);
+    expect(sinkRan).toBe(false);
   });
 });
 

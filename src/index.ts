@@ -98,6 +98,8 @@ export {
 export { scanArgsForTaint } from './taint/scan.js';
 export type { ScanResult } from './taint/scan.js';
 export { findOutboundHosts, isAllowedOutboundHost } from './taint/egress.js';
+export { diffProposedArgs } from './taint/counterfactual-diff.js';
+export type { ArgDiff } from './taint/counterfactual-diff.js';
 export {
   createScope,
   createWatermark,

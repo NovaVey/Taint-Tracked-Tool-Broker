@@ -20,9 +20,11 @@ import type {
  * Prefix reserved for TTTB's own internal/administrative audit-only tool
  * names: `__tttb_context_exposure` (markContextExposure), `__tttb_turn_reset`
  * (startNewTurn), `__tttb_declassify` (declassify), `__tttb_summarize`
- * (summarize). A real tool registered under this prefix would be
- * indistinguishable, in the audit log, from one of these library-generated
- * events — register()/wrap() reject it; see errors.ts's ReservedToolNameError.
+ * (summarize), `__tttb_registration_warning` (register()'s
+ * warnOnLikelyUnclassifiedSink advisory, GAPS.md #10). A real tool
+ * registered under this prefix would be indistinguishable, in the audit
+ * log, from one of these library-generated events — register()/wrap()
+ * reject it; see errors.ts's ReservedToolNameError.
  */
 export const RESERVED_TOOL_NAME_PREFIX = '__tttb_';
 
