@@ -140,7 +140,7 @@ npm run bench       # structuredClone vs jsonSafeClone args-cloning benchmark
 npm run bench:minhash  # why fixed-size MinHash sketches were investigated and NOT shipped for the registry (DESIGN.md)
 ```
 
-See [`CHANGELOG.md`](./CHANGELOG.md) for what's changed.
+See [`CHANGELOG.md`](./CHANGELOG.md) for what's changed, and [`CONTRIBUTING.md`](./CONTRIBUTING.md) for what a good PR looks like (this project is small/solo-maintained per [`SECURITY.md`](./SECURITY.md), but PRs are welcome). Participation is governed by the [Code of Conduct](./CODE_OF_CONDUCT.md).
 
 ## License
 

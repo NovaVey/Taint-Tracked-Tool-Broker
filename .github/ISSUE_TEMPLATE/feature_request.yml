@@ -1,0 +1,44 @@
+name: Feature request
+description: Propose a new capability, API, or a change to an existing one.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check [`GAPS.md`](https://github.com/NovaVey/Taint-Tracked-Tool-Broker/blob/main/GAPS.md) first — if this is about a named limitation, the gap may already be tracked with the reasoning for why it's out of scope, deferred, or a deliberate trade-off (e.g. `resetScope: 'session'` vs `'turn'` vs `'turn-decay'`). If you think that reasoning is wrong, say so — that's still useful — but reference the specific gap number.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What can't you do today, or what are you working around?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: A sketch of the API/behavior, if you have one. Doesn't need to be final.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any existing escape hatch (e.g. `markContextExposure()`, `declarePlan()`, a custom `ApprovalChannel`) that partially covers this, and why it isn't enough.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: soundness
+    attributes:
+      label: Does this affect the watermark/gating soundness model?
+      description: See DESIGN.md §3 and GAPS.md's overclaiming disclaimer (#15). A change to what gets gated, or how, needs more scrutiny than an additive convenience API.
+      options:
+        - "No — purely additive/convenience (like registerAll(), defineSource())"
+        - "Yes — changes what gets gated or how (like a new ResetScope, a new SinkCapability)"
+        - "Not sure"
+    validations:
+      required: true
