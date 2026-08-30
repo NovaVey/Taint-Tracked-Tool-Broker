@@ -39,8 +39,23 @@ export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanRe
     }
   }
 
+  // Guards against a circular args object (e.g. a raw HTTP client/response
+  // object forwarded from a prior tool's result into a later call's
+  // arguments, unremarkable in ordinary JS) recursing forever. `structuredClone`
+  // happily produces a cyclic snapshot (Node's structuredClone supports
+  // cycles), so a cyclic value reaches this scan intact — this is reachable
+  // in practice, not just in theory. A node already visited is skipped, not
+  // re-scanned: a cycle can only make the same subtree reachable via a
+  // second path, never expose content that wasn't already scanned on its
+  // first visit, so skipping loses no coverage.
+  const visited = new WeakSet<object>();
+
   function visit(node: unknown, path: string): void {
     if (node === null || node === undefined) return;
+    if (typeof node === 'object') {
+      if (visited.has(node as object)) return;
+      visited.add(node as object);
+    }
 
     // Layer 1 fast path: a still-wrapped TaintedValue carries its own level
     // and sources directly — no hash lookup needed. It still gets attributed
