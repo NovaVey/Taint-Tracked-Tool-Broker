@@ -31,11 +31,13 @@ import { scanArgsForTaint } from './taint/scan.js';
 import { exactHash, toRegistrableText } from './taint/fingerprint.js';
 import { defaultPolicy } from './policy/default-policy.js';
 import { createQuarantine, unconfiguredQuarantineImpl } from './quarantine.js';
+import { isReservedToolName, isUntrustedSource, recordTrivialAudit } from './internal-audit.js';
 import {
   DualRoleToolError,
   NonCloneableArgsError,
   PlanNotDeclarableError,
   ReentrantCallError,
+  ReservedToolNameError,
   ToolCallBlockedError,
   UnknownToolError,
   UnplannedPrivilegedActionError,
@@ -141,13 +143,13 @@ class Broker implements ToolCallBroker {
     if (opts.initialWatermark) {
       this.currentScope.watermark = { ...opts.initialWatermark, sources: [...opts.initialWatermark.sources] };
     }
-    this.summarize = createQuarantine(
-      opts.quarantineImpl ?? unconfiguredQuarantineImpl,
-      this.registry,
-      (tag) => raiseWatermark(this.currentScope, 'DERIVED_UNTRUSTED', tag),
-      () => this.currentScope.watermark,
-      this.auditSink,
-    );
+    this.summarize = createQuarantine({
+      impl: opts.quarantineImpl ?? unconfiguredQuarantineImpl,
+      registry: this.registry,
+      raiseToDerivedUntrusted: (tag) => raiseWatermark(this.currentScope, 'DERIVED_UNTRUSTED', tag),
+      getScope: () => this.currentScope.watermark,
+      auditSink: this.auditSink,
+    });
   }
 
   get scope(): Readonly<TaintScope> {
@@ -172,8 +174,14 @@ class Broker implements ToolCallBroker {
   }
 
   register(tool: ToolExecutor): void {
+    if (isReservedToolName(tool.name)) {
+      // Reserved for the broker's own internal/administrative audit events
+      // (see internal-audit.ts) — a real tool registered under this prefix
+      // would be indistinguishable from one of those in the audit log.
+      throw new ReservedToolNameError(tool.name);
+    }
     const sinkClass = sinkClassOf(tool.capabilities.capabilities);
-    if (tool.isSource && !tool.trusted && sinkClass !== 'NONE') {
+    if (isUntrustedSource(tool) && sinkClass !== 'NONE') {
       // A single call to a dual-role tool could read untrusted content and
       // act on it in the same, un-gated step: the watermark that would
       // gate its OWN sink behavior can't rise until after execute()
@@ -296,23 +304,11 @@ class Broker implements ToolCallBroker {
 
     this.applyPostExecutionEffects(tool, call, result);
 
-    if (sinkClass === 'NONE' && (tool.capabilities.readsPrivateData || (tool.isSource && !tool.trusted))) {
+    if (sinkClass === 'NONE' && (tool.capabilities.readsPrivateData || isUntrustedSource(tool))) {
       const reasons: string[] = [];
-      if (tool.isSource && !tool.trusted) reasons.push(`untrusted source call raised the scope watermark to ${this.currentScope.watermark.level}.`);
+      if (isUntrustedSource(tool)) reasons.push(`untrusted source call raised the scope watermark to ${this.currentScope.watermark.level}.`);
       if (tool.capabilities.readsPrivateData) reasons.push('private data was read this scope (lethal-trifecta escalator, §3.2).');
-      this.auditSink.record({
-        verdict: { action: 'ALLOW_WITH_WARNING', reason: reasons.join(' ') },
-        call,
-        taint: {
-          matchedRecords: [],
-          scopeLevel: this.currentScope.watermark.level,
-          argFingerprintFloor: 'CLEAN',
-          privateDataSeen: this.currentScope.watermark.privateDataSeen,
-          sinkClass: 'NONE',
-        },
-        at: Date.now(),
-        executed: true,
-      });
+      recordTrivialAudit(this.auditSink, { action: 'ALLOW_WITH_WARNING', reason: reasons.join(' ') }, call, this.currentScope.watermark, true);
     }
 
     if (this.warnOnLikelyUnmarkedSource !== undefined && sinkClass === 'NONE' && !tool.isSource) {
@@ -330,22 +326,16 @@ class Broker implements ToolCallBroker {
         text = undefined;
       }
       if (text !== undefined && text.length >= this.warnOnLikelyUnmarkedSource) {
-        this.auditSink.record({
-          verdict: {
+        recordTrivialAudit(
+          this.auditSink,
+          {
             action: 'ALLOW_WITH_WARNING',
             reason: `Advisory: tool "${toolName}" is not registered isSource:true but returned ${text.length} chars of text (>= the warnOnLikelyUnmarkedSource threshold of ${this.warnOnLikelyUnmarkedSource}). If this tool can return content the agent didn't originate, it likely should be isSource:true (GAPS.md #1) — this warning never changes the watermark or gates anything on its own.`,
           },
           call,
-          taint: {
-            matchedRecords: [],
-            scopeLevel: this.currentScope.watermark.level,
-            argFingerprintFloor: 'CLEAN',
-            privateDataSeen: this.currentScope.watermark.privateDataSeen,
-            sinkClass: 'NONE',
-          },
-          at: Date.now(),
-          executed: true,
-        });
+          this.currentScope.watermark,
+          true,
+        );
       }
     }
 
@@ -373,27 +363,21 @@ class Broker implements ToolCallBroker {
       this.registry.register(source.text, provenance, level, NOT_SENSITIVE);
     }
     raiseWatermark(this.currentScope, level, provenance);
-    this.auditSink.record({
-      verdict: {
+    recordTrivialAudit(
+      this.auditSink,
+      {
         action: 'ALLOW_WITH_WARNING',
         reason: `markContextExposure(): untrusted content reached the model outside any tracked tool call (${provenance.toolName}) — "${source.note}". This is the manual escape hatch for GAPS.md #1; the library could not detect this exposure on its own.`,
       },
-      call: {
+      {
         id: provenance.sourceCallId,
         toolName: '__tttb_context_exposure',
         args: { toolName: source.toolName, note: source.note, level, ...(source.text !== undefined ? { text: source.text } : {}) },
         sessionId: this.sessionId,
       },
-      taint: {
-        matchedRecords: [],
-        scopeLevel: this.currentScope.watermark.level,
-        argFingerprintFloor: 'CLEAN',
-        privateDataSeen: this.currentScope.watermark.privateDataSeen,
-        sinkClass: 'NONE',
-      },
-      at: Date.now(),
-      executed: true,
-    });
+      this.currentScope.watermark,
+      true,
+    );
   }
 
   startNewTurn(): void {
@@ -418,22 +402,16 @@ class Broker implements ToolCallBroker {
       // exactly the moment GAPS.md #2's cross-turn risk crystallizes,
       // though, and (unlike declassify()) had no audit trail before this.
       if (priorLevel !== 'CLEAN') {
-        this.auditSink.record({
-          verdict: {
+        recordTrivialAudit(
+          this.auditSink,
+          {
             action: 'ALLOW_WITH_WARNING',
             reason: `startNewTurn(): turn boundary discarded a ${priorLevel} watermark${hadPlan ? ' and its declared plan' : ''} under resetScope:'turn'. See GAPS.md #2.`,
           },
-          call: { id: randomUUID(), toolName: '__tttb_turn_reset', args: {}, sessionId: this.sessionId },
-          taint: {
-            matchedRecords: [],
-            scopeLevel: priorLevel,
-            argFingerprintFloor: 'CLEAN',
-            privateDataSeen: priorPrivateDataSeen,
-            sinkClass: 'NONE',
-          },
-          at: Date.now(),
-          executed: true,
-        });
+          { id: randomUUID(), toolName: '__tttb_turn_reset', args: {}, sessionId: this.sessionId },
+          { level: priorLevel, privateDataSeen: priorPrivateDataSeen },
+          true,
+        );
       }
     }
     // 'session' mode: no-op by design — the watermark persists for the whole session (§4.1).
@@ -449,22 +427,16 @@ class Broker implements ToolCallBroker {
     const priorLevel = this.currentScope.watermark.level;
     const priorPrivateDataSeen = this.currentScope.watermark.privateDataSeen;
     declassifyScope(this.currentScope);
-    this.auditSink.record({
-      verdict: {
+    recordTrivialAudit(
+      this.auditSink,
+      {
         action: 'ALLOW_WITH_WARNING',
         reason: `declassify(): watermark manually cleared from ${priorLevel} — reason: "${reason}"; approved by ${approvedBy}.`,
       },
-      call: { id: randomUUID(), toolName: '__tttb_declassify', args: { reason, approvedBy }, sessionId: this.sessionId },
-      taint: {
-        matchedRecords: [],
-        scopeLevel: priorLevel,
-        argFingerprintFloor: 'CLEAN',
-        privateDataSeen: priorPrivateDataSeen,
-        sinkClass: 'NONE',
-      },
-      at: Date.now(),
-      executed: true,
-    });
+      { id: randomUUID(), toolName: '__tttb_declassify', args: { reason, approvedBy }, sessionId: this.sessionId },
+      { level: priorLevel, privateDataSeen: priorPrivateDataSeen },
+      true,
+    );
   }
 
   private applyPostExecutionEffects(tool: ToolExecutor, call: ToolCall, result: unknown): void {
@@ -474,7 +446,7 @@ class Broker implements ToolCallBroker {
       markPrivateDataSeen(this.currentScope);
     }
 
-    if (tool.isSource && !tool.trusted) {
+    if (isUntrustedSource(tool)) {
       // The watermark raise below is Layer 0 — load-bearing, must never be
       // skipped for an untrusted source's result. Fingerprint registration
       // (Layer 2) is best-effort/never load-bearing by design (§4.2) — so a

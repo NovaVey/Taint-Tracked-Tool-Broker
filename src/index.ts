@@ -111,4 +111,5 @@ export {
   NonCloneableArgsError,
   PlanNotDeclarableError,
   UnplannedPrivilegedActionError,
+  ReservedToolNameError,
 } from './errors.js';
