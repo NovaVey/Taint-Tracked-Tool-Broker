@@ -189,4 +189,41 @@ describe('InMemoryTaintRegistry', () => {
     expect(after?.level).toBe('RAW_UNTRUSTED');
     expect(after?.sensitivity).toEqual({ containsPrivateData: true, categories: ['pii'] });
   });
+
+  it('evicts by true age (provenance.capturedAt), not by Map insertion order — restore() can insert an old record last', () => {
+    const registry = new InMemoryTaintRegistry({ maxEntries: 2 });
+    // Two "live" records, registered normally and recently.
+    const b = registry.register(
+      'Record B, long enough to be a real registry entry for this eviction test.',
+      tag({ capturedAt: 1000 }),
+      'RAW_UNTRUSTED',
+      NOT_SENSITIVE,
+    );
+    const c = registry.register(
+      'Record C, long enough to be a real registry entry for this eviction test.',
+      tag({ capturedAt: 2000 }),
+      'RAW_UNTRUSTED',
+      NOT_SENSITIVE,
+    );
+
+    // A record genuinely captured much EARLIER (capturedAt: 0) — e.g. an
+    // exported snapshot from early in a long-running session, restored
+    // later after B and C are already live. restore() inserts it LAST by
+    // Map order despite it being oldest by capturedAt: exactly the
+    // divergence true-age eviction exists to handle correctly.
+    const stale = new InMemoryTaintRegistry().register(
+      'Record A, long enough to be a real registry entry for this eviction test.',
+      tag({ capturedAt: 0 }),
+      'RAW_UNTRUSTED',
+      NOT_SENSITIVE,
+    );
+    registry.restore(stale);
+    expect(registry.size).toBe(2); // maxEntries:2 forced an eviction
+
+    // If eviction still went by Map order, B (Map-oldest before this
+    // restore) would have been evicted instead of the truly-oldest `stale`.
+    expect(registry.getById(stale.id)).toBeUndefined();
+    expect(registry.getById(b.id)).toBeDefined();
+    expect(registry.getById(c.id)).toBeDefined();
+  });
 });

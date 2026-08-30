@@ -29,11 +29,19 @@
  *
  * Optional `maxEntries` bounds memory for long-running sessions (the
  * "pruning/retention policy" half of GAPS.md #13) by evicting the
- * oldest-registered record once the bound is exceeded — simple FIFO by
- * first-registration order, not LRU by lookup recency, and re-registering
- * already-known content (the dedup path below) deliberately does not
- * refresh its position. That keeps eviction easy to reason about and audit
- * ("content ages out in the order it first entered the system") rather than
+ * oldest record — by `provenance.capturedAt`, true chronological age, not
+ * Map insertion order — once the bound is exceeded. Those two usually
+ * coincide (an ordinary `register()` call's `capturedAt` is set at roughly
+ * the moment it's inserted), but they can genuinely diverge once
+ * `restore()` (persistence.ts) is in the picture: restoring an old
+ * snapshot's records into a registry that already has newer live entries
+ * inserts the old records LAST by Map order despite them being oldest by
+ * wall-clock time, and evicting by Map order there would evict the wrong
+ * (actually-newer) records first. FIFO by first-registration order, not
+ * LRU by lookup recency — re-registering already-known content (the dedup
+ * path below) deliberately does not refresh a record's `capturedAt` or its
+ * eviction priority. That keeps eviction easy to reason about and audit
+ * ("content ages out by when it first entered the system") rather than
  * silently reshuffled by read traffic. Unbounded (no eviction) by default,
  * so existing callers see no behavior change.
  *
@@ -180,7 +188,22 @@ export class InMemoryTaintRegistry implements TaintRegistry {
   private evictIfNeeded(): void {
     if (this.maxEntries === undefined) return;
     while (this.byExactHash.size > this.maxEntries) {
-      const oldestId = this.byExactHash.keys().next().value;
+      // O(size) per eviction — deliberately not a min-heap. Eviction only
+      // runs at capacity, at most once per new registration, and size is
+      // itself bounded by maxEntries; a heap would only pay for itself at
+      // maxEntries values far larger than what "bound memory for a
+      // long-running session" (the actual use case) calls for. Ties broken
+      // by Map/insertion order (the first-encountered record wins), which
+      // reproduces plain FIFO whenever every record's capturedAt happens to
+      // coincide with its registration order — the common case.
+      let oldestId: string | undefined;
+      let oldestCapturedAt = Infinity;
+      for (const [id, record] of this.byExactHash) {
+        if (record.provenance.capturedAt < oldestCapturedAt) {
+          oldestCapturedAt = record.provenance.capturedAt;
+          oldestId = id;
+        }
+      }
       if (oldestId === undefined) break; // unreachable (size > maxEntries >= 1), just in case
       const record = this.byExactHash.get(oldestId);
       this.byExactHash.delete(oldestId);

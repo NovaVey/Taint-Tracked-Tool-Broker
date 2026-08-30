@@ -178,7 +178,7 @@ The full, precise contract lives in `src/types.ts` and is authoritative for impl
 
 ## 9. Corpus Test Harness
 
-A corpus case pairs a scripted call sequence with an expected verdict and expected final watermark state. See `corpus/schema.ts` for the `CorpusCase` type and `corpus/cases/` for the eleven canonical attack classes (two of which — `untracked-context-channel` and `cross-turn-latent-influence` — are true, asserted known gaps, not silent misses: the corpus proves the library is honest about them, not that it catches them).
+A corpus case pairs a scripted call sequence with an expected verdict and expected final watermark state. See `corpus/schema.ts` for the `CorpusCase` type and `corpus/cases.ts` for the twelve attack classes covered — the eleven canonical classes from the design panel's synthesis plus `plan-freeze-unplanned-privileged-action` (added once `declarePlan()`, §11, shipped) — two of which (`untracked-context-channel` and `cross-turn-latent-influence`) are true, asserted known gaps, not silent misses: the corpus proves the library is honest about them, not that it catches them.
 
 A test runner replays `setupCalls` through mock source/sink tools to seed the registry and raise the watermark as real calls would, then replays `agentActions` in order (routing any `viaQuarantine` step through `broker.summarize()`), and asserts the recorded `PolicyDecision` and final watermark state match `expected`. Cases tagged with a known-gap `attackClass` assert the **documented** outcome, not an idealized one — so the corpus doubles as a regression check against silently overclaiming coverage.
 
