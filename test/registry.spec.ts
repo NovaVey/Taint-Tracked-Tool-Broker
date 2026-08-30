@@ -77,4 +77,90 @@ describe('InMemoryTaintRegistry', () => {
     expect(registry.lookupExact('never registered')).toBeUndefined();
     expect(registry.getById('nonexistent-id')).toBeUndefined();
   });
+
+  it('finds a fuzzy match among many unrelated records (indexed lookup, not a linear scan) — GAPS.md #13', () => {
+    const registry = new InMemoryTaintRegistry();
+    // A wide spread of unrelated filler text so any given query's LSH bands
+    // and shingles collide with only a small slice of the registry, the way
+    // the index is meant to narrow candidates in a long-running session.
+    for (let i = 0; i < 300; i++) {
+      registry.register(
+        `Filler document number ${i} describing unrelated topic ${i * 7} with padding words to clear the fuzzy-match length floor comfortably.`,
+        tag({ id: `filler-${i}` }),
+        'RAW_UNTRUSTED',
+        NOT_SENSITIVE,
+      );
+    }
+    const real = registry.register(SOURCE, tag({ id: 'real' }), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+
+    const wrapped = `Quoting the page: "${SOURCE}" — thought you should see this before end of day.`;
+    const matches = registry.lookupFuzzy(wrapped);
+    expect(matches.some((m) => m.record.id === real.id)).toBe(true);
+
+    const unrelated = registry.lookupFuzzy('The quarterly report shows steady growth across every region this year and next.');
+    expect(unrelated).toEqual([]);
+  });
+
+  it('rejects a non-positive-integer maxEntries', () => {
+    expect(() => new InMemoryTaintRegistry({ maxEntries: 0 })).toThrow(RangeError);
+    expect(() => new InMemoryTaintRegistry({ maxEntries: -1 })).toThrow(RangeError);
+    expect(() => new InMemoryTaintRegistry({ maxEntries: 1.5 })).toThrow(RangeError);
+  });
+
+  it('is unbounded by default — registering many records never evicts', () => {
+    const registry = new InMemoryTaintRegistry();
+    const first = registry.register('First record, long enough to clear the fuzzy floor easily on its own merits.', tag({ id: 'first' }), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+    for (let i = 0; i < 50; i++) {
+      registry.register(`Padding record ${i} to grow the registry well past any small default bound.`, tag({ id: `pad-${i}` }), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+    }
+    expect(registry.size).toBe(51);
+    expect(registry.getById(first.id)).toBeDefined();
+  });
+
+  it('evicts the oldest-registered record once maxEntries is exceeded (FIFO)', () => {
+    const registry = new InMemoryTaintRegistry({ maxEntries: 2 });
+    const a = registry.register('Record A, long enough to be a real registry entry for this eviction test.', tag({ id: 'a' }), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+    const b = registry.register('Record B, long enough to be a real registry entry for this eviction test.', tag({ id: 'b' }), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+    expect(registry.size).toBe(2);
+
+    const c = registry.register('Record C, long enough to be a real registry entry for this eviction test.', tag({ id: 'c' }), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+    expect(registry.size).toBe(2);
+    // A was oldest — evicted. B and C, the two most recently registered, survive.
+    expect(registry.getById(a.id)).toBeUndefined();
+    expect(registry.lookupExact('Record A, long enough to be a real registry entry for this eviction test.')).toBeUndefined();
+    expect(registry.getById(b.id)).toBeDefined();
+    expect(registry.getById(c.id)).toBeDefined();
+  });
+
+  it('re-registering already-known content does not refresh its eviction order (first-seen order, not last-seen)', () => {
+    const registry = new InMemoryTaintRegistry({ maxEntries: 2 });
+    const aText = 'Record A, long enough to be a real registry entry for this eviction test.';
+    const a = registry.register(aText, tag({ id: 'a' }), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+    registry.register('Record B, long enough to be a real registry entry for this eviction test.', tag({ id: 'b' }), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+    // Touching A again (dedup path) must not save it from eviction — it is
+    // still the oldest by first-registration, which is the property being
+    // audited, not by last-lookup/last-seen recency (see registry.ts header).
+    registry.register(aText, tag({ id: 'a-again' }), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+    registry.register('Record C, long enough to be a real registry entry for this eviction test.', tag({ id: 'c' }), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+
+    expect(registry.getById(a.id)).toBeUndefined();
+  });
+
+  it('eviction does not corrupt fuzzy matching for records that survive it', () => {
+    const registry = new InMemoryTaintRegistry({ maxEntries: 1 });
+    registry.register(SOURCE, tag({ id: 'evicted' }), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+    // Evicts the first record — its index entries must be fully removed
+    // without collateral damage to buckets that (by chance) also served it.
+    const survivor = registry.register(
+      'A second, unrelated but equally long piece of source content that will remain in the bounded registry.',
+      tag({ id: 'survivor' }),
+      'RAW_UNTRUSTED',
+      NOT_SENSITIVE,
+    );
+
+    expect(registry.getById('evicted')).toBeUndefined();
+    const wrapped = 'A second, unrelated but equally long piece of source content — quoted here — that will remain in the bounded registry, more or less.';
+    const matches = registry.lookupFuzzy(wrapped);
+    expect(matches.some((m) => m.record.id === survivor.id)).toBe(true);
+  });
 });

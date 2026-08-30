@@ -54,6 +54,7 @@ export type {
   QuarantineResult,
   QuarantineFn,
   QuarantineImpl,
+  PlanStep,
   ToolCallBroker,
 } from './types.js';
 
@@ -65,6 +66,10 @@ export type { BrokerOptions } from './broker.js';
 export { defaultPolicy } from './policy/default-policy.js';
 
 export { InMemoryTaintRegistry } from './taint/registry.js';
+export type { InMemoryTaintRegistryOpts } from './taint/registry.js';
+
+export { serializeRegistry, restoreRegistry, serializeBrokerState, restoreBrokerState } from './persistence.js';
+export type { SerializedTaintRecord, SerializedBrokerState } from './persistence.js';
 export {
   buildFingerprint,
   computeSimhash,
@@ -98,4 +103,7 @@ export {
   QuarantineInputUnknownError,
   DualRoleToolError,
   ReentrantCallError,
+  NonCloneableArgsError,
+  PlanNotDeclarableError,
+  UnplannedPrivilegedActionError,
 } from './errors.js';
