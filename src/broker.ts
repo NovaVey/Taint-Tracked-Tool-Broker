@@ -325,7 +325,43 @@ class Broker implements ToolCallBroker {
 
   startNewTurn(): void {
     if (this.resetScopeMode === 'turn') {
+      const priorLevel = this.currentScope.watermark.level;
+      const priorPrivateDataSeen = this.currentScope.watermark.privateDataSeen;
+      const hadPlan = this.plan !== undefined;
       this.currentScope = createScope('turn', randomUUID());
+      // A declared plan (declarePlan(), §11) is a commitment tied to the
+      // exposure episode it was made against. Leaving it in place across a
+      // turn boundary that just cleared that episode's watermark would
+      // silently constrain unrelated future actions in the new turn — with
+      // no way for the agent to know a plan is even still in effect — and
+      // fixes nothing, since plan-freeze is additive: a stale plan can only
+      // ever cause spurious blocking, never a bypass.
+      this.plan = undefined;
+      this.planCursor = 0;
+      // Only worth an audit entry when there was something to discard —
+      // routine per-turn resets of an already-CLEAN scope are not a
+      // safety-relevant event and shouldn't add audit-log noise on a
+      // per-turn cadence. Discarding a genuinely non-CLEAN watermark is
+      // exactly the moment GAPS.md #2's cross-turn risk crystallizes,
+      // though, and (unlike declassify()) had no audit trail before this.
+      if (priorLevel !== 'CLEAN') {
+        this.auditSink.record({
+          verdict: {
+            action: 'ALLOW_WITH_WARNING',
+            reason: `startNewTurn(): turn boundary discarded a ${priorLevel} watermark${hadPlan ? ' and its declared plan' : ''} under resetScope:'turn'. See GAPS.md #2.`,
+          },
+          call: { id: randomUUID(), toolName: '__tttb_turn_reset', args: {}, sessionId: this.sessionId },
+          taint: {
+            matchedRecords: [],
+            scopeLevel: priorLevel,
+            argFingerprintFloor: 'CLEAN',
+            privateDataSeen: priorPrivateDataSeen,
+            sinkClass: 'NONE',
+          },
+          at: Date.now(),
+          executed: true,
+        });
+      }
     }
     // 'session' mode: no-op by design — the watermark persists for the whole session (§4.1).
   }
@@ -366,18 +402,34 @@ class Broker implements ToolCallBroker {
     }
 
     if (tool.isSource && !tool.trusted) {
-      const text = toRegistrableText(result);
-      const sensitivity = capabilities.readsPrivateData
-        ? { containsPrivateData: true, categories: capabilities.readsPrivateData.categories }
-        : NOT_SENSITIVE;
+      // The watermark raise below is Layer 0 — load-bearing, must never be
+      // skipped for an untrusted source's result. Fingerprint registration
+      // (Layer 2) is best-effort/never load-bearing by design (§4.2) — so a
+      // result toRegistrableText() can't serialize (e.g. JSON.stringify
+      // throwing on a circular object, a realistic shape for a raw
+      // HTTP-client/response result) must not be allowed to silently
+      // suppress the raise it would otherwise gate. structuredClone (used
+      // to snapshot args elsewhere) tolerates cycles; JSON.stringify does
+      // not, so this is a real, reachable gap, not just a theoretical one.
+      let text: string | undefined;
+      try {
+        text = toRegistrableText(result);
+      } catch {
+        text = undefined;
+      }
       const provenance = {
-        id: exactHash(text),
+        id: text !== undefined ? exactHash(text) : randomUUID(),
         sourceCallId: call.id,
         toolName: tool.name,
         sessionId: this.sessionId,
         capturedAt: Date.now(),
       };
-      this.registry.register(text, provenance, 'RAW_UNTRUSTED', sensitivity);
+      if (text !== undefined) {
+        const sensitivity = capabilities.readsPrivateData
+          ? { containsPrivateData: true, categories: capabilities.readsPrivateData.categories }
+          : NOT_SENSITIVE;
+        this.registry.register(text, provenance, 'RAW_UNTRUSTED', sensitivity);
+      }
       raiseWatermark(this.currentScope, 'RAW_UNTRUSTED', provenance);
     }
   }

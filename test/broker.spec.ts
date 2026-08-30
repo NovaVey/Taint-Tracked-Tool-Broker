@@ -63,6 +63,19 @@ describe('ToolCallBroker.call()', () => {
     expect(broker.scope.watermark.level).toBe('CLEAN');
   });
 
+  it('still raises the watermark for a source result the fingerprint registry cannot serialize (Layer 0 must not depend on Layer 2)', async () => {
+    const circular: Record<string, unknown> = { page: 'content' };
+    circular.self = circular; // JSON.stringify throws on this — toRegistrableText() can't serialize it
+    const broker = createBroker();
+    broker.register(fetchUrl(circular));
+    expect(broker.scope.watermark.level).toBe('CLEAN');
+    await expect(broker.call('fetch_url', {})).resolves.toBe(circular);
+    // The load-bearing safety boundary (the watermark) must not be
+    // suppressed just because the best-effort Layer 2 registration for
+    // this particular result was impossible.
+    expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+  });
+
   it('audits a source call that raises the watermark, unlike an ordinary NONE-sink call', async () => {
     const events: AuditEvent[] = [];
     const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
@@ -196,6 +209,44 @@ describe('startNewTurn / declassify', () => {
     await broker.call('fetch_url', {});
     broker.startNewTurn();
     expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+  });
+
+  it('startNewTurn() also resets a declared plan — a stale plan from a prior turn must not constrain unrelated later actions', async () => {
+    const broker = createBroker({ resetScope: 'turn' });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register(shellExec());
+    broker.declarePlan([{ toolName: 'shell_exec' }]);
+    await broker.call('fetch_url', {});
+    await expect(broker.call('shell_exec', { cmd: 'x' })).rejects.toBeInstanceOf(ToolCallBlockedError); // matches the plan, still gated by default policy
+
+    broker.startNewTurn();
+    expect(broker.scope.watermark.level).toBe('CLEAN');
+    // Turn 2, no plan re-declared: an unrelated privileged call must not be
+    // blocked by turn 1's leftover plan/cursor state (before the fix, `plan`
+    // stayed [{toolName:'shell_exec'}] with planCursor still at 1, so this
+    // call would mismatch plan[1] (out of steps) and throw
+    // UnplannedPrivilegedActionError instead of just going through the
+    // normal — here permissive, CLEAN-scope — policy check).
+    broker.register({ name: 'send_email', capabilities: { capabilities: ['net:email'] }, async execute() { return 'sent'; } });
+    await expect(broker.call('send_email', {})).resolves.toBe('sent');
+  });
+
+  it('startNewTurn() audits a discarded non-CLEAN watermark (unlike a routine reset of an already-CLEAN scope)', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ resetScope: 'turn', auditSink: { record: (e) => events.push(e) } });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+
+    broker.startNewTurn(); // nothing to discard yet — must stay silent
+    expect(events).toEqual([]);
+
+    await broker.call('fetch_url', {});
+    events.length = 0; // drop the fetch_url source-call's own audit event; isolate startNewTurn()'s
+
+    broker.startNewTurn();
+    expect(events).toHaveLength(1);
+    expect(events[0]?.call.toolName).toBe('__tttb_turn_reset');
+    expect(events[0]?.verdict.action).toBe('ALLOW_WITH_WARNING');
+    expect(events[0]?.taint.scopeLevel).toBe('RAW_UNTRUSTED'); // the level that got discarded, not the resulting CLEAN
   });
 
   it('declassify() is the only way to lower a session-scoped watermark', async () => {

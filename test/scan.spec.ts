@@ -40,4 +40,25 @@ describe('scanArgsForTaint', () => {
     expect(floor).toBe('CLEAN');
     expect(matches).toEqual([]);
   });
+
+  it('does not stack-overflow on a circular args object — a cycle is skipped, not re-scanned', () => {
+    const registry = new InMemoryTaintRegistry();
+    registry.register(SOURCE, tag(), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+    const args: Record<string, unknown> = { cmd: SOURCE };
+    args.self = args; // circular reference — structuredClone tolerates this, so it reaches the scan intact
+    const { floor, matches } = scanArgsForTaint(args, registry);
+    expect(floor).toBe('RAW_UNTRUSTED');
+    expect(matches.some((m) => m.matchType === 'exact')).toBe(true);
+  });
+
+  it('still fully scans content reachable through a cycle, just not twice', () => {
+    const registry = new InMemoryTaintRegistry();
+    registry.register(SOURCE, tag(), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+    const shared: Record<string, unknown> = { note: SOURCE };
+    const args = { a: shared, b: shared }; // same object reachable via two paths, not itself cyclic
+    const { floor, matches } = scanArgsForTaint(args, registry);
+    expect(floor).toBe('RAW_UNTRUSTED');
+    // Visited once via `a`, skipped via `b` — still exactly one match, not zero.
+    expect(matches.filter((m) => m.matchType === 'exact')).toHaveLength(1);
+  });
 });

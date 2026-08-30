@@ -163,4 +163,30 @@ describe('InMemoryTaintRegistry', () => {
     const matches = registry.lookupFuzzy(wrapped);
     expect(matches.some((m) => m.record.id === survivor.id)).toBe(true);
   });
+
+  it('restore() never downgrades an existing record on an id collision — merges monotonically like register()', () => {
+    const registry = new InMemoryTaintRegistry();
+    const strong = registry.register(SOURCE, tag(), 'RAW_UNTRUSTED', { containsPrivateData: true, categories: ['credentials'] });
+
+    // A weaker record for the SAME content (same id — id is fingerprint.exactHash)
+    // — as if restoring a stale, earlier-taken export after this registry
+    // already re-confirmed the content more strongly via a real register() call.
+    registry.restore({ ...strong, level: 'DERIVED_UNTRUSTED', sensitivity: NOT_SENSITIVE });
+
+    const after = registry.getById(strong.id);
+    expect(after?.level).toBe('RAW_UNTRUSTED');
+    expect(after?.sensitivity).toEqual({ containsPrivateData: true, categories: ['credentials'] });
+    expect(registry.size).toBe(1);
+  });
+
+  it('restore() still strengthens on an id collision when the incoming record is the stronger one', () => {
+    const registry = new InMemoryTaintRegistry();
+    const weak = registry.register(SOURCE, tag(), 'DERIVED_UNTRUSTED', NOT_SENSITIVE);
+
+    registry.restore({ ...weak, level: 'RAW_UNTRUSTED', sensitivity: { containsPrivateData: true, categories: ['pii'] } });
+
+    const after = registry.getById(weak.id);
+    expect(after?.level).toBe('RAW_UNTRUSTED');
+    expect(after?.sensitivity).toEqual({ containsPrivateData: true, categories: ['pii'] });
+  });
 });

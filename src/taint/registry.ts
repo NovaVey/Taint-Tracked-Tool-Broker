@@ -247,13 +247,25 @@ export class InMemoryTaintRegistry implements TaintRegistry {
   restore(record: TaintRecord): void {
     const existing = this.byExactHash.get(record.id);
     if (existing) {
-      // Replace in place: unindex the old fingerprint before indexing the
-      // new one (they're expected to be identical in practice — restore()
-      // is meant for rehydrating exported state, not arbitrary overwrites —
-      // but nothing here assumes that, so it's handled correctly either way).
+      // Merge monotonically — mirrors register()'s own dedup path (above):
+      // restoring an exported snapshot must never let a weaker incoming
+      // record silently downgrade what this registry already has live,
+      // e.g. a record re-confirmed at a stronger level via a real
+      // register() call sometime after the snapshot being restored was
+      // taken. Provenance/fingerprint/confidence/derivedFrom stay
+      // `existing`'s — level/sensitivity are the only safety-relevant
+      // fields, and are the only ones that get merged rather than kept.
+      const merged: TaintRecord = {
+        ...existing,
+        level: maxLevel(existing.level, record.level),
+        sensitivity: {
+          containsPrivateData: existing.sensitivity.containsPrivateData || record.sensitivity.containsPrivateData,
+          categories: Array.from(new Set([...existing.sensitivity.categories, ...record.sensitivity.categories])),
+        },
+      };
       this.unindexRecord(existing);
-      this.byExactHash.set(record.id, record);
-      this.indexRecord(record);
+      this.byExactHash.set(record.id, merged);
+      this.indexRecord(merged);
       return;
     }
     this.insert(record);
