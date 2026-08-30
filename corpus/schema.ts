@@ -9,8 +9,8 @@
  * just a check that "the broker blocks bad things".
  */
 
-import type { AuditEvent, MatchType, PolicyDecision, QuarantineImpl, ResetScope, TaintLevel, ToolCallBroker } from '../src/index.js';
-import { createBroker, exactHash, NOT_SENSITIVE, ToolCallBlockedError } from '../src/index.js';
+import type { AuditEvent, MatchType, PlanStep, PolicyDecision, QuarantineImpl, ResetScope, TaintLevel, ToolCallBroker } from '../src/index.js';
+import { createBroker, exactHash, NOT_SENSITIVE, ToolCallBlockedError, UnplannedPrivilegedActionError } from '../src/index.js';
 import { FIXTURES } from './fixtures.js';
 
 export interface CorpusCase {
@@ -19,6 +19,13 @@ export interface CorpusCase {
   /** One of the canonical attack classes documented in corpus/cases.ts / GAPS.md. */
   attackClass: string;
   resetScope?: ResetScope; // default 'session'
+  /**
+   * If set, calls broker.declarePlan() immediately after registering
+   * fixtures — i.e. before `setup`, so the scope is still guaranteed CLEAN
+   * (declarePlan() throws otherwise). Opts this case into plan-freeze
+   * strict mode (DESIGN.md §11).
+   */
+  plan?: PlanStep[];
   /** Executed in order via broker.call() to seed taint state, using the named fixtures in fixtures.ts. */
   setup: Array<{ tool: keyof typeof FIXTURES; args?: Record<string, unknown> }>;
   /** If set, simulates a turn boundary right after `setup` (and before `quarantine`/`actions`) — see 'turn' resetScope cases. */
@@ -103,6 +110,10 @@ export async function runCorpusCase(c: CorpusCase): Promise<CorpusOutcome> {
   });
   registerFixtures(broker);
 
+  if (c.plan) {
+    broker.declarePlan(c.plan);
+  }
+
   const setupResults: unknown[] = [];
   for (const step of c.setup) {
     setupResults.push(await broker.call(step.tool, step.args ?? {}));
@@ -153,6 +164,16 @@ export async function runCorpusCase(c: CorpusCase): Promise<CorpusOutcome> {
     if (err instanceof ToolCallBlockedError) {
       actualDecision = err.decision.action;
       actualReason = 'reason' in err.decision ? err.decision.reason : undefined;
+    } else if (err instanceof UnplannedPrivilegedActionError) {
+      // Plan-freeze strict mode (§11) rejects before the normal policy
+      // check ever runs, so there's no PolicyDecision object on the error
+      // itself the way ToolCallBlockedError carries one — but dispatch()
+      // always records an equivalent BLOCK AuditEvent immediately before
+      // throwing this error (broker.ts), so the outcome is represented the
+      // same way a normal policy BLOCK is.
+      const last = auditLog[auditLog.length - 1];
+      actualDecision = 'BLOCK';
+      actualReason = last && 'reason' in last.verdict ? last.verdict.reason : undefined;
     }
   }
 

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   createBroker,
   DualRoleToolError,
+  InMemoryTaintRegistry,
   NonCloneableArgsError,
   PlanNotDeclarableError,
   QuarantineInputMismatchError,
@@ -342,6 +343,34 @@ describe('broker.summarize() (quarantine path)', () => {
     await expect(broker.summarize(MALICIOUS_PAGE, { sessionId: 's', sourceTaintRecordId: record.id })).resolves.toMatchObject({
       level: 'DERIVED_UNTRUSTED',
     });
+  });
+
+  it('a bounded registry (maxEntries) can legitimately evict a source record before summarize() needs it — documented behavior, not a crash', async () => {
+    // GAPS.md #13: eviction only ever costs Layer 2 attribution/tightening
+    // opportunities, never Layer 0 soundness — but summarize()'s own input-
+    // provenance check (§6.2 step 1) depends on the source record still
+    // being registry-known. This pins down what actually happens when an
+    // integrator combines maxEntries with the quarantine path and a session
+    // long enough to evict the record summarize() is about to reference.
+    const broker = createBroker({ quarantineImpl: stubQuarantineImpl, registry: new InMemoryTaintRegistry({ maxEntries: 1 }) });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    const record = broker.registry.lookupExact(MALICIOUS_PAGE);
+    if (!record) throw new Error('setup failed: source not registered');
+
+    // A second, unrelated source read evicts the first (maxEntries: 1) —
+    // an entirely ordinary session shape ("read another page"), not
+    // anything adversarial.
+    broker.register(fetchUrl('A second, unrelated page read later in the same session, evicting the first.', { name: 'fetch_url_2' }));
+    await broker.call('fetch_url_2', {});
+    expect(broker.registry.getById(record.id)).toBeUndefined(); // confirms the eviction actually happened
+
+    // summarize() fails loudly and specifically — the caller finds out
+    // clearly (QuarantineInputUnknownError, audited as a BLOCK) rather than
+    // silently succeeding with weaker provenance or crashing unexplained.
+    await expect(broker.summarize(MALICIOUS_PAGE, { sessionId: 's', sourceTaintRecordId: record.id })).rejects.toBeInstanceOf(
+      QuarantineInputUnknownError,
+    );
   });
 
   // DESIGN.md §6.2 says this path is "auditable ... like any other call" —
