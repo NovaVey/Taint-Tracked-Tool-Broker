@@ -68,6 +68,21 @@ await shellExec.execute({ cmd: 'anything the model writes, paraphrased or not' }
 
 Read [`DESIGN.md`](./DESIGN.md) for why each of these choices was made, including the soundness gap the design's own judge-panel process found and closed before this was implemented.
 
+## Examples
+
+Runnable, offline (no API key, no real network calls — everything is mocked except the broker itself) walkthroughs in [`examples/`](./examples):
+
+| Script | What it shows |
+|---|---|
+| `npm run example` | The core model end to end: verbatim injection, paraphrase bypass, the sanctioned `summarize()` path. |
+| `npm run example:mcp` | MCP protocol surfaces (`tools/call`, `tools/list`) and a tool-description rug-pull guard (GAPS.md #1). |
+| `npm run example:tool-loop` | A full Anthropic Messages API-style tool loop — a blocked call recovering gracefully, `REQUIRE_APPROVAL` suspending the loop, and `startNewTurn()`'s one correct call site under `resetScope:'turn'`. |
+| `npm run example:langchain` | Wiring `broker.wrap()` behind LangChain.js's `tool()`/`Runnable.invoke()` shape. |
+| `npm run example:vercel-ai` | The same pattern behind the Vercel AI SDK's `tool()`/`execute()` shape. |
+| `npm run example:openai-agents` | The same pattern behind the OpenAI Agents SDK's `tool()`/`execute()` shape, exercising the `REQUIRE_APPROVAL` path via `createDeferredApprovalChannel()`. |
+
+The three framework examples don't depend on the real `langchain`/`ai`/`@openai/agents` packages — each uses a small structural stand-in for that framework's real tool-definition shape, since the integration point (a `name`/`description`/schema object with an async execute function) is what matters, not fidelity to a fast-moving package's exact current types. Every framework's real dispatch loop calls that function the same way once `broker.wrap()` has interposed it.
+
 ## Injection corpus
 
 ```bash
