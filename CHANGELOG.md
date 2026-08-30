@@ -4,7 +4,11 @@ All notable changes to this project are documented here. Format loosely follows 
 
 ## [Unreleased]
 
-Nothing has been published to npm yet — everything below describes the library's current state ahead of its first `0.1.0` release. See `.github/workflows/release.yml` for the tag-triggered publish process; when a maintainer cuts the first release, this section becomes `## [0.1.0] - <date>`.
+Nothing yet.
+
+## [0.1.0] - 2026-08-30
+
+First published release. Everything below was built and validated (typecheck, unit tests, injection corpus, build) before this tag was cut — see `.github/workflows/release.yml` for the tag-triggered publish process that re-validates all of it once more before publishing.
 
 ### Added
 
@@ -18,10 +22,13 @@ Nothing has been published to npm yet — everything below describes the library
 - **`jsonSafeClone()`** — an opt-in, faster alternative to `structuredClone` for args snapshotting when tool arguments are plain JSON; throws (rather than silently misrepresenting) on Date/Map/Set/RegExp/class instances/functions/symbols/bigints.
 - **Convenience API surface**: `callSafe()` (a non-throwing `call()`), `registerAll()`/`wrapAll()` (bulk registration over a name -> tool record), `defineSource()`/`defineSink()` (pure `ToolExecutor`-building sugar), `registerRawForQuarantine()` (operationalizes the fetch-and-quarantine composite-tool pattern, returning `{ text, taintRecordId }` ready for `summarize()`).
 - **`ToolExecutor.mayCallSummarize`** — declare `true` on a composite fetch-and-quarantine tool whose own `execute()` calls `broker.summarize()` internally, so it's correctly excluded from the lock-barrier-exemption optimization (GAPS.md #17).
-- **Injection corpus** (`npm run corpus`, also run under `npm test`): 14 cases across 12 attack classes, including two true, asserted known gaps (not silently-passing tests) and a plan-freeze case.
+- **`resetScope: 'turn-decay'`** — a third watermark-reset mode between `'session'` (never clears) and `'turn'` (clears at the next turn boundary): persists the watermark across a configurable `turnDecayWindow` of consecutive turns with no new exposure before clearing, narrowing (not closing) the cross-turn latent-influence gap (GAPS.md #2) to a chosen, quantified size. `turnDecayWindow: 1` is exactly `'turn'`.
+- **Narrowed lock barrier**: `Broker.withLock`'s full-serialization cost is now scoped — a call that can neither be gated (`sinkClass === 'NONE'`) nor raise/mutate the watermark (not an untrusted source, no `readsPrivateData`, and, since GAPS.md #17, not `mayCallSummarize`) bypasses the lock entirely, since it's provably inert to the state the lock protects.
+- **Injection corpus** (`npm run corpus`, also run under `npm test`): 15 cases across 12 attack classes, including two true, asserted known gaps (not silently-passing tests), a plan-freeze case, and a `resetScope: 'turn-decay'` case showing the cross-turn gap narrowed rather than closed.
 - **Docs**: `DESIGN.md` (full architecture and rationale, including the soundness gap the original judge-panel design process found and closed), `GAPS.md` (17 named, honest limitations), `docs/classifying-tools.md` (a checklist and worked examples for classifying less-obvious tools).
-- **Examples**: `examples/basic-usage.ts`, `examples/mcp-integration.ts` (MCP protocol-surface wiring plus a tool-description rug-pull guard), `examples/anthropic-tool-loop.ts` (a full tool-calling loop, including `startNewTurn()`'s correct call site and a deferred-approval scenario).
+- **Examples**: `examples/basic-usage.ts`, `examples/mcp-integration.ts` (MCP protocol-surface wiring plus a tool-description rug-pull guard), `examples/anthropic-tool-loop.ts` (a full tool-calling loop, including `startNewTurn()`'s correct call site and a deferred-approval scenario), plus framework-integration examples for `examples/langchain-integration.ts`, `examples/vercel-ai-sdk-integration.ts`, and `examples/openai-agents-sdk-integration.ts` (each a structural stand-in for that framework's `tool()`/`execute()` shape, no real framework dependency required).
 - **`bench/args-clone.ts`** (`npm run bench`) — `structuredClone` vs `jsonSafeClone` benchmark across representative args shapes.
+- **`bench/minhash-sketch-tradeoff.ts`** (`npm run bench:minhash`) — the reproducible Monte Carlo measurement behind the decision *not* to ship fixed-size MinHash sketches for the registry (see GAPS.md #13 and DESIGN.md's implementation note): 35-79% false-negative rates at realistic document-size ratios even at a generous sketch size.
 - **`.github/workflows/release.yml`** — tag-triggered (`v*`) npm publish with provenance, gated on the tag matching `package.json`'s version and a full re-run of typecheck/build/test/corpus.
 
 ### Fixed
