@@ -53,6 +53,7 @@
     "corpus": "tsx corpus/run-corpus.ts",
     "example": "tsx examples/basic-usage.ts",
     "example:mcp": "tsx examples/mcp-integration.ts",
+    "example:mcp-sdk": "tsx examples/mcp-sdk-integration.ts",
     "example:tool-loop": "tsx examples/anthropic-tool-loop.ts",
     "example:langchain": "tsx examples/langchain-integration.ts",
     "example:vercel-ai": "tsx examples/vercel-ai-sdk-integration.ts",
@@ -66,6 +67,7 @@
     "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"corpus/**/*.ts\" \"examples/**/*.ts\" \"bench/**/*.ts\" \"*.{js,ts}\""
   },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@types/node": "^26.3.0",
     "@vitest/coverage-v8": "^4.1.11",
     "eslint": "^10.9.1",
@@ -74,6 +76,7 @@
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "typescript-eslint": "^8.68.0",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.11",
+    "zod": "^4.5.4"
   }
 }
