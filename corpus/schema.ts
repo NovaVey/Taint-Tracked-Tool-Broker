@@ -21,6 +21,7 @@ import type {
 } from '../src/index.js';
 import {
   createBroker,
+  DisallowedOutboundHostError,
   exactHash,
   NOT_SENSITIVE,
   ToolCallBlockedError,
@@ -34,6 +35,8 @@ export interface CorpusCase {
   /** One of the canonical attack classes documented in corpus/cases.ts / GAPS.md. */
   attackClass: string;
   resetScope?: ResetScope; // default 'session'
+  /** If set, opts this case into BrokerOptions.allowedOutboundHosts (DESIGN.md §7.4) — an opt-in, additive egress firewall independent of the taint-based policy below. */
+  allowedOutboundHosts?: readonly string[];
   /** Required (and only meaningful) when resetScope is 'turn-decay' — see BrokerOptions.turnDecayWindow. */
   turnDecayWindow?: number;
   /**
@@ -163,6 +166,9 @@ export async function runCorpusCase(c: CorpusCase): Promise<CorpusOutcome> {
   const broker = createBroker({
     resetScope: c.resetScope ?? 'session',
     ...(c.turnDecayWindow !== undefined ? { turnDecayWindow: c.turnDecayWindow } : {}),
+    ...(c.allowedOutboundHosts !== undefined
+      ? { allowedOutboundHosts: c.allowedOutboundHosts }
+      : {}),
     auditSink: { record: (e) => auditLog.push(e) },
     // No human present by default: REQUIRE_APPROVAL always denies in the
     // corpus, so "was this call ever safe to auto-execute" is exactly what
@@ -236,6 +242,13 @@ export async function runCorpusCase(c: CorpusCase): Promise<CorpusOutcome> {
       // always records an equivalent BLOCK AuditEvent immediately before
       // throwing this error (broker.ts), so the outcome is represented the
       // same way a normal policy BLOCK is.
+      const last = auditLog[auditLog.length - 1];
+      actualDecision = 'BLOCK';
+      actualReason = last && 'reason' in last.verdict ? last.verdict.reason : undefined;
+    } else if (err instanceof DisallowedOutboundHostError) {
+      // Same shape as UnplannedPrivilegedActionError above: the outbound
+      // host allowlist (§7.4) rejects before the normal policy check runs,
+      // but dispatch() records an equivalent BLOCK AuditEvent first.
       const last = auditLog[auditLog.length - 1];
       actualDecision = 'BLOCK';
       actualReason = last && 'reason' in last.verdict ? last.verdict.reason : undefined;

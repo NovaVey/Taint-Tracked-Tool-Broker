@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   createBroker,
+  DisallowedOutboundHostError,
   DualRoleToolError,
   exactHash,
   InMemoryTaintRegistry,
@@ -83,6 +84,16 @@ function sendEmail(): ToolExecutor {
     capabilities: { capabilities: ['net:email'] },
     async execute(args) {
       return `sent:${JSON.stringify(args)}`;
+    },
+  };
+}
+
+function netPost(): ToolExecutor {
+  return {
+    name: 'net_post',
+    capabilities: { capabilities: ['net:outbound'] },
+    async execute(args) {
+      return `posted:${JSON.stringify(args)}`;
     },
   };
 }
@@ -1439,5 +1450,102 @@ describe('plan-freeze strict mode (declarePlan)', () => {
     await expect(broker.call('save_draft', {})).rejects.toBeInstanceOf(
       UnplannedPrivilegedActionError,
     );
+  });
+});
+
+describe('allowedOutboundHosts (opt-in egress allowlist, DESIGN.md §7.4)', () => {
+  it('blocks an EXFIL-class call whose URL argument targets a host not in the allowlist — even on a CLEAN scope, the one thing the normal policy alone would never do', async () => {
+    const broker = createBroker({ allowedOutboundHosts: ['approved.example'] });
+    broker.register(netPost());
+    // Nothing tainted this scope at all — the default policy alone would
+    // ALLOW this unconditionally. The allowlist is a genuinely independent
+    // gate, not a taint-tightening mechanism.
+    await expect(
+      broker.call('net_post', { url: 'https://not-approved.example/x' }),
+    ).rejects.toBeInstanceOf(DisallowedOutboundHostError);
+  });
+
+  it('allows a call whose URL host IS in the allowlist, on an otherwise-CLEAN scope', async () => {
+    const broker = createBroker({ allowedOutboundHosts: ['approved.example'] });
+    broker.register(netPost());
+    const result = await broker.call('net_post', { url: 'https://approved.example/x' });
+    expect(result).toContain('posted:');
+  });
+
+  it('accepts a predicate function in place of an array', async () => {
+    const broker = createBroker({
+      allowedOutboundHosts: (host) => host.endsWith('.approved.example'),
+    });
+    broker.register(netPost());
+    await expect(
+      broker.call('net_post', { url: 'https://a.approved.example/x' }),
+    ).resolves.toContain('posted:');
+    await expect(
+      broker.call('net_post', { url: 'https://approved.example/x' }), // not a *subdomain* of approved.example
+    ).rejects.toBeInstanceOf(DisallowedOutboundHostError);
+  });
+
+  it('does nothing when allowedOutboundHosts is not configured — no behavior change from the default', async () => {
+    const broker = createBroker(); // unset
+    broker.register(netPost());
+    const result = await broker.call('net_post', { url: 'https://anywhere.example/x' });
+    expect(result).toContain('posted:');
+  });
+
+  it('does not apply to a non-EXFIL sink, even one whose argument happens to be a URL', async () => {
+    const broker = createBroker({ allowedOutboundHosts: ['approved.example'] });
+    broker.register({
+      name: 'write_file',
+      capabilities: { capabilities: ['write:fs'] }, // MUTATE, not EXFIL
+      async execute(args) {
+        return `wrote:${JSON.stringify(args)}`;
+      },
+    });
+    // A URL string written to disk is not egress — writing it is fine even
+    // though its host is not allowlisted.
+    const result = await broker.call('write_file', {
+      path: '/tmp/x',
+      contents: 'https://not-approved.example/x',
+    });
+    expect(result).toContain('wrote:');
+  });
+
+  it('does not fire when the call carries no http(s) URL argument at all — documented scope boundary, not a general egress-classification mechanism', async () => {
+    const broker = createBroker({ allowedOutboundHosts: ['approved.example'] });
+    broker.register(sendEmail());
+    // send_email's `to` is an email address, not a URL — findOutboundHosts
+    // finds nothing to check, so this call is invisible to the allowlist
+    // (GAPS.md #18). The normal policy still applies (CLEAN scope -> ALLOW).
+    const result = await broker.call('send_email', { to: 'x@example.com', body: 'hi' });
+    expect(result).toContain('sent:');
+  });
+
+  it('is additive: an allowlisted host still goes through the normal policy check afterward, and can still be blocked by it', async () => {
+    const broker = createBroker({ allowedOutboundHosts: ['approved.example'] });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register(netPost());
+    await broker.call('fetch_url', {}); // raises the watermark to RAW_UNTRUSTED
+    // Host is allowlisted, so the egress check passes — but the scope is
+    // RAW_UNTRUSTED and this is an EXFIL sink with no private data seen, so
+    // the default policy still requires approval (§7.2). No approval
+    // channel is configured, so it's denied.
+    await expect(
+      broker.call('net_post', { url: 'https://approved.example/x' }),
+    ).rejects.toBeInstanceOf(ToolCallBlockedError);
+  });
+
+  it('records a BLOCK AuditEvent before throwing, the same shape as any other broker-level rejection', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      allowedOutboundHosts: ['approved.example'],
+      auditSink: { record: (e) => events.push(e) },
+    });
+    broker.register(netPost());
+    await expect(
+      broker.call('net_post', { url: 'https://not-approved.example/x' }),
+    ).rejects.toBeInstanceOf(DisallowedOutboundHostError);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.verdict.action).toBe('BLOCK');
+    expect(events[0]?.executed).toBe(false);
   });
 });

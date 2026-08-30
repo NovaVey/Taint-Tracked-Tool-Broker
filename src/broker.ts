@@ -40,11 +40,13 @@ import {
   raiseWatermark,
 } from './taint/scope.js';
 import { scanArgsForTaint } from './taint/scan.js';
+import { findOutboundHosts, isAllowedOutboundHost } from './taint/egress.js';
 import { exactHash, toRegistrableText } from './taint/fingerprint.js';
 import { defaultPolicy } from './policy/default-policy.js';
 import { createQuarantine, unconfiguredQuarantineImpl } from './quarantine.js';
 import { isReservedToolName, isUntrustedSource, recordTrivialAudit } from './internal-audit.js';
 import {
+  DisallowedOutboundHostError,
   DualRoleToolError,
   NonCloneableArgsError,
   PlanNotDeclarableError,
@@ -109,6 +111,24 @@ export interface BrokerOptions {
    * 200 characters; a number sets your own.
    */
   warnOnLikelyUnmarkedSource?: boolean | number;
+  /**
+   * Opt-in outbound-host allowlist for EXFIL-class sink calls (`net:outbound`
+   * / `net:email` / `net:api-call` / `net:post-message`). When set, every
+   * such call's arguments are scanned for genuine http(s) URLs
+   * (`taint/egress.ts`'s `findOutboundHosts`); if any found hostname isn't
+   * in the allowlist, the call is rejected with `DisallowedOutboundHostError`
+   * — a pure firewall-style rule, independent of the taint-based policy in
+   * §7.2 and applied even to a `CLEAN` scope, since the point of an explicit
+   * allowlist is a structural boundary rather than another approval prompt
+   * (GAPS.md #7's fatigue risk). A string array is matched exactly
+   * (case-insensitively, no subdomain/wildcard matching); a predicate
+   * function gets the lowercased hostname directly for callers who want
+   * that. Deliberately narrow in scope — see DESIGN.md §7.4 and GAPS.md #18
+   * for exactly what this does and doesn't cover (a call with no http(s)
+   * URL argument at all, e.g. a bare email address, is invisible to this
+   * check; it is not a general egress-classification mechanism).
+   */
+  allowedOutboundHosts?: readonly string[] | ((hostname: string) => boolean);
 }
 
 const DEFAULT_UNMARKED_SOURCE_WARN_THRESHOLD = 200;
@@ -136,6 +156,8 @@ class Broker implements ToolCallBroker {
   private readonly auditSink: AuditSink;
   private readonly cloneArgs: (value: unknown) => unknown;
   private readonly warnOnLikelyUnmarkedSource: number | undefined;
+  private readonly allowedOutboundHosts:
+    readonly string[] | ((hostname: string) => boolean) | undefined;
   private readonly tools = new Map<string, ToolExecutor>();
   private currentScope: TaintScope;
 
@@ -191,6 +213,7 @@ class Broker implements ToolCallBroker {
         : opts.warnOnLikelyUnmarkedSource === false || opts.warnOnLikelyUnmarkedSource === undefined
           ? undefined
           : opts.warnOnLikelyUnmarkedSource;
+    this.allowedOutboundHosts = opts.allowedOutboundHosts;
     this.registry = opts.registry ?? new InMemoryTaintRegistry();
     this.currentScope = createScope(this.resetScopeMode, this.sessionId);
     if (opts.initialWatermark) {
@@ -501,6 +524,32 @@ class Broker implements ToolCallBroker {
           throw new UnplannedPrivilegedActionError(toolName, expected?.toolName);
         }
         this.planCursor++;
+      }
+
+      // Outbound-host allowlist (DESIGN.md §7.4), additive on top of the
+      // normal policy check below, never instead of it — a pure firewall
+      // rule that runs regardless of scope level, unlike everything else
+      // in this branch. Only ever examines EXFIL-class calls; a non-EXFIL
+      // sink with a URL-shaped argument (e.g. write_file writing a URL
+      // string to disk) is not egress and is out of scope for this check.
+      const allowlist = this.allowedOutboundHosts;
+      if (allowlist !== undefined && sinkClass === 'EXFIL') {
+        const disallowedHosts = findOutboundHosts(argsSnapshot).filter(
+          (host) => !isAllowedOutboundHost(host, allowlist),
+        );
+        if (disallowedHosts.length > 0) {
+          this.auditSink.record({
+            verdict: {
+              action: 'BLOCK',
+              reason: `Outbound host allowlist violation: ${disallowedHosts.map((h) => `"${h}"`).join(', ')} not in BrokerOptions.allowedOutboundHosts.`,
+            },
+            call,
+            taint,
+            at: Date.now(),
+            executed: false,
+          });
+          throw new DisallowedOutboundHostError(toolName, disallowedHosts);
+        }
       }
 
       const decision = await this.policy(call, taint);

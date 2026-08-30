@@ -97,6 +97,7 @@ export {
 } from './taint/fingerprint.js';
 export { scanArgsForTaint } from './taint/scan.js';
 export type { ScanResult } from './taint/scan.js';
+export { findOutboundHosts, isAllowedOutboundHost } from './taint/egress.js';
 export {
   createScope,
   createWatermark,
@@ -137,4 +138,5 @@ export {
   UnplannedPrivilegedActionError,
   ReservedToolNameError,
   QuarantineSourceUnavailableError,
+  DisallowedOutboundHostError,
 } from './errors.js';
