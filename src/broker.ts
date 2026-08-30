@@ -10,6 +10,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type {
   ApprovalChannel,
   AuditSink,
+  PlanStep,
   PolicyFn,
   QuarantineFn,
   QuarantineImpl,
@@ -18,6 +19,7 @@ import type {
   TaintLevel,
   TaintRegistry,
   TaintScope,
+  TaintWatermark,
   ToolCall,
   ToolCallBroker,
   ToolExecutor,
@@ -29,7 +31,15 @@ import { scanArgsForTaint } from './taint/scan.js';
 import { exactHash, toRegistrableText } from './taint/fingerprint.js';
 import { defaultPolicy } from './policy/default-policy.js';
 import { createQuarantine, unconfiguredQuarantineImpl } from './quarantine.js';
-import { DualRoleToolError, ReentrantCallError, ToolCallBlockedError, UnknownToolError } from './errors.js';
+import {
+  DualRoleToolError,
+  NonCloneableArgsError,
+  PlanNotDeclarableError,
+  ReentrantCallError,
+  ToolCallBlockedError,
+  UnknownToolError,
+  UnplannedPrivilegedActionError,
+} from './errors.js';
 
 export interface BrokerOptions {
   sessionId?: string;
@@ -41,6 +51,23 @@ export interface BrokerOptions {
   /** The capability-less LLM call used by broker.summarize(). No default — see quarantine.ts. */
   quarantineImpl?: QuarantineImpl;
   registry?: TaintRegistry;
+  /**
+   * Restores a previously-exported `broker.scope.watermark` (e.g. from a
+   * prior process, persisted alongside a restored registry) instead of
+   * starting CLEAN. `TaintWatermark` is a plain JSON-able object — no
+   * special deserialization needed. See GAPS.md #12 and persistence.ts for
+   * the matching registry-side restore helpers.
+   */
+  initialWatermark?: TaintWatermark;
+  /**
+   * Custom args cloner, used in place of `structuredClone` for snapshotting
+   * (see NonCloneableArgsError). Only needed if a tool's arguments include
+   * values `structuredClone` can't handle (functions, most class
+   * instances, WeakMap/WeakSet). Must still produce an independent copy —
+   * returning the input unchanged reopens the args-mutation gap this
+   * snapshotting exists to close.
+   */
+  cloneArgs?: (value: unknown) => unknown;
 }
 
 const NOOP_AUDIT: AuditSink = { record() {} };
@@ -50,23 +77,20 @@ function blockedMessage(toolName: string, decision: { action: string; reason?: s
   return `Tool call "${toolName}" was not executed (${decision.action}): ${reason}`;
 }
 
-/** Best-effort deep clone for args snapshotting. Falls back to the original reference for values structuredClone can't handle (functions, etc.) — a documented residual gap, not silently unsafe for the common JSON-able-args case. */
-function safeClone<T>(value: T): T {
-  try {
-    return structuredClone(value);
-  } catch {
-    return value;
-  }
-}
-
 class Broker implements ToolCallBroker {
   private readonly sessionId: string;
   private readonly resetScopeMode: ResetScope;
   private readonly policy: PolicyFn;
   private readonly approvalChannel: ApprovalChannel | undefined;
   private readonly auditSink: AuditSink;
+  private readonly cloneArgs: (value: unknown) => unknown;
   private readonly tools = new Map<string, ToolExecutor>();
   private currentScope: TaintScope;
+
+  // Plan-freeze strict mode (DESIGN.md §11) — undefined means not opted in.
+  // `cursor` is the index of the next step a privileged call must match.
+  private plan: PlanStep[] | undefined;
+  private planCursor = 0;
 
   // Serializes every call() invocation on this broker instance so that a
   // source call's watermark raise always happens-before any later call's
@@ -88,8 +112,12 @@ class Broker implements ToolCallBroker {
     this.policy = opts.policy ?? defaultPolicy;
     this.approvalChannel = opts.approvalChannel;
     this.auditSink = opts.auditSink ?? NOOP_AUDIT;
+    this.cloneArgs = opts.cloneArgs ?? structuredClone;
     this.registry = opts.registry ?? new InMemoryTaintRegistry();
     this.currentScope = createScope(this.resetScopeMode, this.sessionId);
+    if (opts.initialWatermark) {
+      this.currentScope.watermark = { ...opts.initialWatermark, sources: [...opts.initialWatermark.sources] };
+    }
     this.summarize = createQuarantine(opts.quarantineImpl ?? unconfiguredQuarantineImpl, this.registry, (tag) =>
       raiseWatermark(this.currentScope, 'DERIVED_UNTRUSTED', tag),
     );
@@ -97,6 +125,23 @@ class Broker implements ToolCallBroker {
 
   get scope(): Readonly<TaintScope> {
     return this.currentScope;
+  }
+
+  /** Best-effort deep clone for args snapshotting; throws NonCloneableArgsError rather than silently degrading — see GAPS.md #16. */
+  private cloneArgsOrThrow(toolName: string, value: unknown): unknown {
+    try {
+      return this.cloneArgs(value);
+    } catch (cause) {
+      throw new NonCloneableArgsError(toolName, cause);
+    }
+  }
+
+  declarePlan(steps: PlanStep[]): void {
+    if (this.currentScope.watermark.level !== 'CLEAN') {
+      throw new PlanNotDeclarableError();
+    }
+    this.plan = [...steps];
+    this.planCursor = 0;
   }
 
   register(tool: ToolExecutor): void {
@@ -151,7 +196,7 @@ class Broker implements ToolCallBroker {
     // a human and what the audit log records as having executed, since
     // both would share one mutable reference with whatever execute() did
     // to it.
-    const argsSnapshot = safeClone(args);
+    const argsSnapshot = this.cloneArgsOrThrow(toolName, args);
     const call: ToolCall = { id: randomUUID(), toolName, args: argsSnapshot, sessionId: this.sessionId };
     const sinkClass = sinkClassOf(tool.capabilities.capabilities);
 
@@ -161,7 +206,7 @@ class Broker implements ToolCallBroker {
       // Not a privileged sink: no gating, no audit record. Source tools
       // (fetch_url, read_email, ...) typically land here — their taint
       // effects are applied below, after execution, regardless of sinkClass.
-      result = await tool.execute(safeClone(args));
+      result = await tool.execute(this.cloneArgsOrThrow(toolName, args));
     } else {
       const { matches, floor } = scanArgsForTaint(argsSnapshot, this.registry);
       const taint: TaintContext = {
@@ -172,16 +217,40 @@ class Broker implements ToolCallBroker {
         sinkClass,
       };
 
+      // Plan-freeze strict mode (DESIGN.md §11), additive on top of the
+      // normal policy check below, never instead of it. Only engages once
+      // the scope has left CLEAN — a plan is inert until the first
+      // exposure, exactly matching "committed before any untrusted read".
+      if (this.plan !== undefined && this.currentScope.watermark.level !== 'CLEAN') {
+        const expected = this.plan[this.planCursor];
+        if (!expected || expected.toolName !== toolName) {
+          this.auditSink.record({
+            verdict: {
+              action: 'BLOCK',
+              reason: `Unplanned privileged action after exposure (plan-freeze strict mode): ${
+                expected ? `expected "${expected.toolName}"` : 'no steps left in the declared plan'
+              }.`,
+            },
+            call,
+            taint,
+            at: Date.now(),
+            executed: false,
+          });
+          throw new UnplannedPrivilegedActionError(toolName, expected?.toolName);
+        }
+        this.planCursor++;
+      }
+
       const decision = await this.policy(call, taint);
       let executed = false;
 
       if (decision.action === 'ALLOW' || decision.action === 'ALLOW_WITH_WARNING') {
-        result = await tool.execute(safeClone(args));
+        result = await tool.execute(this.cloneArgsOrThrow(toolName, args));
         executed = true;
       } else if (decision.action === 'REQUIRE_APPROVAL') {
         const granted = this.approvalChannel ? await this.approvalChannel.requestApproval(call, taint, decision) : false;
         if (granted) {
-          result = await tool.execute(safeClone(args));
+          result = await tool.execute(this.cloneArgsOrThrow(toolName, args));
           executed = true;
         }
       }

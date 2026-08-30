@@ -74,6 +74,64 @@ export class DualRoleToolError extends TaintBrokerError {
 }
 
 /**
+ * Thrown by call() when a tool's args can't be cloned (structuredClone
+ * threw — functions, most class instances, WeakMap/WeakSet, etc. — and no
+ * BrokerOptions.cloneArgs override was supplied). Args snapshotting is what
+ * keeps "what was approved", "what executed", and "what got audited" from
+ * silently diverging (see DESIGN.md's concurrency implementation note); a
+ * value that can't be cloned would silently reopen exactly that gap if the
+ * call proceeded on a shared, mutable reference instead. Fails loud rather
+ * than degrading quietly — see GAPS.md #16. Pass a custom `cloneArgs` to
+ * createBroker() if your tools genuinely need non-JSON-able argument types.
+ */
+export class NonCloneableArgsError extends TaintBrokerError {
+  constructor(toolName: string, cause: unknown) {
+    super(
+      `Tool call "${toolName}" was not dispatched: its arguments could not be cloned (structuredClone threw). ` +
+        'Args must be snapshotted so that what an approver sees, what executes, and what gets audited cannot silently ' +
+        'diverge — see GAPS.md #16. Pass a custom cloneArgs to createBroker() if this tool genuinely needs ' +
+        'non-JSON-able argument types.',
+      { cause },
+    );
+    this.name = 'NonCloneableArgsError';
+  }
+}
+
+/**
+ * Thrown by declarePlan() when the scope has already left CLEAN. Plan-freeze
+ * strict mode (DESIGN.md §11) only means something if the plan is committed
+ * BEFORE any untrusted content is read — declaring one retroactively, after
+ * exposure, would let the very content the plan is meant to constrain shape
+ * the plan itself.
+ */
+export class PlanNotDeclarableError extends TaintBrokerError {
+  constructor() {
+    super(
+      'declarePlan() must be called while the scope is still CLEAN. Untrusted content is already live in this scope, ' +
+        'so committing to a plan now would let that content help shape the very plan meant to constrain it. See DESIGN.md §11.',
+    );
+    this.name = 'PlanNotDeclarableError';
+  }
+}
+
+/**
+ * Thrown by call() under plan-freeze strict mode when a privileged call's
+ * tool does not match the next committed PlanStep. This is checked in
+ * addition to (never instead of) the normal policy decision — see
+ * DESIGN.md §11.
+ */
+export class UnplannedPrivilegedActionError extends TaintBrokerError {
+  constructor(toolName: string, expectedToolName: string | undefined) {
+    super(
+      `Tool call "${toolName}" was not executed: plan-freeze strict mode is active and this call does not match the ` +
+        `next committed step${expectedToolName ? ` ("${expectedToolName}")` : ' (the plan has no steps left)'}. ` +
+        'Untrusted content is live in this scope, so only the pre-committed call sequence may proceed. See DESIGN.md §11.',
+    );
+    this.name = 'UnplannedPrivilegedActionError';
+  }
+}
+
+/**
  * Thrown when broker.call() is invoked reentrantly — from within a tool's
  * own execute() (or anything it awaited) on the SAME broker instance,
  * before the outer call has finished. Reentrant calls would deadlock the

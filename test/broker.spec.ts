@@ -2,11 +2,14 @@ import { describe, expect, it } from 'vitest';
 import {
   createBroker,
   DualRoleToolError,
+  NonCloneableArgsError,
+  PlanNotDeclarableError,
   QuarantineInputMismatchError,
   QuarantineInputUnknownError,
   ReentrantCallError,
   ToolCallBlockedError,
   UnknownToolError,
+  UnplannedPrivilegedActionError,
   type AuditEvent,
   type QuarantineImpl,
   type ToolExecutor,
@@ -385,5 +388,118 @@ describe('args snapshotting', () => {
     await broker.call('send_email', { to: 'ops@example.com', body: 'summary' });
     expect(typeof seenToken).toBe('string');
     expect(seenToken!.length).toBeGreaterThan(0);
+  });
+
+  it('throws NonCloneableArgsError instead of silently sharing a live reference (GAPS #16)', async () => {
+    const broker = createBroker();
+    broker.register(shellExec());
+    await expect(broker.call('shell_exec', { cmd: 'echo hi', onDone: () => {} })).rejects.toBeInstanceOf(NonCloneableArgsError);
+  });
+
+  it('accepts a custom cloneArgs for tools that genuinely need non-JSON-able argument types', async () => {
+    const broker = createBroker({ cloneArgs: (v) => v }); // integrator takes responsibility; not a safe default
+    broker.register(shellExec());
+    const fn = () => 'unchanged';
+    const result = await broker.call('shell_exec', { cmd: 'echo hi', onDone: fn });
+    expect(result).toContain('echo hi');
+  });
+
+  it('a custom cloneArgs that still throws surfaces as NonCloneableArgsError, not the raw cause', async () => {
+    const broker = createBroker({
+      cloneArgs: () => {
+        throw new Error('nope');
+      },
+    });
+    broker.register(shellExec());
+    await expect(broker.call('shell_exec', { cmd: 'echo hi' })).rejects.toBeInstanceOf(NonCloneableArgsError);
+  });
+});
+
+describe('plan-freeze strict mode (declarePlan)', () => {
+  it('allows a privileged call that matches the next committed step', async () => {
+    const broker = createBroker();
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register(shellExec());
+    // fetch_url is a NONE-sink source: it's never plan-gated and never
+    // consumes a step (see declarePlan()'s doc comment), so it has no
+    // business appearing in the plan itself — only shell_exec does.
+    broker.declarePlan([{ toolName: 'shell_exec' }]);
+    await broker.call('fetch_url', {});
+    // shell_exec matches the plan, but is still subject to the normal
+    // policy check — RAW_UNTRUSTED + EXEC is an unconditional BLOCK
+    // regardless of the plan (additive, never a bypass).
+    await expect(broker.call('shell_exec', { cmd: 'anything' })).rejects.toBeInstanceOf(ToolCallBlockedError);
+  });
+
+  it('blocks a privileged call that does not match the next committed step, even if the default policy would allow it', async () => {
+    const broker = createBroker();
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register(sendEmail());
+    broker.register({
+      name: 'save_draft',
+      capabilities: { capabilities: [] },
+      async execute() {
+        return 'saved';
+      },
+    });
+    // Plan says: after fetching, only save_draft is allowed — never send_email.
+    // (fetch_url itself is not a plan step — see the previous test.)
+    broker.declarePlan([{ toolName: 'save_draft' }]);
+    await broker.call('fetch_url', {});
+    await expect(broker.call('send_email', { to: 'x@example.com', body: 'hi' })).rejects.toBeInstanceOf(UnplannedPrivilegedActionError);
+  });
+
+  it('does not constrain calls made while the scope is still CLEAN', async () => {
+    const broker = createBroker();
+    broker.register(fetchUrl('benign'));
+    broker.register(sendEmail());
+    broker.declarePlan([{ toolName: 'send_email' }]); // never actually invoked
+    // fetch_url is never called, so the scope never leaves CLEAN — the plan
+    // is inert and unplanned (or, as here, un-called) calls are still fine.
+    const result = await broker.call('send_email', { to: 'x@example.com', body: 'hi' });
+    expect(result).toContain('sent:');
+  });
+
+  it('does not constrain NONE-class sinks even after exposure', async () => {
+    const broker = createBroker();
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register({
+      name: 'noop',
+      capabilities: { capabilities: [] },
+      async execute() {
+        return 'ok';
+      },
+    });
+    broker.declarePlan([{ toolName: 'fetch_url' }]); // noop deliberately not in the plan
+    await broker.call('fetch_url', {});
+    expect(await broker.call('noop', {})).toBe('ok');
+  });
+
+  it('throws PlanNotDeclarableError if declared after the scope has already left CLEAN', async () => {
+    const broker = createBroker();
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    expect(() => broker.declarePlan([{ toolName: 'shell_exec' }])).toThrow(PlanNotDeclarableError);
+  });
+
+  it('blocks a call once the plan runs out of steps', async () => {
+    // A custom always-ALLOW policy isolates plan-cursor exhaustion (what
+    // this test is about) from the default policy matrix's own opinion on
+    // a MUTATE sink at RAW_UNTRUSTED (REQUIRE_APPROVAL) — save_draft needs
+    // a real (non-NONE) sinkClass to be plan-gated at all, see GAPS.md.
+    const broker = createBroker({ policy: () => ({ action: 'ALLOW' }) });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register({
+      name: 'save_draft',
+      capabilities: { capabilities: ['write:fs'] },
+      async execute() {
+        return 'saved';
+      },
+    });
+    // Only one committed step: a single save_draft is planned, a second is not.
+    broker.declarePlan([{ toolName: 'save_draft' }]);
+    await broker.call('fetch_url', {});
+    await expect(broker.call('save_draft', {})).resolves.toBe('saved');
+    await expect(broker.call('save_draft', {})).rejects.toBeInstanceOf(UnplannedPrivilegedActionError);
   });
 });

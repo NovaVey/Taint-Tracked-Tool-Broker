@@ -119,6 +119,25 @@ export interface TaintRegistry {
   lookupFuzzy(text: string, opts?: FuzzyLookupOpts): TaintMatch[];
   getById(id: string): TaintRecord | undefined;
   readonly size: number;
+
+  /**
+   * Every stored record, oldest-registered first. The registry deliberately
+   * never stores raw plaintext (only fingerprints derived from it), so this
+   * — not re-deriving fingerprints from a text corpus — is the supported
+   * basis for exporting registry state, e.g. for cross-process/cross-agent
+   * persistence (GAPS.md #12, persistence.ts).
+   */
+  entries(): readonly TaintRecord[];
+
+  /**
+   * Inserts an already-built `TaintRecord` directly, bypassing register()'s
+   * text -> fingerprint computation. The counterpart to entries(): restoring
+   * previously-exported state doesn't have the original plaintext to
+   * re-fingerprint, only the record itself. Restoring an id that's already
+   * present replaces it in place rather than duplicating it. See
+   * persistence.ts.
+   */
+  restore(record: TaintRecord): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +333,22 @@ export type QuarantineImpl = <S = string>(
 ) => Promise<S>;
 
 // ---------------------------------------------------------------------------
+// Optional strict mode: plan-freeze (§11)
+// ---------------------------------------------------------------------------
+
+/**
+ * One committed step in a declared plan: which tool the NEXT privileged
+ * call must be, once the scope leaves CLEAN. v1 matches on tool identity
+ * only — matching on argument shape too is a possible future enhancement,
+ * not implemented; see GAPS.md.
+ */
+export interface PlanStep {
+  toolName: string;
+  /** Free-form note for audit/debugging — not enforced. */
+  note?: string;
+}
+
+// ---------------------------------------------------------------------------
 // The broker (§7.3, §8)
 // ---------------------------------------------------------------------------
 
@@ -332,6 +367,24 @@ export interface ToolCallBroker {
   startNewTurn(): void;
   /** The ONLY path that lowers a watermark. Explicit, audited, never an implicit side effect of an approval. */
   declassify(reason: string, approvedBy: string): void;
+
+  /**
+   * Opt into plan-freeze strict mode (§11): once the scope leaves CLEAN, a
+   * privileged call whose tool doesn't match the next committed step is
+   * blocked as unplanned, on top of (never instead of) the normal policy
+   * check. Must be called while the scope is still CLEAN — committing to a
+   * plan after exposure would be meaningless, since the whole point is that
+   * the shape of what may happen was fixed before any untrusted content was
+   * read. Throws if the scope has already left CLEAN.
+   *
+   * Only privileged calls (non-NONE sinkClass) are matched against — and
+   * advance — the plan. NONE-sink calls, including source/read-only tools
+   * like a `fetch_url`, are never gated by policy in the first place (see
+   * "NONE" in SinkClass) and are correspondingly invisible to the plan: do
+   * not list them as steps expecting them to be consumed, and expect them
+   * to run freely between (and interleaved with) planned privileged steps.
+   */
+  declarePlan(steps: PlanStep[]): void;
 
   readonly scope: Readonly<TaintScope>;
   readonly registry: TaintRegistry;
