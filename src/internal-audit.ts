@@ -7,7 +7,14 @@
  * and independently drifting from each other over time.
  */
 
-import type { AuditSink, PolicyDecision, TaintContext, TaintLevel, ToolCall, ToolExecutor } from './types.js';
+import type {
+  AuditSink,
+  PolicyDecision,
+  TaintContext,
+  TaintLevel,
+  ToolCall,
+  ToolExecutor,
+} from './types.js';
 
 /**
  * Prefix reserved for TTTB's own internal/administrative audit-only tool
@@ -45,7 +52,10 @@ export function isUntrustedSource(tool: Pick<ToolExecutor, 'isSource' | 'trusted
  * fingerprint match driving the decision — only the scope level and
  * privateDataSeen flag at the time.
  */
-export function trivialTaintContext(scope: { level: TaintLevel; privateDataSeen: boolean }): TaintContext {
+export function trivialTaintContext(scope: {
+  level: TaintLevel;
+  privateDataSeen: boolean;
+}): TaintContext {
   return {
     matchedRecords: [],
     scopeLevel: scope.level,

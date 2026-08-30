@@ -33,7 +33,12 @@ import type {
 } from './types.js';
 import { NOT_SENSITIVE, sinkClassOf } from './types.js';
 import { InMemoryTaintRegistry } from './taint/registry.js';
-import { createScope, declassifyScope, markPrivateDataSeen, raiseWatermark } from './taint/scope.js';
+import {
+  createScope,
+  declassifyScope,
+  markPrivateDataSeen,
+  raiseWatermark,
+} from './taint/scope.js';
 import { scanArgsForTaint } from './taint/scan.js';
 import { exactHash, toRegistrableText } from './taint/fingerprint.js';
 import { defaultPolicy } from './policy/default-policy.js';
@@ -169,7 +174,7 @@ class Broker implements ToolCallBroker {
       if (!Number.isInteger(opts.turnDecayWindow) || (opts.turnDecayWindow as number) < 1) {
         throw new RangeError(
           `createBroker({ resetScope: 'turn-decay' }) requires turnDecayWindow to be a positive integer, got ${opts.turnDecayWindow}. ` +
-            "This is a deliberate security-relevant choice (how many turns of residual cross-turn exposure risk to accept) — there is no default.",
+            'This is a deliberate security-relevant choice (how many turns of residual cross-turn exposure risk to accept) — there is no default.',
         );
       }
       this.turnDecayWindow = opts.turnDecayWindow;
@@ -189,7 +194,10 @@ class Broker implements ToolCallBroker {
     this.registry = opts.registry ?? new InMemoryTaintRegistry();
     this.currentScope = createScope(this.resetScopeMode, this.sessionId);
     if (opts.initialWatermark) {
-      this.currentScope.watermark = { ...opts.initialWatermark, sources: [...opts.initialWatermark.sources] };
+      this.currentScope.watermark = {
+        ...opts.initialWatermark,
+        sources: [...opts.initialWatermark.sources],
+      };
     }
     this.rawSummarize = createQuarantine({
       impl: opts.quarantineImpl ?? unconfiguredQuarantineImpl,
@@ -209,12 +217,19 @@ class Broker implements ToolCallBroker {
     // serialized, no new lock needed; anything else (a genuine top-level
     // call, OR nested inside a barrier-EXEMPT call that never took the lock
     // at all) -> acquire the lock exactly like a fresh call() would.
-    this.summarize = <S = string>(text: string, quarantineOpts: QuarantineOpts<S>): Promise<QuarantineResult<S>> => {
+    this.summarize = <S = string>(
+      text: string,
+      quarantineOpts: QuarantineOpts<S>,
+    ): Promise<QuarantineResult<S>> => {
       const ctx = this.reentrancyGuard.getStore();
       if (ctx?.lockHeld) {
         return this.rawSummarize<S>(text, quarantineOpts);
       }
-      return this.withLock(() => this.reentrancyGuard.run({ lockHeld: true }, () => this.rawSummarize<S>(text, quarantineOpts)));
+      return this.withLock(() =>
+        this.reentrancyGuard.run({ lockHeld: true }, () =>
+          this.rawSummarize<S>(text, quarantineOpts),
+        ),
+      );
     };
   }
 
@@ -274,7 +289,7 @@ class Broker implements ToolCallBroker {
   /** Registers `executor` and returns a drop-in replacement whose execute() is interposed through call(). */
   wrap<T extends ToolExecutor>(executor: T): T {
     this.register(executor);
-    return { ...executor, execute: (args: unknown) => this.call(executor.name, args) } as T;
+    return { ...executor, execute: (args: unknown) => this.call(executor.name, args) };
   }
 
   registerAll<T extends Record<string, ToolExecutor>>(tools: T): void {
@@ -299,8 +314,12 @@ class Broker implements ToolCallBroker {
       // Deliberately never `trusted` — a trusted source is never registered
       // into the fingerprint registry (see applyPostExecutionEffects), so
       // there would be no taintRecordId for this helper to hand back. See
-      // RawQuarantineSourceTool's doc comment in types.ts.
-      execute: tool.execute,
+      // RawQuarantineSourceTool's doc comment in types.ts. Bound (not a
+      // bare reference) since ToolExecutor.execute is a method-shorthand
+      // interface member — an integrator's implementation is free to use
+      // `this` internally, and extracting it unbound would silently break
+      // that once it's called here detached from `tool`.
+      execute: tool.execute.bind(tool),
     });
     return {
       name: tool.name,
@@ -363,7 +382,12 @@ class Broker implements ToolCallBroker {
    * via the "not exempt" path rather than a special case here.
    */
   private isBarrierExempt(tool: ToolExecutor, sinkClass: SinkClass): boolean {
-    return sinkClass === 'NONE' && !isUntrustedSource(tool) && !tool.capabilities.readsPrivateData && !tool.mayCallSummarize;
+    return (
+      sinkClass === 'NONE' &&
+      !isUntrustedSource(tool) &&
+      !tool.capabilities.readsPrivateData &&
+      !tool.mayCallSummarize
+    );
   }
 
   async call(toolName: string, args: unknown): Promise<unknown> {
@@ -384,7 +408,9 @@ class Broker implements ToolCallBroker {
       // itself (GAPS.md #17), it cannot assume one is already held here.
       return this.reentrancyGuard.run({ lockHeld: false }, () => this.dispatch(toolName, args));
     }
-    return this.withLock(() => this.reentrancyGuard.run({ lockHeld: true }, () => this.dispatch(toolName, args)));
+    return this.withLock(() =>
+      this.reentrancyGuard.run({ lockHeld: true }, () => this.dispatch(toolName, args)),
+    );
   }
 
   async callSafe(toolName: string, args: unknown): Promise<CallResult> {
@@ -423,7 +449,12 @@ class Broker implements ToolCallBroker {
     // both would share one mutable reference with whatever execute() did
     // to it.
     const argsSnapshot = this.cloneArgsOrThrow(toolName, args);
-    const call: ToolCall = { id: randomUUID(), toolName, args: argsSnapshot, sessionId: this.sessionId };
+    const call: ToolCall = {
+      id: randomUUID(),
+      toolName,
+      args: argsSnapshot,
+      sessionId: this.sessionId,
+    };
     const sinkClass = sinkClassOf(tool.capabilities.capabilities);
 
     let result: unknown;
@@ -479,7 +510,9 @@ class Broker implements ToolCallBroker {
         result = await tool.execute(this.cloneArgsOrThrow(toolName, args));
         executed = true;
       } else if (decision.action === 'REQUIRE_APPROVAL') {
-        const granted = this.approvalChannel ? await this.approvalChannel.requestApproval(call, taint, decision) : false;
+        const granted = this.approvalChannel
+          ? await this.approvalChannel.requestApproval(call, taint, decision)
+          : false;
         if (granted) {
           result = await tool.execute(this.cloneArgsOrThrow(toolName, args));
           executed = true;
@@ -497,9 +530,19 @@ class Broker implements ToolCallBroker {
 
     if (sinkClass === 'NONE' && (tool.capabilities.readsPrivateData || isUntrustedSource(tool))) {
       const reasons: string[] = [];
-      if (isUntrustedSource(tool)) reasons.push(`untrusted source call raised the scope watermark to ${this.currentScope.watermark.level}.`);
-      if (tool.capabilities.readsPrivateData) reasons.push('private data was read this scope (lethal-trifecta escalator, §3.2).');
-      recordTrivialAudit(this.auditSink, { action: 'ALLOW_WITH_WARNING', reason: reasons.join(' ') }, call, this.currentScope.watermark, true);
+      if (isUntrustedSource(tool))
+        reasons.push(
+          `untrusted source call raised the scope watermark to ${this.currentScope.watermark.level}.`,
+        );
+      if (tool.capabilities.readsPrivateData)
+        reasons.push('private data was read this scope (lethal-trifecta escalator, §3.2).');
+      recordTrivialAudit(
+        this.auditSink,
+        { action: 'ALLOW_WITH_WARNING', reason: reasons.join(' ') },
+        call,
+        this.currentScope.watermark,
+        true,
+      );
     }
 
     if (this.warnOnLikelyUnmarkedSource !== undefined && sinkClass === 'NONE' && !tool.isSource) {
@@ -533,7 +576,10 @@ class Broker implements ToolCallBroker {
     return result;
   }
 
-  markContextExposure(source: { toolName?: string; note: string; text?: string }, level: TaintLevel = 'RAW_UNTRUSTED'): void {
+  markContextExposure(
+    source: { toolName?: string; note: string; text?: string },
+    level: TaintLevel = 'RAW_UNTRUSTED',
+  ): void {
     // Optional `text`: registers the actual exposed content into the Layer
     // 2 fingerprint registry (mirroring applyPostExecutionEffects()'s
     // register-then-raise pattern for ordinary source-tool calls), instead
@@ -563,7 +609,12 @@ class Broker implements ToolCallBroker {
       {
         id: provenance.sourceCallId,
         toolName: '__tttb_context_exposure',
-        args: { toolName: source.toolName, note: source.note, level, ...(source.text !== undefined ? { text: source.text } : {}) },
+        args: {
+          toolName: source.toolName,
+          note: source.note,
+          level,
+          ...(source.text !== undefined ? { text: source.text } : {}),
+        },
         sessionId: this.sessionId,
       },
       this.currentScope.watermark,
@@ -571,19 +622,45 @@ class Broker implements ToolCallBroker {
     );
   }
 
-  markToolDescriptionExposure(toolName: string, description: string, level: TaintLevel = 'RAW_UNTRUSTED'): void {
+  markToolDescriptionExposure(
+    toolName: string,
+    description: string,
+    level: TaintLevel = 'RAW_UNTRUSTED',
+  ): void {
     this.markContextExposure(
-      { toolName, note: `tool/plugin description exposure: "${toolName}"'s description was ingested (or changed) outside a tracked tool call — see GAPS.md #1.`, text: description },
+      {
+        toolName,
+        note: `tool/plugin description exposure: "${toolName}"'s description was ingested (or changed) outside a tracked tool call — see GAPS.md #1.`,
+        text: description,
+      },
       level,
     );
   }
 
   markSystemPromptExposure(note: string, text?: string, level: TaintLevel = 'RAW_UNTRUSTED'): void {
-    this.markContextExposure({ toolName: 'system-prompt', note: `system-prompt exposure: ${note}`, ...(text !== undefined ? { text } : {}) }, level);
+    this.markContextExposure(
+      {
+        toolName: 'system-prompt',
+        note: `system-prompt exposure: ${note}`,
+        ...(text !== undefined ? { text } : {}),
+      },
+      level,
+    );
   }
 
-  markPastedContentExposure(note: string, text?: string, level: TaintLevel = 'RAW_UNTRUSTED'): void {
-    this.markContextExposure({ toolName: 'pasted-content', note: `user-pasted content exposure: ${note}`, ...(text !== undefined ? { text } : {}) }, level);
+  markPastedContentExposure(
+    note: string,
+    text?: string,
+    level: TaintLevel = 'RAW_UNTRUSTED',
+  ): void {
+    this.markContextExposure(
+      {
+        toolName: 'pasted-content',
+        note: `user-pasted content exposure: ${note}`,
+        ...(text !== undefined ? { text } : {}),
+      },
+      level,
+    );
   }
 
   /**
@@ -611,7 +688,10 @@ class Broker implements ToolCallBroker {
    * phrase its own reason text without duplicating this snapshot/clear
    * sequence.
    */
-  private clearScopeForTurnReset(kind: 'turn' | 'turn-decay', buildReason: (priorLevel: TaintLevel, hadPlan: boolean) => string): void {
+  private clearScopeForTurnReset(
+    kind: 'turn' | 'turn-decay',
+    buildReason: (priorLevel: TaintLevel, hadPlan: boolean) => string,
+  ): void {
     const priorLevel = this.currentScope.watermark.level;
     const priorPrivateDataSeen = this.currentScope.watermark.privateDataSeen;
     const hadPlan = this.plan !== undefined;
@@ -681,7 +761,12 @@ class Broker implements ToolCallBroker {
         action: 'ALLOW_WITH_WARNING',
         reason: `declassify(): watermark manually cleared from ${priorLevel} — reason: "${reason}"; approved by ${approvedBy}.`,
       },
-      { id: randomUUID(), toolName: '__tttb_declassify', args: { reason, approvedBy }, sessionId: this.sessionId },
+      {
+        id: randomUUID(),
+        toolName: '__tttb_declassify',
+        args: { reason, approvedBy },
+        sessionId: this.sessionId,
+      },
       { level: priorLevel, privateDataSeen: priorPrivateDataSeen },
       true,
     );

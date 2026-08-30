@@ -61,7 +61,14 @@ export type {
   QuarantineSourceResult,
 } from './types.js';
 
-export { LEVEL_ORDER, maxLevel, levelAtLeast, sinkClassOf, NOT_SENSITIVE, TAINT_BRAND } from './types.js';
+export {
+  LEVEL_ORDER,
+  maxLevel,
+  levelAtLeast,
+  sinkClassOf,
+  NOT_SENSITIVE,
+  TAINT_BRAND,
+} from './types.js';
 
 export { createBroker } from './broker.js';
 export type { BrokerOptions } from './broker.js';
@@ -71,7 +78,12 @@ export { defaultPolicy } from './policy/default-policy.js';
 export { InMemoryTaintRegistry } from './taint/registry.js';
 export type { InMemoryTaintRegistryOpts } from './taint/registry.js';
 
-export { serializeRegistry, restoreRegistry, serializeBrokerState, restoreBrokerState } from './persistence.js';
+export {
+  serializeRegistry,
+  restoreRegistry,
+  serializeBrokerState,
+  restoreBrokerState,
+} from './persistence.js';
 export type { SerializedTaintRecord, SerializedBrokerState } from './persistence.js';
 export {
   buildFingerprint,
@@ -85,7 +97,13 @@ export {
 } from './taint/fingerprint.js';
 export { scanArgsForTaint } from './taint/scan.js';
 export type { ScanResult } from './taint/scan.js';
-export { createScope, createWatermark, declassifyScope, markPrivateDataSeen, raiseWatermark } from './taint/scope.js';
+export {
+  createScope,
+  createWatermark,
+  declassifyScope,
+  markPrivateDataSeen,
+  raiseWatermark,
+} from './taint/scope.js';
 export {
   concatTainted,
   isTaintedValue,

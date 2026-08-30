@@ -163,7 +163,10 @@ export interface TaintRegistry {
    * lookupFuzzy() keeps working unchanged, at the cost of the redundant
    * hash this exists to skip. InMemoryTaintRegistry implements it.
    */
-  lookupCombined?(text: string, opts?: FuzzyLookupOpts): { exact: TaintRecord | undefined; fuzzy: TaintMatch[] };
+  lookupCombined?(
+    text: string,
+    opts?: FuzzyLookupOpts,
+  ): { exact: TaintRecord | undefined; fuzzy: TaintMatch[] };
 }
 
 // ---------------------------------------------------------------------------
@@ -319,7 +322,10 @@ export type PolicyDecision =
 
 export type RequireApprovalDecision = Extract<PolicyDecision, { action: 'REQUIRE_APPROVAL' }>;
 
-export type PolicyFn = (call: ToolCall, taint: TaintContext) => Promise<PolicyDecision> | PolicyDecision;
+export type PolicyFn = (
+  call: ToolCall,
+  taint: TaintContext,
+) => Promise<PolicyDecision> | PolicyDecision;
 
 export interface ApprovalChannel {
   /**
@@ -330,7 +336,11 @@ export interface ApprovalChannel {
    * trusting that whatever comes back on this call corresponds to this
    * particular request.
    */
-  requestApproval(call: ToolCall, taint: TaintContext, decision: RequireApprovalDecision): Promise<boolean>;
+  requestApproval(
+    call: ToolCall,
+    taint: TaintContext,
+    decision: RequireApprovalDecision,
+  ): Promise<boolean>;
 }
 
 export interface AuditEvent {
@@ -366,7 +376,10 @@ export interface QuarantineResult<S = string> {
   level: 'DERIVED_UNTRUSTED';
 }
 
-export type QuarantineFn = <S = string>(text: string, opts: QuarantineOpts<S>) => Promise<QuarantineResult<S>>;
+export type QuarantineFn = <S = string>(
+  text: string,
+  opts: QuarantineOpts<S>,
+) => Promise<QuarantineResult<S>>;
 
 /**
  * The actual LLM call an integrator supplies for the quarantine path. Must be
@@ -447,7 +460,9 @@ export interface ToolCallBroker {
    * DualRoleToolError at registration if `tool` also declares sink
    * capabilities — this helper is for source-only tools; see register().
    */
-  registerRawForQuarantine<A = unknown, R = unknown>(tool: RawQuarantineSourceTool<A, R>): { name: string; execute(args: A): Promise<QuarantineSourceResult> };
+  registerRawForQuarantine<A = unknown, R = unknown>(
+    tool: RawQuarantineSourceTool<A, R>,
+  ): { name: string; execute(args: A): Promise<QuarantineSourceResult> };
 
   summarize: QuarantineFn;
 
@@ -459,7 +474,10 @@ export interface ToolCallBroker {
    * when only the fact of an exposure is known (e.g. "this tool's
    * description changed since last seen"), not its content.
    */
-  markContextExposure(source: { toolName?: string; note: string; text?: string }, level?: TaintLevel): void;
+  markContextExposure(
+    source: { toolName?: string; note: string; text?: string },
+    level?: TaintLevel,
+  ): void;
 
   /** markContextExposure() specialized for a tool/plugin/MCP-server description read at discovery time (GAPS.md #1's own canonical example) — see examples/mcp-integration.ts's rug-pull guard for a worked pattern. */
   markToolDescriptionExposure(toolName: string, description: string, level?: TaintLevel): void;

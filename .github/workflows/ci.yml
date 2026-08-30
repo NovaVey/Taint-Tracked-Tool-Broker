@@ -41,3 +41,15 @@ jobs:
       # below them. Runs once (not across the full Node matrix above) since
       # V8 coverage isn't meaningfully Node-version-sensitive here.
       - run: npm run coverage
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run format:check

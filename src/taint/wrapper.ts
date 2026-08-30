@@ -15,16 +15,22 @@
 import type { ProvenanceTag, TaintLevel, TaintedValue } from '../types.js';
 import { TAINT_BRAND, maxLevel } from '../types.js';
 
-export function wrapTainted<T>(value: T, level: TaintLevel, sources: ProvenanceTag[]): TaintedValue<T> {
+export function wrapTainted<T>(
+  value: T,
+  level: TaintLevel,
+  sources: ProvenanceTag[],
+): TaintedValue<T> {
   return { [TAINT_BRAND]: true, value, level, sources };
 }
 
 export function isTaintedValue(x: unknown): x is TaintedValue<unknown> {
-  return typeof x === 'object' && x !== null && (x as Record<PropertyKey, unknown>)[TAINT_BRAND] === true;
+  return (
+    typeof x === 'object' && x !== null && (x as Record<PropertyKey, unknown>)[TAINT_BRAND] === true
+  );
 }
 
 export function unwrap<T>(x: T | TaintedValue<T>): T {
-  return isTaintedValue(x) ? (x.value as T) : x;
+  return isTaintedValue(x) ? x.value : x;
 }
 
 function mergeSources(...groups: ProvenanceTag[][]): ProvenanceTag[] {
@@ -42,7 +48,9 @@ function mergeSources(...groups: ProvenanceTag[][]): ProvenanceTag[] {
 }
 
 /** Concatenates strings (tainted or plain), unioning level and sources of any tainted parts (§5). */
-export function concatTainted(...parts: Array<string | TaintedValue<string>>): TaintedValue<string> {
+export function concatTainted(
+  ...parts: Array<string | TaintedValue<string>>
+): TaintedValue<string> {
   let level: TaintLevel = 'CLEAN';
   const sourceGroups: ProvenanceTag[][] = [];
   let text = '';
@@ -102,9 +110,12 @@ export function spreadTainted<T extends Record<string, unknown>>(
 }
 
 /** Array.prototype.map that carries the source array's taint onto the mapped result (§5). */
-export function mapTainted<T, U>(arr: TaintedValue<T[]> | T[], fn: (item: T, index: number) => U): TaintedValue<U[]> {
+export function mapTainted<T, U>(
+  arr: TaintedValue<T[]> | T[],
+  fn: (item: T, index: number) => U,
+): TaintedValue<U[]> {
   const level = isTaintedValue(arr) ? arr.level : 'CLEAN';
   const sources = isTaintedValue(arr) ? arr.sources : [];
-  const items = isTaintedValue(arr) ? (arr.value as T[]) : arr;
+  const items = isTaintedValue(arr) ? arr.value : arr;
   return wrapTainted(items.map(fn), level, sources);
 }

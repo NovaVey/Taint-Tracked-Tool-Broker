@@ -19,7 +19,13 @@
  * BOTH outcomes, and every other framework example already covers BLOCK.
  */
 
-import { createBroker, createDeferredApprovalChannel, ToolCallBlockedError, type ToolCallBroker, type ToolExecutor } from '../src/index.js';
+import {
+  createBroker,
+  createDeferredApprovalChannel,
+  ToolCallBlockedError,
+  type ToolCallBroker,
+  type ToolExecutor,
+} from '../src/index.js';
 
 // ---------------------------------------------------------------------------
 // A minimal stand-in for @openai/agents' tool() + Agent/run() shapes.
@@ -34,12 +40,21 @@ interface MockAgentsSdkTool<A = unknown, R = unknown> {
 }
 
 /** Stands in for `import { tool } from '@openai/agents'`. */
-function tool<A, R>(config: { name: string; description: string; parameters: { parse(input: unknown): A }; execute(args: A): Promise<R> }): MockAgentsSdkTool<A, R> {
+function tool<A, R>(config: {
+  name: string;
+  description: string;
+  parameters: { parse(input: unknown): A };
+  execute(args: A): Promise<R>;
+}): MockAgentsSdkTool<A, R> {
   return config;
 }
 
 /** Stands in for `Agent`'s tool registry + `run(agent, input)`'s own dispatch loop calling a requested tool's execute(). */
-async function mockRun(tools: MockAgentsSdkTool[], toolName: string, rawArgs: unknown): Promise<{ ok: true; result: unknown } | { ok: false; error: unknown }> {
+async function mockRun(
+  tools: MockAgentsSdkTool[],
+  toolName: string,
+  rawArgs: unknown,
+): Promise<{ ok: true; result: unknown } | { ok: false; error: unknown }> {
   const t = tools.find((candidate) => candidate.name === toolName);
   if (!t) return { ok: false, error: new Error(`no such tool: ${toolName}`) };
   try {
@@ -61,15 +76,24 @@ function wrapAsAgentsSdkTool<A, R>(
   parameters: { parse(input: unknown): A },
 ): MockAgentsSdkTool<A, R> {
   const wrapped = broker.wrap(executor);
-  return tool<A, R>({ name: executor.name, description, parameters, execute: (args) => wrapped.execute(args) });
+  return tool<A, R>({
+    name: executor.name,
+    description,
+    parameters,
+    execute: (args) => wrapped.execute(args),
+  });
 }
 
 async function main(): Promise<void> {
-  console.log('=== OpenAI Agents SDK integration: broker.wrap() behind tool()/execute(), REQUIRE_APPROVAL path ===\n');
+  console.log(
+    '=== OpenAI Agents SDK integration: broker.wrap() behind tool()/execute(), REQUIRE_APPROVAL path ===\n',
+  );
 
   const approvalChannel = createDeferredApprovalChannel({
     onPending: (token) => {
-      console.log(`  [approval requested] token=${token} — in a real integration this is where you'd notify a human (Slack, an approval-queue UI, ...).`);
+      console.log(
+        `  [approval requested] token=${token} — in a real integration this is where you'd notify a human (Slack, an approval-queue UI, ...).`,
+      );
       setTimeout(() => {
         console.log('  [human responds] approved.');
         approvalChannel.resolve(token, true);
@@ -81,13 +105,26 @@ async function main(): Promise<void> {
   const tools: MockAgentsSdkTool[] = [
     wrapAsAgentsSdkTool(
       broker,
-      { name: 'fetch_page', capabilities: { capabilities: [] }, isSource: true, async execute({ url }: { url: string }) { return 'Here is the quarterly report content.'; } },
+      {
+        name: 'fetch_page',
+        capabilities: { capabilities: [] },
+        isSource: true,
+        async execute({ url: _url }: { url: string }) {
+          return 'Here is the quarterly report content.';
+        },
+      },
       'Fetches the raw text content of a web page by URL.',
       { parse: (x) => x as { url: string } },
     ),
     wrapAsAgentsSdkTool(
       broker,
-      { name: 'write_file', capabilities: { capabilities: ['write:fs'] }, async execute({ path, contents }: { path: string; contents: string }) { return `wrote: ${path}`; } },
+      {
+        name: 'write_file',
+        capabilities: { capabilities: ['write:fs'] },
+        async execute({ path, contents: _contents }: { path: string; contents: string }) {
+          return `wrote: ${path}`;
+        },
+      },
       'Writes contents to a local file path.',
       { parse: (x) => x as { path: string; contents: string } },
     ),
@@ -103,9 +140,16 @@ async function main(): Promise<void> {
   // write_file is a MUTATE sink under a RAW_UNTRUSTED scope -> REQUIRE_APPROVAL
   // (not BLOCK) — createDeferredApprovalChannel() suspends this call until
   // the onPending hook's simulated human decision resolves it.
-  const writeOutcome = await mockRun(tools, 'write_file', { path: '/tmp/report.txt', contents: 'saved' });
+  const writeOutcome = await mockRun(tools, 'write_file', {
+    path: '/tmp/report.txt',
+    contents: 'saved',
+  });
   if (writeOutcome.ok) {
-    console.log('write_file ->', writeOutcome.result, '(approved — REQUIRE_APPROVAL resolved true, execution proceeded)');
+    console.log(
+      'write_file ->',
+      writeOutcome.result,
+      '(approved — REQUIRE_APPROVAL resolved true, execution proceeded)',
+    );
   } else if (writeOutcome.error instanceof ToolCallBlockedError) {
     console.log('UNEXPECTED: denied —', writeOutcome.error.decision.action);
   } else {

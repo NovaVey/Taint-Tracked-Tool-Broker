@@ -32,7 +32,13 @@ function tag(overrides: Partial<ProvenanceTag> = {}): ProvenanceTag {
 }
 
 function shellExec(): ToolExecutor {
-  return { name: 'shell_exec', capabilities: { capabilities: ['exec:shell'] }, async execute(args) { return `ran:${JSON.stringify(args)}`; } };
+  return {
+    name: 'shell_exec',
+    capabilities: { capabilities: ['exec:shell'] },
+    async execute(args) {
+      return `ran:${JSON.stringify(args)}`;
+    },
+  };
 }
 
 /** Forces every value through a real JSON round trip, the way it would cross an actual process boundary (file, DB, network). */
@@ -43,7 +49,10 @@ function throughJSON<T>(value: T): T {
 describe('registry persistence (serializeRegistry / restoreRegistry) — GAPS.md #12', () => {
   it('round-trips exact lookup, fuzzy lookup, and record fields through JSON', () => {
     const source = new InMemoryTaintRegistry();
-    source.register(SOURCE, tag(), 'RAW_UNTRUSTED', { containsPrivateData: true, categories: ['credentials'] });
+    source.register(SOURCE, tag(), 'RAW_UNTRUSTED', {
+      containsPrivateData: true,
+      categories: ['credentials'],
+    });
 
     const wire = throughJSON(serializeRegistry(source));
     // simhash (bigint) and shingleHashes (Uint32Array) must have survived as
@@ -68,7 +77,12 @@ describe('registry persistence (serializeRegistry / restoreRegistry) — GAPS.md
 
   it('merges into a registry that already has other entries, without disturbing them', () => {
     const target = new InMemoryTaintRegistry();
-    const preexisting = target.register('Some other content already in this registry before restore runs, long enough to count.', tag({ id: 'pre' }), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+    const preexisting = target.register(
+      'Some other content already in this registry before restore runs, long enough to count.',
+      tag({ id: 'pre' }),
+      'RAW_UNTRUSTED',
+      NOT_SENSITIVE,
+    );
 
     const source = new InMemoryTaintRegistry();
     source.register(SOURCE, tag(), 'RAW_UNTRUSTED', NOT_SENSITIVE);
@@ -92,9 +106,16 @@ describe('registry persistence (serializeRegistry / restoreRegistry) — GAPS.md
 });
 
 describe('broker state persistence (serializeBrokerState / restoreBrokerState) — GAPS.md #12', () => {
-  it('a broker restored from another process-boundary-crossed broker\'s state carries the raised watermark forward', async () => {
+  it("a broker restored from another process-boundary-crossed broker's state carries the raised watermark forward", async () => {
     const producer = createBroker();
-    producer.register({ name: 'fetch_url', capabilities: { capabilities: [] }, isSource: true, async execute() { return SOURCE; } });
+    producer.register({
+      name: 'fetch_url',
+      capabilities: { capabilities: [] },
+      isSource: true,
+      async execute() {
+        return SOURCE;
+      },
+    });
     await producer.call('fetch_url', {});
     expect(producer.scope.watermark.level).toBe('RAW_UNTRUSTED');
 
@@ -107,14 +128,23 @@ describe('broker state persistence (serializeBrokerState / restoreBrokerState) �
     // purely from the restored watermark, not from anything it did itself.
     expect(consumer.scope.watermark.level).toBe('RAW_UNTRUSTED');
     consumer.register(shellExec());
-    await expect(consumer.call('shell_exec', { cmd: 'anything' })).rejects.toBeInstanceOf(ToolCallBlockedError);
+    await expect(consumer.call('shell_exec', { cmd: 'anything' })).rejects.toBeInstanceOf(
+      ToolCallBlockedError,
+    );
   });
 
   it('a freshly created broker with no restored state is unaffected (CLEAN, unplanned calls proceed normally)', async () => {
-    const broker = createBroker({ ...restoreBrokerState({ watermark: { level: 'CLEAN', privateDataSeen: false, sources: [] }, registry: [] }) });
+    const broker = createBroker({
+      ...restoreBrokerState({
+        watermark: { level: 'CLEAN', privateDataSeen: false, sources: [] },
+        registry: [],
+      }),
+    });
     expect(broker.scope.watermark.level).toBe('CLEAN');
     broker.register(shellExec());
-    await expect(broker.call('shell_exec', { cmd: 'echo hi' })).resolves.toBe('ran:{"cmd":"echo hi"}');
+    await expect(broker.call('shell_exec', { cmd: 'echo hi' })).resolves.toBe(
+      'ran:{"cmd":"echo hi"}',
+    );
   });
 
   it('restoreBrokerState honors a custom makeRegistry (e.g. one with maxEntries)', () => {
@@ -129,10 +159,23 @@ describe('broker state persistence (serializeBrokerState / restoreBrokerState) �
 
   it('a declared plan does NOT survive serializeBrokerState()/restoreBrokerState() — plan-freeze protection is silently lost, and cannot be re-declared afterward (DESIGN.md §11, GAPS.md #12)', async () => {
     const alwaysApprove: ApprovalChannel = { requestApproval: async () => true };
-    const sendEmail = (): ToolExecutor => ({ name: 'send_email', capabilities: { capabilities: ['net:email'] }, async execute() { return 'sent'; } });
+    const sendEmail = (): ToolExecutor => ({
+      name: 'send_email',
+      capabilities: { capabilities: ['net:email'] },
+      async execute() {
+        return 'sent';
+      },
+    });
 
     const producer = createBroker({ approvalChannel: alwaysApprove });
-    producer.register({ name: 'fetch_url', capabilities: { capabilities: [] }, isSource: true, async execute() { return SOURCE; } });
+    producer.register({
+      name: 'fetch_url',
+      capabilities: { capabilities: [] },
+      isSource: true,
+      async execute() {
+        return SOURCE;
+      },
+    });
     producer.register(sendEmail());
     // Committed plan does not include send_email as the next step.
     producer.declarePlan([{ toolName: 'some_other_tool' }]);
@@ -143,7 +186,9 @@ describe('broker state persistence (serializeBrokerState / restoreBrokerState) �
     // On the ORIGINAL broker, plan-freeze rejects this outright — even
     // though the approval channel above would happily grant it — because it
     // doesn't match the next committed step.
-    await expect(producer.call('send_email', {})).rejects.toBeInstanceOf(UnplannedPrivilegedActionError);
+    await expect(producer.call('send_email', {})).rejects.toBeInstanceOf(
+      UnplannedPrivilegedActionError,
+    );
 
     // Export/restore across a simulated process boundary.
     const wire: SerializedBrokerState = throughJSON(serializeBrokerState(producer));
@@ -152,7 +197,9 @@ describe('broker state persistence (serializeBrokerState / restoreBrokerState) �
 
     // Re-declaring the same plan on the restored broker is impossible — the
     // restored watermark is already non-CLEAN, so declarePlan() throws.
-    expect(() => consumer.declarePlan([{ toolName: 'some_other_tool' }])).toThrow(PlanNotDeclarableError);
+    expect(() => consumer.declarePlan([{ toolName: 'some_other_tool' }])).toThrow(
+      PlanNotDeclarableError,
+    );
 
     // The IDENTICAL call that was blocked on producer now succeeds on
     // consumer: restoreBrokerState() only restores the watermark and

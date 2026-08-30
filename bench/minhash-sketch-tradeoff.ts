@@ -73,7 +73,7 @@ function largeDocumentContaining(excerpt: string, wrapperWords: number, salt: nu
 
 function minhashSeeds(k: number, rngSeed: number): number[] {
   const seeds: number[] = [];
-  let s = (rngSeed >>> 0) || 0x2545f491;
+  let s = rngSeed >>> 0 || 0x2545f491;
   for (let i = 0; i < k; i++) {
     s = (Math.imul(s, 1103515245) + 12345) >>> 0;
     seeds.push(s);
@@ -81,7 +81,11 @@ function minhashSeeds(k: number, rngSeed: number): number[] {
   return seeds;
 }
 
-function computeMinhashSketch(shingleHashes: Uint32Array, k: number, seeds: readonly number[]): Uint32Array {
+function computeMinhashSketch(
+  shingleHashes: Uint32Array,
+  k: number,
+  seeds: readonly number[],
+): Uint32Array {
   const sketch = new Uint32Array(k).fill(0xffffffff);
   for (const shingle of shingleHashes) {
     for (let j = 0; j < k; j++) {
@@ -113,9 +117,18 @@ const RATIOS = [10, 50, 200, 500];
 function main(): void {
   const sourceHashes = shingleHashesOf(MALICIOUS_EXCERPT);
 
-  console.log(`MinHash sketch vs exact overlapCoefficient() — TRUE containment is always 1.0 (the excerpt is verbatim inside the document).`);
-  console.log(`Production threshold (overlapMin): ${OVERLAP_MIN}. ${TRIALS_PER_CONFIG} trials per (ratio, K) with independently randomized hash seeds.\n`);
-  console.log('ratio'.padEnd(8), 'docShingles'.padEnd(13), 'exactOC'.padEnd(9), ...K_VALUES.map((k) => `K=${k}: mean/min/FN%`.padEnd(24)));
+  console.log(
+    `MinHash sketch vs exact overlapCoefficient() — TRUE containment is always 1.0 (the excerpt is verbatim inside the document).`,
+  );
+  console.log(
+    `Production threshold (overlapMin): ${OVERLAP_MIN}. ${TRIALS_PER_CONFIG} trials per (ratio, K) with independently randomized hash seeds.\n`,
+  );
+  console.log(
+    'ratio'.padEnd(8),
+    'docShingles'.padEnd(13),
+    'exactOC'.padEnd(9),
+    ...K_VALUES.map((k) => `K=${k}: mean/min/FN%`.padEnd(24)),
+  );
 
   for (const ratio of RATIOS) {
     const wrapperWords = MALICIOUS_EXCERPT.split(' ').length * ratio;
@@ -123,7 +136,11 @@ function main(): void {
     const documentHashes = shingleHashesOf(document);
     const exactOC = overlapCoefficient(sourceHashes, documentHashes); // the library's real, current matching function — always ~1.0 here, confirming ground truth.
 
-    const row = [String(ratio).padEnd(8), String(documentHashes.length).padEnd(13), exactOC.toFixed(2).padEnd(9)];
+    const row = [
+      String(ratio).padEnd(8),
+      String(documentHashes.length).padEnd(13),
+      exactOC.toFixed(2).padEnd(9),
+    ];
     for (const k of K_VALUES) {
       const estimates: number[] = [];
       for (let trial = 0; trial < TRIALS_PER_CONFIG; trial++) {
@@ -131,12 +148,17 @@ function main(): void {
         const sketchA = computeMinhashSketch(sourceHashes, k, seeds);
         const sketchB = computeMinhashSketch(documentHashes, k, seeds);
         const jaccard = estimatedJaccard(sketchA, sketchB);
-        estimates.push(overlapCoefficientFromJaccard(jaccard, sourceHashes.length, documentHashes.length));
+        estimates.push(
+          overlapCoefficientFromJaccard(jaccard, sourceHashes.length, documentHashes.length),
+        );
       }
       const mean = estimates.reduce((a, b) => a + b, 0) / TRIALS_PER_CONFIG;
       const min = Math.min(...estimates);
-      const falseNegativeRate = (estimates.filter((e) => e < OVERLAP_MIN).length / TRIALS_PER_CONFIG) * 100;
-      row.push(`${mean.toFixed(2)} / ${min.toFixed(2)} / ${falseNegativeRate.toFixed(0)}%`.padEnd(24));
+      const falseNegativeRate =
+        (estimates.filter((e) => e < OVERLAP_MIN).length / TRIALS_PER_CONFIG) * 100;
+      row.push(
+        `${mean.toFixed(2)} / ${min.toFixed(2)} / ${falseNegativeRate.toFixed(0)}%`.padEnd(24),
+      );
     }
     console.log(row.join(' '));
   }

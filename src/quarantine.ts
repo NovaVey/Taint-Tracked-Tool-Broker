@@ -21,7 +21,12 @@ import type {
   TaintRegistry,
   ToolCall,
 } from './types.js';
-import { buildFingerprint, exactHash, shingleIntersectionSize, toRegistrableText } from './taint/fingerprint.js';
+import {
+  buildFingerprint,
+  exactHash,
+  shingleIntersectionSize,
+  toRegistrableText,
+} from './taint/fingerprint.js';
 import { QuarantineInputMismatchError, QuarantineInputUnknownError } from './errors.js';
 import { recordTrivialAudit } from './internal-audit.js';
 
@@ -66,7 +71,10 @@ export interface CreateQuarantineOpts {
 
 export function createQuarantine(config: CreateQuarantineOpts): QuarantineFn {
   const { impl, registry, raiseToDerivedUntrusted, getScope, auditSink } = config;
-  return async function summarize<S = string>(text: string, opts: QuarantineOpts<S>): Promise<QuarantineResult<S>> {
+  return async function summarize<S = string>(
+    text: string,
+    opts: QuarantineOpts<S>,
+  ): Promise<QuarantineResult<S>> {
     // §6.2 says this path is "auditable and policy-visible like any other
     // call" (DESIGN.md). It isn't policy-gated — summarize() has no
     // sinkClass to gate — but every branch below (both rejections and the
@@ -76,7 +84,11 @@ export function createQuarantine(config: CreateQuarantineOpts): QuarantineFn {
     const call: ToolCall = {
       id: randomUUID(),
       toolName: '__tttb_summarize',
-      args: { text, sourceTaintRecordId: opts.sourceTaintRecordId, hasSchema: opts.schema !== undefined },
+      args: {
+        text,
+        sourceTaintRecordId: opts.sourceTaintRecordId,
+        hasSchema: opts.schema !== undefined,
+      },
       sessionId: opts.sessionId,
     };
 
@@ -84,7 +96,10 @@ export function createQuarantine(config: CreateQuarantineOpts): QuarantineFn {
     if (!sourceRecord) {
       recordTrivialAudit(
         auditSink,
-        { action: 'BLOCK', reason: `summarize() input references unknown taint record "${opts.sourceTaintRecordId}" — see GAPS.md #4, DESIGN.md §6.2.` },
+        {
+          action: 'BLOCK',
+          reason: `summarize() input references unknown taint record "${opts.sourceTaintRecordId}" — see GAPS.md #4, DESIGN.md §6.2.`,
+        },
         call,
         getScope(),
         false,
@@ -102,7 +117,10 @@ export function createQuarantine(config: CreateQuarantineOpts): QuarantineFn {
         coverage =
           inputFingerprint.shingleHashes.length === 0
             ? 0
-            : shingleIntersectionSize(inputFingerprint.shingleHashes, sourceRecord.fingerprint.shingleHashes) / inputFingerprint.shingleHashes.length;
+            : shingleIntersectionSize(
+                inputFingerprint.shingleHashes,
+                sourceRecord.fingerprint.shingleHashes,
+              ) / inputFingerprint.shingleHashes.length;
         if (coverage < MIN_SOURCE_COVERAGE) mismatch = true;
       }
       if (mismatch) {
@@ -113,7 +131,14 @@ export function createQuarantine(config: CreateQuarantineOpts): QuarantineFn {
           },
           call,
           taint: {
-            matchedRecords: [{ record: sourceRecord, matchType: 'quarantine-derived', argPath: '', score: coverage }],
+            matchedRecords: [
+              {
+                record: sourceRecord,
+                matchType: 'quarantine-derived',
+                argPath: '',
+                score: coverage,
+              },
+            ],
             scopeLevel: getScope().level,
             argFingerprintFloor: 'CLEAN',
             privateDataSeen: getScope().privateDataSeen,
@@ -145,7 +170,13 @@ export function createQuarantine(config: CreateQuarantineOpts): QuarantineFn {
       capturedAt: Date.now(),
       note: `derived from ${sourceRecord.id}`,
     };
-    const record = registry.register(outText, provenance, 'DERIVED_UNTRUSTED', sourceRecord.sensitivity, [sourceRecord.id]);
+    const record = registry.register(
+      outText,
+      provenance,
+      'DERIVED_UNTRUSTED',
+      sourceRecord.sensitivity,
+      [sourceRecord.id],
+    );
 
     // §6.2 step 4: raises the scope watermark to at least DERIVED_UNTRUSTED
     // — never all the way back to CLEAN. The quarantine path buys a lower
@@ -158,9 +189,14 @@ export function createQuarantine(config: CreateQuarantineOpts): QuarantineFn {
         action: 'ALLOW_WITH_WARNING',
         reason: `Quarantine/summarize: condensed untrusted content from taint record "${sourceRecord.id}" to a new DERIVED_UNTRUSTED record "${record.id}" (see DESIGN.md §6.2).`,
       },
-      call: { ...call, args: { ...(call.args as Record<string, unknown>), outputTaintRecordId: record.id } },
+      call: {
+        ...call,
+        args: { ...(call.args as Record<string, unknown>), outputTaintRecordId: record.id },
+      },
       taint: {
-        matchedRecords: [{ record: sourceRecord, matchType: 'quarantine-derived', argPath: '', score: 1 }],
+        matchedRecords: [
+          { record: sourceRecord, matchType: 'quarantine-derived', argPath: '', score: 1 },
+        ],
         scopeLevel: getScope().level,
         argFingerprintFloor: sourceRecord.level,
         privateDataSeen: getScope().privateDataSeen,

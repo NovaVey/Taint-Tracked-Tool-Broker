@@ -23,7 +23,10 @@
  */
 
 function isPlainObject(value: object): boolean {
-  const proto = Object.getPrototypeOf(value);
+  // Object.getPrototypeOf's lib.d.ts return type is `any` — assert its
+  // genuine runtime return type explicitly rather than letting that `any`
+  // flow through unchecked.
+  const proto = Object.getPrototypeOf(value) as object | null;
   return proto === Object.prototype || proto === null;
 }
 
@@ -43,7 +46,7 @@ export function jsonSafeClone(value: unknown): unknown {
     );
   }
   const out: Record<string, unknown> = {};
-  for (const key of Object.keys(value as Record<string, unknown>)) {
+  for (const key of Object.keys(value)) {
     out[key] = jsonSafeClone((value as Record<string, unknown>)[key]);
   }
   return out;

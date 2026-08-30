@@ -9,8 +9,23 @@
  * just a check that "the broker blocks bad things".
  */
 
-import type { AuditEvent, MatchType, PlanStep, PolicyDecision, QuarantineImpl, ResetScope, TaintLevel, ToolCallBroker } from '../src/index.js';
-import { createBroker, exactHash, NOT_SENSITIVE, ToolCallBlockedError, UnplannedPrivilegedActionError } from '../src/index.js';
+import type {
+  AuditEvent,
+  MatchType,
+  PlanStep,
+  PolicyDecision,
+  QuarantineImpl,
+  ResetScope,
+  TaintLevel,
+  ToolCallBroker,
+} from '../src/index.js';
+import {
+  createBroker,
+  exactHash,
+  NOT_SENSITIVE,
+  ToolCallBlockedError,
+  UnplannedPrivilegedActionError,
+} from '../src/index.js';
 import { FIXTURES } from './fixtures.js';
 
 export interface CorpusCase {
@@ -145,7 +160,10 @@ export async function runCorpusCase(c: CorpusCase): Promise<CorpusOutcome> {
       'RAW_UNTRUSTED',
       NOT_SENSITIVE,
     );
-    const opts: Parameters<typeof broker.summarize>[1] = { sessionId: 'corpus-session', sourceTaintRecordId: record.id };
+    const opts: Parameters<typeof broker.summarize>[1] = {
+      sessionId: 'corpus-session',
+      sourceTaintRecordId: record.id,
+    };
     if (c.quarantine.schema) opts.schema = c.quarantine.schema;
     if (c.quarantine.instructions) opts.instructions = c.quarantine.instructions;
     await broker.summarize(rawText, opts);
@@ -190,15 +208,30 @@ export async function runCorpusCase(c: CorpusCase): Promise<CorpusOutcome> {
 
   const failures: string[] = [];
   if (actualDecision !== c.expected.decision) {
-    failures.push(`decision: expected ${c.expected.decision}, got ${actualDecision}${actualReason ? ` (${actualReason})` : ''}`);
+    failures.push(
+      `decision: expected ${c.expected.decision}, got ${actualDecision}${actualReason ? ` (${actualReason})` : ''}`,
+    );
   }
-  if (c.expected.expectedFinalWatermarkLevel !== undefined && broker.scope.watermark.level !== c.expected.expectedFinalWatermarkLevel) {
-    failures.push(`watermark: expected ${c.expected.expectedFinalWatermarkLevel}, got ${broker.scope.watermark.level}`);
+  if (
+    c.expected.expectedFinalWatermarkLevel !== undefined &&
+    broker.scope.watermark.level !== c.expected.expectedFinalWatermarkLevel
+  ) {
+    failures.push(
+      `watermark: expected ${c.expected.expectedFinalWatermarkLevel}, got ${broker.scope.watermark.level}`,
+    );
   }
-  if (c.expected.expectedPrivateDataSeen !== undefined && broker.scope.watermark.privateDataSeen !== c.expected.expectedPrivateDataSeen) {
-    failures.push(`privateDataSeen: expected ${c.expected.expectedPrivateDataSeen}, got ${broker.scope.watermark.privateDataSeen}`);
+  if (
+    c.expected.expectedPrivateDataSeen !== undefined &&
+    broker.scope.watermark.privateDataSeen !== c.expected.expectedPrivateDataSeen
+  ) {
+    failures.push(
+      `privateDataSeen: expected ${c.expected.expectedPrivateDataSeen}, got ${broker.scope.watermark.privateDataSeen}`,
+    );
   }
-  if (c.expected.minMatchType !== undefined && MATCH_STRENGTH[bestMatchType] < MATCH_STRENGTH[c.expected.minMatchType]) {
+  if (
+    c.expected.minMatchType !== undefined &&
+    MATCH_STRENGTH[bestMatchType] < MATCH_STRENGTH[c.expected.minMatchType]
+  ) {
     failures.push(`matchType: expected at least ${c.expected.minMatchType}, got ${bestMatchType}`);
   }
 
