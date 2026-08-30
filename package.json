@@ -49,6 +49,7 @@
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:watch": "vitest",
+    "coverage": "vitest run --coverage",
     "corpus": "tsx corpus/run-corpus.ts",
     "example": "tsx examples/basic-usage.ts",
     "example:mcp": "tsx examples/mcp-integration.ts",
@@ -62,6 +63,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.3.0",
+    "@vitest/coverage-v8": "^4.1.11",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.11"

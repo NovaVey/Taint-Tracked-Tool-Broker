@@ -26,3 +26,18 @@ jobs:
       - run: npm run build
       - run: npm test
       - run: npm run corpus
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # Enforces vitest.config.ts's coverage thresholds — a real gate, not
+      # just a report: this step (and the job) fails if coverage regresses
+      # below them. Runs once (not across the full Node matrix above) since
+      # V8 coverage isn't meaningfully Node-version-sensitive here.
+      - run: npm run coverage
