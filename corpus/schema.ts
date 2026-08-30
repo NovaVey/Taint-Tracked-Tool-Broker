@@ -74,6 +74,50 @@ export interface CorpusCase {
   };
 }
 
+export interface UnprotectedOutcome {
+  case: CorpusCase;
+  /** Did every action in c.actions complete without throwing? */
+  sinkExecuted: boolean;
+  error: unknown;
+}
+
+/**
+ * The counterfactual baseline runCorpusCase's own pass/fail doesn't
+ * establish: what would this exact sequence of sink calls have done against
+ * an agent with the same tools but no taint-tracking broker in front of it
+ * at all? Calls each of c.actions' tools directly via FIXTURES[tool].execute
+ * — no broker.call(), no watermark, no gating, no audit log — using the
+ * exact same fixtures runCorpusCase itself dispatches through, so the ONLY
+ * variable that changes between the two runs is whether the broker mediates
+ * the call.
+ *
+ * Deliberately only replays `actions`, not `setup`/`quarantine`: those model
+ * how untrusted content enters the agent's context, which doesn't depend on
+ * whether a broker is watching — an unprotected agent still reads the same
+ * page, it just has nothing gating what it does with it next. The question
+ * this answers is specifically "would the SINK call(s) have gone through,"
+ * which is exactly what `actions` (the LAST entry being "the sink call under
+ * test," per CorpusCase's own doc comment) represents.
+ *
+ * Without this, "N/M passed" is unfalsifiable — a reader has no way to tell
+ * whether a case's protected BLOCK meant the broker stopped something real,
+ * or whether nothing was ever at stake for that specific case's exact
+ * arguments. See run-corpus.ts's summary for how this and runCorpusCase's
+ * result are combined into that answer.
+ */
+export async function runUnprotectedCase(c: CorpusCase): Promise<UnprotectedOutcome> {
+  let error: unknown;
+  try {
+    for (const step of c.actions) {
+      // step.tool: keyof typeof FIXTURES — always a real key by construction.
+      await FIXTURES[step.tool]!.execute(step.args ?? {});
+    }
+  } catch (err) {
+    error = err;
+  }
+  return { case: c, sinkExecuted: error === undefined, error };
+}
+
 export interface CorpusOutcome {
   case: CorpusCase;
   actualDecision: PolicyDecision['action'] | 'ERROR';
