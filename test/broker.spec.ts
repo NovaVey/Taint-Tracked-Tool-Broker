@@ -8,6 +8,7 @@ import {
   QuarantineInputMismatchError,
   QuarantineInputUnknownError,
   ReentrantCallError,
+  ReservedToolNameError,
   ToolCallBlockedError,
   UnknownToolError,
   UnplannedPrivilegedActionError,
@@ -536,6 +537,29 @@ describe('dual-role tool rejection', () => {
           return 'cached';
         },
       }),
+    ).not.toThrow();
+  });
+});
+
+describe('reserved tool-name rejection', () => {
+  it('register() throws ReservedToolNameError for a tool name starting with the __tttb_ prefix', () => {
+    const broker = createBroker();
+    expect(() =>
+      broker.register({ name: '__tttb_summarize', capabilities: { capabilities: [] }, async execute() { return 'x'; } }),
+    ).toThrow(ReservedToolNameError);
+  });
+
+  it('wrap() also rejects a reserved tool name (it delegates to register())', () => {
+    const broker = createBroker();
+    expect(() =>
+      broker.wrap({ name: '__tttb_custom_thing', capabilities: { capabilities: [] }, async execute() { return 'x'; } }),
+    ).toThrow(ReservedToolNameError);
+  });
+
+  it('an ordinary tool name that merely contains, but does not start with, the prefix is allowed', () => {
+    const broker = createBroker();
+    expect(() =>
+      broker.register({ name: 'not___tttb_reserved', capabilities: { capabilities: [] }, async execute() { return 'x'; } }),
     ).not.toThrow();
   });
 });

@@ -23,6 +23,7 @@ import type {
 } from './types.js';
 import { buildFingerprint, exactHash, shingleIntersectionSize, toRegistrableText } from './taint/fingerprint.js';
 import { QuarantineInputMismatchError, QuarantineInputUnknownError } from './errors.js';
+import { recordTrivialAudit } from './internal-audit.js';
 
 // Two independent, asymmetric checks — text must be substantially DERIVED
 // FROM the claimed source, not merely similar to it. Neither alone is
@@ -55,13 +56,16 @@ const MAX_LENGTH_EXPANSION = 2; // text may be at most this many times longer th
 // same-sized-but-unrelated text.
 const MIN_SOURCE_COVERAGE = 0.3; // fraction of text's own shingles that must trace back to the source
 
-export function createQuarantine(
-  impl: QuarantineImpl,
-  registry: TaintRegistry,
-  raiseToDerivedUntrusted: (tag: ProvenanceTag) => void,
-  getScope: () => { level: TaintLevel; privateDataSeen: boolean },
-  auditSink: AuditSink,
-): QuarantineFn {
+export interface CreateQuarantineOpts {
+  impl: QuarantineImpl;
+  registry: TaintRegistry;
+  raiseToDerivedUntrusted: (tag: ProvenanceTag) => void;
+  getScope: () => { level: TaintLevel; privateDataSeen: boolean };
+  auditSink: AuditSink;
+}
+
+export function createQuarantine(config: CreateQuarantineOpts): QuarantineFn {
+  const { impl, registry, raiseToDerivedUntrusted, getScope, auditSink } = config;
   return async function summarize<S = string>(text: string, opts: QuarantineOpts<S>): Promise<QuarantineResult<S>> {
     // §6.2 says this path is "auditable and policy-visible like any other
     // call" (DESIGN.md). It isn't policy-gated — summarize() has no
@@ -78,13 +82,13 @@ export function createQuarantine(
 
     const sourceRecord = registry.getById(opts.sourceTaintRecordId);
     if (!sourceRecord) {
-      auditSink.record({
-        verdict: { action: 'BLOCK', reason: `summarize() input references unknown taint record "${opts.sourceTaintRecordId}" — see GAPS.md #4, DESIGN.md §6.2.` },
+      recordTrivialAudit(
+        auditSink,
+        { action: 'BLOCK', reason: `summarize() input references unknown taint record "${opts.sourceTaintRecordId}" — see GAPS.md #4, DESIGN.md §6.2.` },
         call,
-        taint: { matchedRecords: [], scopeLevel: getScope().level, argFingerprintFloor: 'CLEAN', privateDataSeen: getScope().privateDataSeen, sinkClass: 'NONE' },
-        at: Date.now(),
-        executed: false,
-      });
+        getScope(),
+        false,
+      );
       throw new QuarantineInputUnknownError(opts.sourceTaintRecordId);
     }
 

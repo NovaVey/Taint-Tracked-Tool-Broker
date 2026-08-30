@@ -1,6 +1,25 @@
 import type { PolicyDecision, ToolCall } from './types.js';
+import { RESERVED_TOOL_NAME_PREFIX } from './internal-audit.js';
 
 export class TaintBrokerError extends Error {}
+
+/**
+ * Thrown by register()/wrap() when a tool's name starts with the
+ * `__tttb_` prefix TTTB reserves for its own internal/administrative
+ * audit-only events (declassify(), startNewTurn(), markContextExposure(),
+ * summarize()). Registering a real tool under this prefix would make its
+ * audit events indistinguishable from one of those library-generated ones.
+ */
+export class ReservedToolNameError extends TaintBrokerError {
+  constructor(toolName: string) {
+    super(
+      `Tool name "${toolName}" starts with the reserved prefix "${RESERVED_TOOL_NAME_PREFIX}", which TTTB uses for ` +
+        'its own internal/administrative audit events (declassify(), startNewTurn(), markContextExposure(), ' +
+        'summarize()). Choose a different name for this tool.',
+    );
+    this.name = 'ReservedToolNameError';
+  }
+}
 
 export class UnknownToolError extends TaintBrokerError {
   constructor(toolName: string) {
