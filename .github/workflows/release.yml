@@ -1,0 +1,54 @@
+name: Release
+
+# Tag-triggered publish to npm with provenance attestation. Push a tag
+# matching v<package.json version> (e.g. `git tag v0.2.0 && git push origin
+# v0.2.0`) to publish that exact commit.
+#
+# Requires an `NPM_TOKEN` repository secret (an npm automation/publish
+# token for this package) — see https://docs.npmjs.com/creating-and-viewing-access-tokens.
+# Without it this workflow runs the same validation as CI and then fails
+# at the publish step with an auth error, rather than silently no-op'ing.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write # required for npm provenance attestation
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm ci
+
+      # A tagged release for a version this package.json doesn't actually
+      # have is almost always a mistake (forgot to bump package.json, or
+      # tagged the wrong ref) — fail loud before doing any real work.
+      - name: Verify the pushed tag matches package.json's version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match package.json version ${PKG_VERSION}"
+            exit 1
+          fi
+
+      # Same validation CI already runs on every push/PR — re-run here too
+      # rather than trusting that whatever CI run happened to pass earlier
+      # on this commit is still what's about to be published.
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+      - run: npm run corpus
+
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

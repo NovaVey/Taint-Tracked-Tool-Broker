@@ -98,6 +98,8 @@ export { unconfiguredQuarantineImpl } from './quarantine.js';
 export { createDeferredApprovalChannel } from './approval.js';
 export type { DeferredApprovalChannel, DeferredApprovalChannelOpts } from './approval.js';
 
+export { jsonSafeClone } from './json-safe-clone.js';
+
 export {
   TaintBrokerError,
   ToolCallBlockedError,
