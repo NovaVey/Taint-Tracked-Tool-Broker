@@ -12,6 +12,8 @@ One thing narrows this gap's most likely real-world trigger — an ordinary tool
 
 `examples/mcp-integration.ts` (`npm run example:mcp`) works through this gap's own canonical example concretely: which MCP protocol surface (`tools/call`, `resources/read`, `tools/list`) maps to which mechanism (source wrapping vs. `markContextExposure()`), plus a reusable tool-description-fingerprinting guard that detects a server rewriting a tool's description between two `tools/list` calls (a "rug pull") and calls `markContextExposure()` automatically at the moment of the change. The guard only detects that a description *changed* — deliberately, not whether any one description is malicious, for the same reason GAPS.md #14 keeps its distance from content-matching heuristics.
 
+`examples/mcp-sdk-integration.ts` (`npm run example:mcp-sdk`) runs the identical pattern against a genuine `@modelcontextprotocol/sdk` `McpServer` and `Client` — connected via the SDK's own `InMemoryTransport.createLinkedPair()` so it stays offline, but doing real JSON-RPC request/response and a real server-side `RegisteredTool.update()` rug pull, not a mock. It exists to confirm the wiring pattern above holds against the actual current SDK shapes, not just a hand-rolled stand-in for them.
+
 ## 2. Cross-turn / cross-session latent influence — **TRUE KNOWN GAP**
 
 Under `resetScope: 'turn'` (the lower-friction mode), content read in turn N that shapes model behavior in turn N+2 with no new tool result in between is invisible once the turn boundary clears the watermark. `resetScope: 'session'` closes this but pays a larger blanket-gating cost across the whole session; this is a deliberate, named trade the operator must choose, not something the library resolves for them.
