@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 import {
   createBroker,
   DualRoleToolError,
+  exactHash,
   InMemoryTaintRegistry,
   NonCloneableArgsError,
+  NOT_SENSITIVE,
   PlanNotDeclarableError,
   QuarantineInputMismatchError,
   QuarantineInputUnknownError,
@@ -13,6 +15,7 @@ import {
   UnknownToolError,
   UnplannedPrivilegedActionError,
   type AuditEvent,
+  type ProvenanceTag,
   type QuarantineImpl,
   type ToolExecutor,
 } from '../src/index.js';
@@ -29,6 +32,11 @@ function fetchUrl(result: unknown, opts: Partial<ToolExecutor> = {}): ToolExecut
 
 function shellExec(): ToolExecutor {
   return { name: 'shell_exec', capabilities: { capabilities: ['exec:shell'] }, async execute(args) { return `ran:${JSON.stringify(args)}`; } };
+}
+
+/** Registers `text` directly into the registry (bypassing broker.call(), same as the composite fetch-and-quarantine pattern's own internal fetch, DESIGN.md §6.2) — leaves the watermark untouched, unlike broker.call('fetch_url', ...). */
+function registerDirect(broker: { registry: { register(text: string, provenance: ProvenanceTag, level: 'RAW_UNTRUSTED', sensitivity: typeof NOT_SENSITIVE): { id: string } } }, text: string, toolName = 'fetch_url') {
+  return broker.registry.register(text, { id: exactHash(text), sourceCallId: `internal-${toolName}`, toolName, sessionId: 's', capturedAt: Date.now() }, 'RAW_UNTRUSTED', NOT_SENSITIVE);
 }
 
 function sendEmail(): ToolExecutor {
@@ -884,6 +892,137 @@ describe('barrier exemption (narrowed lock)', () => {
       expect(results.map((r) => r.status)).toEqual(['fulfilled', 'fulfilled', 'fulfilled', 'rejected', 'fulfilled']);
       expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
     }
+  });
+});
+
+// GAPS.md #17: broker.summarize() raises the watermark exactly like a
+// source call does, so it needs the same happens-before guarantee relative
+// to a concurrently-dispatched call() — but summarize() is a standalone
+// function, not routed through call()'s own reentrancy check, so it needed
+// its own fix rather than inheriting call()'s. The naive fix (unconditionally
+// wrap summarize() in the same withLock()) was rejected specifically because
+// it would deadlock the documented fetch-and-quarantine composite pattern
+// (a tool's execute() calling broker.summarize() on itself) the moment that
+// outer call already held the lock. Tests below cover: the race actually
+// closing, the composite pattern NOT deadlocking (both when the outer call
+// holds the lock and — a case found while designing this fix — when the
+// outer call is barrier-EXEMPT and never held the lock at all), correct
+// non-race ordering when summarize() is listed second, and two independent
+// summarize() calls not corrupting each other.
+describe('broker.summarize() / broker.call() serialization (GAPS.md #17)', () => {
+  it('a call listed AFTER a concurrent broker.summarize() is correctly gated by its raise — the documented race, now fixed', async () => {
+    const broker = createBroker({ quarantineImpl: stubQuarantineImpl });
+    broker.register(shellExec());
+    const record = registerDirect(broker, MALICIOUS_PAGE);
+    expect(broker.scope.watermark.level).toBe('CLEAN'); // registerDirect() alone never touches the watermark
+
+    const [summarizeOutcome, shellOutcome] = await Promise.allSettled([
+      broker.summarize(MALICIOUS_PAGE, { sessionId: 's', sourceTaintRecordId: record.id }),
+      broker.call('shell_exec', { cmd: 'anything' }), // listed AFTER summarize() — must see the raise, not race it
+    ]);
+
+    expect(summarizeOutcome.status).toBe('fulfilled');
+    expect(shellOutcome.status).toBe('rejected');
+    if (shellOutcome.status === 'rejected') expect(shellOutcome.reason).toBeInstanceOf(ToolCallBlockedError);
+    expect(broker.scope.watermark.level).toBe('DERIVED_UNTRUSTED');
+  });
+
+  it('a call listed BEFORE a concurrent broker.summarize() legitimately runs against the pre-summarize watermark — not a race', async () => {
+    const broker = createBroker({ quarantineImpl: stubQuarantineImpl });
+    broker.register(sendEmail());
+    const record = registerDirect(broker, MALICIOUS_PAGE);
+
+    const [emailOutcome] = await Promise.allSettled([
+      broker.call('send_email', { to: 'x@example.com', body: 'hi' }), // listed BEFORE summarize()
+      broker.summarize(MALICIOUS_PAGE, { sessionId: 's', sourceTaintRecordId: record.id }),
+    ]);
+    expect(emailOutcome.status).toBe('fulfilled'); // scope was genuinely still CLEAN when send_email was dispatched
+  });
+
+  it('a NON-exempt composite tool (readsPrivateData) calling broker.summarize() from within its own execute() resolves without deadlocking — the specific shape the naive "just wrap summarize in withLock" fix would have deadlocked', async () => {
+    const broker = createBroker({ quarantineImpl: stubQuarantineImpl });
+    broker.register({
+      name: 'fetch_and_quarantine_with_private_data',
+      capabilities: { capabilities: [], readsPrivateData: { categories: ['pii'] } }, // NOT exempt — this call itself holds the lock
+      async execute() {
+        const record = registerDirect(broker, MALICIOUS_PAGE, 'fetch_and_quarantine_with_private_data');
+        const result = await broker.summarize(MALICIOUS_PAGE, { sessionId: 's', sourceTaintRecordId: record.id });
+        return result.text;
+      },
+    });
+    await expect(broker.call('fetch_and_quarantine_with_private_data', {})).resolves.toBe('summary');
+    expect(broker.scope.watermark.level).toBe('DERIVED_UNTRUSTED');
+    expect(broker.scope.watermark.privateDataSeen).toBe(true);
+  });
+
+  it('a composite tool correctly declared mayCallSummarize:true is NOT barrier-exempt, so its internal broker.summarize() still correctly serializes against a concurrently-dispatched gated call', async () => {
+    const broker = createBroker({ quarantineImpl: stubQuarantineImpl });
+    broker.register({
+      name: 'fetch_and_quarantine',
+      capabilities: { capabilities: [] }, // NONE sinkClass, not a source, no private data — would be exempt WITHOUT the next line
+      mayCallSummarize: true, // correctly declared: this tool calls broker.summarize() internally, so it must hold the lock like any other call
+      async execute() {
+        const record = registerDirect(broker, MALICIOUS_PAGE, 'fetch_and_quarantine');
+        await new Promise((resolve) => setTimeout(resolve, 15)); // simulates real async work (e.g. a fetch) before reaching summarize()
+        const result = await broker.summarize(MALICIOUS_PAGE, { sessionId: 's', sourceTaintRecordId: record.id });
+        return result.text;
+      },
+    });
+    broker.register(shellExec());
+
+    const [compositeOutcome, shellOutcome] = await Promise.allSettled([
+      broker.call('fetch_and_quarantine', {}), // NOT exempt — holds the lock for its whole dispatch, covering the internal summarize() call
+      broker.call('shell_exec', { cmd: 'anything' }), // listed second — must still be gated once the internal summarize()'s raise commits
+    ]);
+
+    expect(compositeOutcome.status).toBe('fulfilled');
+    expect(shellOutcome.status).toBe('rejected');
+    if (shellOutcome.status === 'rejected') expect(shellOutcome.reason).toBeInstanceOf(ToolCallBlockedError);
+    expect(broker.scope.watermark.level).toBe('DERIVED_UNTRUSTED');
+  });
+
+  it('DOCUMENTED RESIDUAL RISK: a composite tool that calls broker.summarize() internally WITHOUT declaring mayCallSummarize is wrongly classified as barrier-exempt and the race can still occur — this is why mayCallSummarize exists and must be declared honestly (GAPS.md #10\'s trust boundary, not a library bug)', async () => {
+    const broker = createBroker({ quarantineImpl: stubQuarantineImpl });
+    broker.register({
+      name: 'misdeclared_fetch_and_quarantine',
+      capabilities: { capabilities: [] }, // NONE sinkClass, not a source, no private data, mayCallSummarize NOT declared -> wrongly exempt
+      async execute() {
+        const record = registerDirect(broker, MALICIOUS_PAGE, 'misdeclared_fetch_and_quarantine');
+        await new Promise((resolve) => setTimeout(resolve, 15)); // real async work before reaching summarize(), same as the correctly-declared test above
+        const result = await broker.summarize(MALICIOUS_PAGE, { sessionId: 's', sourceTaintRecordId: record.id });
+        return result.text;
+      },
+    });
+    broker.register(shellExec());
+
+    const [compositeOutcome, shellOutcome] = await Promise.allSettled([
+      broker.call('misdeclared_fetch_and_quarantine', {}), // wrongly exempt — never reserves a lock position
+      broker.call('shell_exec', { cmd: 'anything' }), // its gating check can now run BEFORE the nested summarize() is even invoked
+    ]);
+
+    expect(compositeOutcome.status).toBe('fulfilled');
+    // This assertion documents the actual (undesirable) behavior of a
+    // misdeclared tool — it is NOT the library asserting this is fine. See
+    // the correctly-declared test immediately above for the fix, and
+    // GAPS.md #10/#17 for why this residual risk is named, not silently
+    // left for someone to discover in production.
+    expect(shellOutcome.status).toBe('fulfilled');
+  });
+
+  it('two concurrent top-level broker.summarize() calls both correctly serialize and both succeed', async () => {
+    const broker = createBroker({ quarantineImpl: stubQuarantineImpl });
+    const textA = 'first quarantine source text, long enough to pass the length checks easily here.';
+    const textB = 'second, entirely different quarantine source text, also long enough on its own merits.';
+    const recordA = registerDirect(broker, textA);
+    const recordB = registerDirect(broker, textB);
+
+    const [outcomeA, outcomeB] = await Promise.allSettled([
+      broker.summarize(textA, { sessionId: 's', sourceTaintRecordId: recordA.id }),
+      broker.summarize(textB, { sessionId: 's', sourceTaintRecordId: recordB.id }),
+    ]);
+    expect(outcomeA.status).toBe('fulfilled');
+    expect(outcomeB.status).toBe('fulfilled');
+    expect(broker.scope.watermark.level).toBe('DERIVED_UNTRUSTED');
   });
 });
 

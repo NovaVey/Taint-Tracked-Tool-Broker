@@ -22,6 +22,10 @@ Writes, network egress, state changes, purchases, anything irreversible — decl
 
 Secrets, credentials, PII, anything you'd wince at leaking. Set `readsPrivateData: { categories: [...] }` — this is what turns MUTATE/EXFIL sinks from "require approval" into "block" once combined with untrusted content live in scope (the lethal-trifecta escalation, DESIGN.md §3.2). This is independent of `isSource`/`capabilities` — a tool can be a pure sink that also happens to read a secret as part of its own operation (e.g. a tool that reads a stored API key to make an authenticated call on the agent's behalf).
 
+### 5. Does its `execute()` call `broker.summarize()` internally?
+
+Only relevant for a composite fetch-and-quarantine tool (§6.2's implementation note, and example 4 below) — a tool that fetches raw content and quarantines it in one call, rather than as two separate broker-mediated steps. If `execute()` calls `broker.summarize()` on its own fetched content before returning, set `mayCallSummarize: true`. This is easy to miss because such a tool otherwise often looks completely inert (`capabilities: []`, not `isSource`, no `readsPrivateData`) — which would make it eligible for the lock-barrier-exemption optimization (DESIGN.md's "narrowing the lock" note) were it not for this call. Leaving it unset reopens GAPS.md #17's race for that one tool: a concurrently-dispatched gated call can slip past before the tool's internal `summarize()` raise commits, exactly the failure mode `mayCallSummarize` exists to prevent.
+
 ## Worked examples
 
 ### A filesystem MCP server
@@ -46,7 +50,7 @@ GAPS.md #10's own named example. `get_account_summary(accountId)` looks read-onl
 A tool shaped like `run_code(code: string, context?: string): Output` that can both take untrusted input (`context`, or `code` itself if the agent assembles it from earlier tool results) *and* execute it is exactly the shape `register()`/`wrap()` reject outright as `DualRoleToolError` (`isSource: true` + non-empty `capabilities` on one call — see `src/errors.ts`) — a single call could read untrusted content and act on it before the watermark that's supposed to gate that action ever rises. Two ways out, both covered elsewhere in this repo:
 
 - **Split it**: a source-only call that fetches/prepares the input, and a separate sink-only call that executes it — two broker-mediated calls instead of one, so the watermark from the first is live before the second's gating check runs.
-- **Fetch-and-quarantine**: if the tool's own job really is "run this specific canned operation over some untrusted input, and only that," route the untrusted part through `broker.summarize()` first (DESIGN.md §6.2's implementation note) so the tool receives only a `DERIVED_UNTRUSTED`, quarantine-narrowed value.
+- **Fetch-and-quarantine**: if the tool's own job really is "run this specific canned operation over some untrusted input, and only that," route the untrusted part through `broker.summarize()` first (DESIGN.md §6.2's implementation note) so the tool receives only a `DERIVED_UNTRUSTED`, quarantine-narrowed value. If a single tool's `execute()` does the fetch **and** the `broker.summarize()` call itself (rather than the caller doing the second step separately), it must also declare `mayCallSummarize: true` — see question 5 above and GAPS.md #17.
 
 ## When you're still not sure
 

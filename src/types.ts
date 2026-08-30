@@ -271,6 +271,21 @@ export interface ToolExecutor<A = unknown, R = unknown> {
   isSource?: boolean;
   /** Deterministic/pure tools may opt out of raising even if isSource is set. */
   trusted?: boolean;
+  /**
+   * Declare `true` if this tool's `execute()` calls `broker.summarize()`
+   * internally (the fetch-and-quarantine composite-tool pattern, DESIGN.md
+   * §6.2's implementation note) — this tells `register()`/`wrap()` the tool
+   * is NOT eligible for lock-barrier exemption (DESIGN.md's "narrowing the
+   * lock to a targeted barrier" note) even if its `sinkClass`/`isSource`/
+   * `readsPrivateData` would otherwise qualify it, because its `execute()`
+   * can still raise the watermark indirectly through that nested
+   * `summarize()` call. Leaving this unset/false for a tool that DOES call
+   * `summarize()` internally reopens GAPS.md #17's race for that specific
+   * tool — the same "integrator declares, library enforces" trust boundary
+   * `isSource`/`readsPrivateData` already rest on (GAPS.md #10). Unset by
+   * default so existing tools are unaffected.
+   */
+  mayCallSummarize?: boolean;
   execute(args: A): Promise<R>;
 }
 

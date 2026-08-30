@@ -16,6 +16,8 @@ import type {
   ProvenanceTag,
   QuarantineFn,
   QuarantineImpl,
+  QuarantineOpts,
+  QuarantineResult,
   QuarantineSourceResult,
   RawQuarantineSourceTool,
   ResetScope,
@@ -145,10 +147,19 @@ class Broker implements ToolCallBroker {
   private lockTail: Promise<void> = Promise.resolve();
   // Detects a tool's execute() calling broker.call() again on the same
   // broker before the outer call finishes — that would deadlock the lock
-  // above, so it's rejected immediately instead.
-  private readonly reentrancyGuard = new AsyncLocalStorage<true>();
+  // above, so it's rejected immediately instead. Also tells summarize()
+  // (GAPS.md #17) whether it's already running inside a call() that HOLDS
+  // the lock (safe to raise the watermark inline, no new lock needed) or
+  // is nested inside a barrier-exempt call that never took the lock (must
+  // acquire it itself, exactly like a top-level summarize() call would) —
+  // see summarize()'s own wrapper in the constructor below.
+  private readonly reentrancyGuard = new AsyncLocalStorage<{ lockHeld: boolean }>();
 
   readonly registry: TaintRegistry;
+  // The actual quarantine logic (quarantine.ts), unaware of locking — see
+  // the constructor for the serialization wrapper assigned to `summarize`
+  // itself (GAPS.md #17).
+  private readonly rawSummarize: QuarantineFn;
   readonly summarize: QuarantineFn;
 
   constructor(opts: BrokerOptions = {}) {
@@ -180,13 +191,31 @@ class Broker implements ToolCallBroker {
     if (opts.initialWatermark) {
       this.currentScope.watermark = { ...opts.initialWatermark, sources: [...opts.initialWatermark.sources] };
     }
-    this.summarize = createQuarantine({
+    this.rawSummarize = createQuarantine({
       impl: opts.quarantineImpl ?? unconfiguredQuarantineImpl,
       registry: this.registry,
       raiseToDerivedUntrusted: (tag) => this.raiseWatermarkAndResetDecay('DERIVED_UNTRUSTED', tag),
       getScope: () => this.currentScope.watermark,
       auditSink: this.auditSink,
     });
+    // GAPS.md #17: summarize() raises the watermark exactly like a source
+    // call does, so it needs the same happens-before guarantee relative to
+    // a concurrently-dispatched call() — but it must not naively join the
+    // same lock unconditionally, or the documented fetch-and-quarantine
+    // composite-tool pattern (§6.2, calling broker.summarize() from within
+    // a tool's own execute()) would deadlock on a lock that call already
+    // holds. reentrancyGuard's lockHeld flag distinguishes the two cases:
+    // already inside a lock-holding call() -> raise inline, already
+    // serialized, no new lock needed; anything else (a genuine top-level
+    // call, OR nested inside a barrier-EXEMPT call that never took the lock
+    // at all) -> acquire the lock exactly like a fresh call() would.
+    this.summarize = <S = string>(text: string, quarantineOpts: QuarantineOpts<S>): Promise<QuarantineResult<S>> => {
+      const ctx = this.reentrancyGuard.getStore();
+      if (ctx?.lockHeld) {
+        return this.rawSummarize<S>(text, quarantineOpts);
+      }
+      return this.withLock(() => this.reentrancyGuard.run({ lockHeld: true }, () => this.rawSummarize<S>(text, quarantineOpts)));
+    };
   }
 
   get scope(): Readonly<TaintScope> {
@@ -310,19 +339,31 @@ class Broker implements ToolCallBroker {
    * — see DESIGN.md's implementation note on narrowing the lock to a
    * targeted barrier. A call is exempt only if it can neither READ the
    * watermark for a gating decision (`sinkClass === 'NONE'`) nor WRITE to
-   * it (not an untrusted source that would raise the level, and doesn't
-   * read private data that would set `privateDataSeen`). An exempt call's
-   * entire dispatch — gating (skipped for NONE), execute(), and
-   * applyPostExecutionEffects() — is then provably inert to
-   * `this.currentScope.watermark` in both directions, so its presence or
-   * absence in the lock queue cannot affect the correctness of any other
-   * call's relative ordering. An unknown tool name is deliberately never
-   * exempt (see call() below) — it falls through to dispatch()'s own
-   * UnknownToolError inside the lock, same as today, just via the "not
-   * exempt" path rather than a special case here.
+   * it: not an untrusted source that would raise the level, doesn't read
+   * private data that would set `privateDataSeen`, AND — GAPS.md #17's
+   * fetch-and-quarantine interaction, found while implementing that fix —
+   * does not declare `mayCallSummarize`. Without that last check, a
+   * composite tool whose execute() calls `broker.summarize()` internally
+   * (a real, documented pattern, §6.2) could still raise the watermark
+   * indirectly through that nested call; being exempt means the OUTER call
+   * never reserved a lock position, so a call dispatched after it can slip
+   * past before the nested summarize() is even reached, let alone resolved
+   * — summarize()'s own lock-awareness alone cannot fix this, since by the
+   * time it runs, another call's gating check may already have completed.
+   * `mayCallSummarize` is an integrator declaration, not something this
+   * check can infer from a tool's shape (the library cannot see into an
+   * execute() function body) — the same "integrator declares, library
+   * enforces" trust boundary `isSource`/`readsPrivateData` already rest on
+   * (GAPS.md #10). An exempt call's entire dispatch is otherwise provably
+   * inert to `this.currentScope.watermark` in both directions, so its
+   * presence or absence in the lock queue cannot affect the correctness of
+   * any other call's relative ordering. An unknown tool name is
+   * deliberately never exempt (see call() below) — it falls through to
+   * dispatch()'s own UnknownToolError inside the lock, same as today, just
+   * via the "not exempt" path rather than a special case here.
    */
   private isBarrierExempt(tool: ToolExecutor, sinkClass: SinkClass): boolean {
-    return sinkClass === 'NONE' && !isUntrustedSource(tool) && !tool.capabilities.readsPrivateData;
+    return sinkClass === 'NONE' && !isUntrustedSource(tool) && !tool.capabilities.readsPrivateData && !tool.mayCallSummarize;
   }
 
   async call(toolName: string, args: unknown): Promise<unknown> {
@@ -337,11 +378,13 @@ class Broker implements ToolCallBroker {
     // still does its own tool lookup independently; recomputing sinkClass
     // there too is cheap and can't disagree (same tool object, pure function).
     const tool = this.tools.get(toolName);
-    const run = (): Promise<unknown> => this.reentrancyGuard.run(true, () => this.dispatch(toolName, args));
     if (tool && this.isBarrierExempt(tool, sinkClassOf(tool.capabilities.capabilities))) {
-      return run();
+      // Exempt: never touches the lock, so the context records lockHeld:false
+      // — a nested broker.summarize() call must still acquire the lock
+      // itself (GAPS.md #17), it cannot assume one is already held here.
+      return this.reentrancyGuard.run({ lockHeld: false }, () => this.dispatch(toolName, args));
     }
-    return this.withLock(run);
+    return this.withLock(() => this.reentrancyGuard.run({ lockHeld: true }, () => this.dispatch(toolName, args)));
   }
 
   async callSafe(toolName: string, args: unknown): Promise<CallResult> {

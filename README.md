@@ -1,8 +1,26 @@
 # Taint-Tracked Tool Broker
 
 [![CI](https://github.com/NovaVey/Taint-Tracked-Tool-Broker/actions/workflows/ci.yml/badge.svg)](https://github.com/NovaVey/Taint-Tracked-Tool-Broker/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](./LICENSE)
+[![Node.js >= 20](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178c6.svg)](https://www.typescriptlang.org/)
+[![Module: ESM only](https://img.shields.io/badge/module-ESM%20only-informational.svg)](#install)
 
 Provenance labeling for agent inputs, enforced at the tool-call boundary. Blocks untrusted data from reaching shell, filesystem, and network sinks — including when it arrives paraphrased, translated, re-encoded, or laundered through a boolean decision instead of copied verbatim. Ships with an injection corpus and a published list of known gaps.
+
+**Status:** pre-`0.1.0`, not yet published to npm — the API and this README describe the library's current state ahead of its first release. See [Install](#install) for how to use it from source today, and [`CHANGELOG.md`](./CHANGELOG.md) for what's shipped so far.
+
+## Contents
+
+- [The problem](#the-problem)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Core model](#core-model)
+- [Examples](#examples)
+- [Injection corpus](#injection-corpus)
+- [Known gaps](#known-gaps)
+- [Development](#development)
+- [License](#license)
 
 ## The problem
 
@@ -14,11 +32,25 @@ This library gates on *exposure* instead of content. The moment untrusted conten
 
 ## Install
 
+Once the first release is tagged, this will be:
+
 ```bash
 npm install taint-tracked-tool-broker
 ```
 
+Until then, install from source:
+
+```bash
+git clone https://github.com/NovaVey/Taint-Tracked-Tool-Broker.git
+cd Taint-Tracked-Tool-Broker
+npm install && npm run build
+```
+
+`dist/` is then importable directly (`import { createBroker } from './Taint-Tracked-Tool-Broker/dist/index.js'`), or link it into another project with `npm link`.
+
 **ESM only** — this package ships as native ESM (`"type": "module"`, no CommonJS build). `import` it from an ESM project as normal. A CommonJS project on a Node version without [`require(esm)`](https://nodejs.org/api/modules.html#loading-ecmascript-modules-using-require) support can't `require()` it directly (`ERR_REQUIRE_ESM`) — use a dynamic `await import('taint-tracked-tool-broker')` instead.
+
+**Requires Node.js >= 20** (see `engines` in `package.json`).
 
 ## Quick start
 
