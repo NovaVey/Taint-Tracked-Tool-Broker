@@ -4,7 +4,10 @@ All notable changes to this project are documented here. Format loosely follows 
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Test coverage reporting** (`npm run coverage`, `vitest.config.ts`): v8-provider coverage over `src/**`, enforced in CI as a real gate (a dedicated `coverage` job, separate from the Node 20/22/24 test matrix) rather than just a report — thresholds are set a few points below the actual measured coverage as of this change (statements 96.32% / branches 91.82% / functions 99.21% / lines 98.03%) so a genuine regression fails CI without ordinary refactors tripping it.
+- `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, and `.github/ISSUE_TEMPLATE/`/`PULL_REQUEST_TEMPLATE.md` — standard public-OSS-package community files, added now that `v0.1.0` is published.
 
 ## [0.1.0] - 2026-08-30
 

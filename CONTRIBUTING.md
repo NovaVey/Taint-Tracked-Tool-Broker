@@ -25,10 +25,11 @@ npm install
 npm run typecheck   # tsc --noEmit
 npm test             # vitest — unit tests + the injection corpus
 npm run corpus       # just the corpus, with a readable pass/fail table
+npm run coverage     # vitest --coverage, enforced against vitest.config.ts's thresholds
 npm run build        # emit dist/, exactly what CI and the release workflow run
 ```
 
-All four must pass clean before opening a PR — CI runs the same four commands on Node 20/22/24 (see `.github/workflows/ci.yml`), so there's nothing hidden that only fails in CI.
+All five must pass clean before opening a PR — CI runs typecheck/build/test/corpus on Node 20/22/24, plus a separate coverage job (see `.github/workflows/ci.yml`), so there's nothing hidden that only fails in CI. If your change lowers coverage below `vitest.config.ts`'s thresholds, either add the missing test coverage or, if the drop is deliberate and justified, lower the specific threshold in the same PR and say why in the PR description — don't leave CI red with no explanation.
 
 ## What a good PR looks like
 
