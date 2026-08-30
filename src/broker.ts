@@ -10,10 +10,13 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import type {
   ApprovalChannel,
   AuditSink,
+  CallResult,
   PlanStep,
   PolicyFn,
   QuarantineFn,
   QuarantineImpl,
+  QuarantineSourceResult,
+  RawQuarantineSourceTool,
   ResetScope,
   TaintContext,
   TaintLevel,
@@ -36,6 +39,7 @@ import {
   DualRoleToolError,
   NonCloneableArgsError,
   PlanNotDeclarableError,
+  QuarantineSourceUnavailableError,
   ReentrantCallError,
   ReservedToolNameError,
   ToolCallBlockedError,
@@ -198,11 +202,77 @@ class Broker implements ToolCallBroker {
     return { ...executor, execute: (args: unknown) => this.call(executor.name, args) } as T;
   }
 
+  registerAll<T extends Record<string, ToolExecutor>>(tools: T): void {
+    for (const tool of Object.values(tools)) this.register(tool);
+  }
+
+  wrapAll<T extends Record<string, ToolExecutor>>(tools: T): T {
+    const wrapped = {} as Record<string, ToolExecutor>;
+    for (const [key, tool] of Object.entries(tools)) {
+      wrapped[key] = this.wrap(tool);
+    }
+    return wrapped as T;
+  }
+
+  registerRawForQuarantine<A = unknown, R = unknown>(
+    tool: RawQuarantineSourceTool<A, R>,
+  ): { name: string; execute(args: A): Promise<QuarantineSourceResult> } {
+    const wrapped = this.wrap({
+      name: tool.name,
+      capabilities: { capabilities: [] },
+      isSource: true,
+      // Deliberately never `trusted` — a trusted source is never registered
+      // into the fingerprint registry (see applyPostExecutionEffects), so
+      // there would be no taintRecordId for this helper to hand back. See
+      // RawQuarantineSourceTool's doc comment in types.ts.
+      execute: tool.execute,
+    });
+    return {
+      name: tool.name,
+      execute: async (args: A): Promise<QuarantineSourceResult> => {
+        const result = await wrapped.execute(args);
+        // The call above already ran this through the normal call()/dispatch()
+        // pipeline, which — for an isSource:true tool — registered its result
+        // into the registry via applyPostExecutionEffects() using this exact
+        // same toRegistrableText()+exactHash() derivation (see broker.ts). So
+        // rather than re-deriving an id independently (and risking it silently
+        // drift from whatever actually got registered — the lesson of
+        // internal-audit.ts's isUntrustedSource() dedup), look up the record
+        // that call already created and use ITS id.
+        let text: string;
+        try {
+          text = toRegistrableText(result);
+        } catch (cause) {
+          throw new QuarantineSourceUnavailableError(tool.name, cause);
+        }
+        const record = this.registry.lookupExact(text);
+        if (!record) {
+          // Only reachable if applyPostExecutionEffects()'s own registration
+          // failed for a reason this call's toRegistrableText() didn't hit
+          // (shouldn't happen — same function, same input), or a bounded
+          // registry (maxEntries, GAPS.md #13) evicted the record in the
+          // narrow window between that registration and this lookup.
+          throw new QuarantineSourceUnavailableError(tool.name);
+        }
+        return { text, taintRecordId: record.id };
+      },
+    };
+  }
+
   async call(toolName: string, args: unknown): Promise<unknown> {
     if (this.reentrancyGuard.getStore()) {
       throw new ReentrantCallError(toolName);
     }
     return this.withLock(() => this.reentrancyGuard.run(true, () => this.dispatch(toolName, args)));
+  }
+
+  async callSafe(toolName: string, args: unknown): Promise<CallResult> {
+    try {
+      const result = await this.call(toolName, args);
+      return { ok: true, result };
+    } catch (error) {
+      return { ok: false, error };
+    }
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -378,6 +448,21 @@ class Broker implements ToolCallBroker {
       this.currentScope.watermark,
       true,
     );
+  }
+
+  markToolDescriptionExposure(toolName: string, description: string, level: TaintLevel = 'RAW_UNTRUSTED'): void {
+    this.markContextExposure(
+      { toolName, note: `tool/plugin description exposure: "${toolName}"'s description was ingested (or changed) outside a tracked tool call — see GAPS.md #1.`, text: description },
+      level,
+    );
+  }
+
+  markSystemPromptExposure(note: string, text?: string, level: TaintLevel = 'RAW_UNTRUSTED'): void {
+    this.markContextExposure({ toolName: 'system-prompt', note: `system-prompt exposure: ${note}`, ...(text !== undefined ? { text } : {}) }, level);
+  }
+
+  markPastedContentExposure(note: string, text?: string, level: TaintLevel = 'RAW_UNTRUSTED'): void {
+    this.markContextExposure({ toolName: 'pasted-content', note: `user-pasted content exposure: ${note}`, ...(text !== undefined ? { text } : {}) }, level);
   }
 
   startNewTurn(): void {

@@ -352,11 +352,55 @@ export interface PlanStep {
 // The broker (§7.3, §8)
 // ---------------------------------------------------------------------------
 
+/** Result of callSafe() — call()'s outcome as a value instead of a throw/resolve split, for call sites that would rather branch on `ok` than wrap every call() in try/catch. */
+export type CallResult<T = unknown> = { ok: true; result: T } | { ok: false; error: unknown };
+
+/**
+ * Input to registerRawForQuarantine(): a source-only tool (no sink
+ * capabilities, always untrusted) — this helper is specifically for the
+ * fetch-and-quarantine composite pattern (DESIGN.md §6.2's implementation
+ * note), which only makes sense for untrusted content: a `trusted` source is
+ * never fingerprinted into the registry at all (see applyPostExecutionEffects
+ * in broker.ts), so there would be no `taintRecordId` for this helper to hand
+ * back. A genuinely trusted source doesn't need quarantining in the first
+ * place — register it normally with broker.register()/wrap() instead.
+ */
+export interface RawQuarantineSourceTool<A = unknown, R = unknown> {
+  name: string;
+  execute(args: A): Promise<R>;
+}
+
+/** Result of a registerRawForQuarantine()-wrapped tool's execute(): the fetched text plus the taintRecordId summarize() needs as its sourceTaintRecordId — no separate lookup required. */
+export interface QuarantineSourceResult {
+  text: string;
+  taintRecordId: string;
+}
+
 export interface ToolCallBroker {
   register(tool: ToolExecutor): void;
   /** Registers `executor` and returns an interposed drop-in replacement whose execute() routes through call(). */
   wrap<T extends ToolExecutor>(executor: T): T;
   call(toolName: string, args: unknown): Promise<unknown>;
+
+  /** Same as call(), but resolves to a CallResult instead of throwing — for call sites that would rather branch on `ok` than wrap every call() in try/catch. */
+  callSafe(toolName: string, args: unknown): Promise<CallResult>;
+
+  /** Bulk register() over a name -> tool record — equivalent to calling register() once per value, in Object.values() order. */
+  registerAll<T extends Record<string, ToolExecutor>>(tools: T): void;
+  /** Bulk wrap() over a name -> tool record, returning the same keys mapped to their wrapped executors — equivalent to calling wrap() once per value, in Object.values() order. */
+  wrapAll<T extends Record<string, ToolExecutor>>(tools: T): T;
+
+  /**
+   * Registers a source-only tool for the fetch-and-quarantine composite
+   * pattern (DESIGN.md §6.2's implementation note) and returns a wrapper
+   * whose execute() resolves to `{ text, taintRecordId }` instead of just
+   * the raw result — `taintRecordId` is exactly what summarize() needs as
+   * `sourceTaintRecordId`, so callers don't have to separately compute or
+   * look up the fetched content's fingerprint id themselves. Throws
+   * DualRoleToolError at registration if `tool` also declares sink
+   * capabilities — this helper is for source-only tools; see register().
+   */
+  registerRawForQuarantine<A = unknown, R = unknown>(tool: RawQuarantineSourceTool<A, R>): { name: string; execute(args: A): Promise<QuarantineSourceResult> };
 
   summarize: QuarantineFn;
 
@@ -369,6 +413,13 @@ export interface ToolCallBroker {
    * description changed since last seen"), not its content.
    */
   markContextExposure(source: { toolName?: string; note: string; text?: string }, level?: TaintLevel): void;
+
+  /** markContextExposure() specialized for a tool/plugin/MCP-server description read at discovery time (GAPS.md #1's own canonical example) — see examples/mcp-integration.ts's rug-pull guard for a worked pattern. */
+  markToolDescriptionExposure(toolName: string, description: string, level?: TaintLevel): void;
+  /** markContextExposure() specialized for an untrusted system-prompt fragment. `text` is optional, same as markContextExposure() — omit it when only the fact of the exposure, not its content, is known. */
+  markSystemPromptExposure(note: string, text?: string, level?: TaintLevel): void;
+  /** markContextExposure() specialized for content a user pastes directly into a turn. `text` is optional, same as markContextExposure(). */
+  markPastedContentExposure(note: string, text?: string, level?: TaintLevel): void;
 
   /** Per `resetScope`: clears the watermark ('turn' mode) or is a no-op ('session' mode, the default). */
   startNewTurn(): void;

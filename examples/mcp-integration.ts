@@ -67,14 +67,7 @@ function createMcpDescriptionGuard(broker: ToolCallBroker): (tools: McpToolDescr
       const hash = exactHash(tool.description);
       const previous = lastSeenHash.get(tool.name);
       if (previous !== undefined && previous !== hash) {
-        broker.markContextExposure(
-          {
-            toolName: tool.name,
-            note: `MCP tool description for "${tool.name}" changed since it was last seen — possible rug-pull (GAPS.md #1).`,
-            text: tool.description,
-          },
-          'RAW_UNTRUSTED',
-        );
+        broker.markToolDescriptionExposure(tool.name, tool.description, 'RAW_UNTRUSTED');
       }
       lastSeenHash.set(tool.name, hash);
     }

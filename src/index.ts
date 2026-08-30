@@ -56,6 +56,9 @@ export type {
   QuarantineImpl,
   PlanStep,
   ToolCallBroker,
+  CallResult,
+  RawQuarantineSourceTool,
+  QuarantineSourceResult,
 } from './types.js';
 
 export { LEVEL_ORDER, maxLevel, levelAtLeast, sinkClassOf, NOT_SENSITIVE, TAINT_BRAND } from './types.js';
@@ -100,6 +103,9 @@ export type { DeferredApprovalChannel, DeferredApprovalChannelOpts } from './app
 
 export { jsonSafeClone } from './json-safe-clone.js';
 
+export { defineSource, defineSink } from './define.js';
+export type { DefineSourceOpts, DefineSinkOpts } from './define.js';
+
 export {
   TaintBrokerError,
   ToolCallBlockedError,
@@ -112,4 +118,5 @@ export {
   PlanNotDeclarableError,
   UnplannedPrivilegedActionError,
   ReservedToolNameError,
+  QuarantineSourceUnavailableError,
 } from './errors.js';
