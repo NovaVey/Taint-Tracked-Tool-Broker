@@ -200,3 +200,23 @@ export class ReentrantCallError extends TaintBrokerError {
     this.name = 'ReentrantCallError';
   }
 }
+
+/**
+ * Thrown when `BrokerOptions.allowedOutboundHosts` is configured and an
+ * EXFIL-class call's arguments reference an http(s) URL whose hostname
+ * isn't in it. This is a pure firewall-style rule (DESIGN.md §7.4) —
+ * independent of, and applied even when, the taint-based policy in §7.2
+ * would otherwise ALLOW the call (e.g. a CLEAN scope), since the whole
+ * point of an explicit allowlist is a structural boundary rather than
+ * another approval prompt subject to GAPS.md #7's fatigue risk.
+ */
+export class DisallowedOutboundHostError extends TaintBrokerError {
+  constructor(toolName: string, disallowedHosts: readonly string[]) {
+    super(
+      `Tool call "${toolName}" was not executed: outbound host allowlist violation — ` +
+        `${disallowedHosts.map((h) => `"${h}"`).join(', ')} not in BrokerOptions.allowedOutboundHosts. ` +
+        'See DESIGN.md §7.4 and GAPS.md #18 for what this check does and does not cover.',
+    );
+    this.name = 'DisallowedOutboundHostError';
+  }
+}
