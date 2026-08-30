@@ -90,6 +90,7 @@ npm run typecheck   # tsc --noEmit
 npm test            # vitest (unit tests + the injection corpus)
 npm run corpus      # just the corpus, with a readable pass/fail table
 npm run build       # emit dist/
+npm run bench       # structuredClone vs jsonSafeClone args-cloning benchmark
 ```
 
 ## License

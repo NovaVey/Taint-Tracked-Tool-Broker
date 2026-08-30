@@ -14,6 +14,7 @@
     "LICENSE"
   ],
   "scripts": {
+    "prepack": "npm run build",
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -21,6 +22,7 @@
     "example": "tsx examples/basic-usage.ts",
     "example:mcp": "tsx examples/mcp-integration.ts",
     "example:tool-loop": "tsx examples/anthropic-tool-loop.ts",
+    "bench": "tsx bench/args-clone.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
