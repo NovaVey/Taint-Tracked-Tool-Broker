@@ -23,14 +23,21 @@ const CASES: Case[] = [
   {
     name: 'medium (a moderately nested tool-call object, ~50 fields)',
     make: () => {
-      const obj: Record<string, unknown> = { path: '/tmp/report.json', metadata: { author: 'agent', tags: ['report', 'quarterly'] } };
-      for (let i = 0; i < 50; i++) obj[`field_${i}`] = { index: i, value: `value-${i}`, nested: { a: i, b: i * 2 } };
+      const obj: Record<string, unknown> = {
+        path: '/tmp/report.json',
+        metadata: { author: 'agent', tags: ['report', 'quarterly'] },
+      };
+      for (let i = 0; i < 50; i++)
+        obj[`field_${i}`] = { index: i, value: `value-${i}`, nested: { a: i, b: i * 2 } };
       return obj;
     },
   },
   {
     name: 'large (a ~50KB fetched-page-style string field)',
-    make: () => ({ url: 'https://example.com/docs', contents: 'Lorem ipsum dolor sit amet. '.repeat(1800) }),
+    make: () => ({
+      url: 'https://example.com/docs',
+      contents: 'Lorem ipsum dolor sit amet. '.repeat(1800),
+    }),
   },
   {
     name: 'deep (50 levels of nesting)',
@@ -53,8 +60,15 @@ function timeIt(fn: () => void, iterations: number): number {
 }
 
 function main(): void {
-  console.log(`Comparing structuredClone vs jsonSafeClone, ${ITERATIONS.toLocaleString()} iterations per case:\n`);
-  console.log('case'.padEnd(52), 'structuredClone'.padStart(18), 'jsonSafeClone'.padStart(16), 'speedup'.padStart(10));
+  console.log(
+    `Comparing structuredClone vs jsonSafeClone, ${ITERATIONS.toLocaleString()} iterations per case:\n`,
+  );
+  console.log(
+    'case'.padEnd(52),
+    'structuredClone'.padStart(18),
+    'jsonSafeClone'.padStart(16),
+    'speedup'.padStart(10),
+  );
   console.log('-'.repeat(100));
 
   for (const c of CASES) {

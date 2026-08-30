@@ -55,14 +55,25 @@ export interface DeferredApprovalChannelOpts {
    * `requestApproval()` resolves, which is too late to notify anyone about
    * a request that still needs a decision.
    */
-  onPending?: (approvalToken: string, call: ToolCall, taint: TaintContext, decision: RequireApprovalDecision) => void;
+  onPending?: (
+    approvalToken: string,
+    call: ToolCall,
+    taint: TaintContext,
+    decision: RequireApprovalDecision,
+  ) => void;
 }
 
-export function createDeferredApprovalChannel(opts: DeferredApprovalChannelOpts = {}): DeferredApprovalChannel {
+export function createDeferredApprovalChannel(
+  opts: DeferredApprovalChannelOpts = {},
+): DeferredApprovalChannel {
   const pending = new Map<string, (granted: boolean) => void>();
 
   return {
-    async requestApproval(call: ToolCall, taint: TaintContext, decision: RequireApprovalDecision): Promise<boolean> {
+    async requestApproval(
+      call: ToolCall,
+      taint: TaintContext,
+      decision: RequireApprovalDecision,
+    ): Promise<boolean> {
       return new Promise<boolean>((resolvePromise) => {
         let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
         const settle = (granted: boolean): void => {

@@ -85,8 +85,16 @@ describe('taint/wrapper (Layer 1)', () => {
   });
 
   it('spreadTainted merges objects and unions taint', () => {
+    // The cast looks unnecessary in isolation (wrapTainted's parameter type
+    // doesn't require it), but removing it narrows T from Record<string,
+    // number> to the literal type { x: number }, which then makes the next
+    // line's { y: 2 } fail TypeScript's excess-property check against
+    // spreadTainted's inferred generic — a real cross-line interaction the
+    // rule's single-assertion analysis can't see. Verified: removing this
+    // breaks `npm run typecheck`.
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion
     const t = wrapTainted({ x: 1 } as Record<string, number>, 'DERIVED_UNTRUSTED', [tag('a')]);
-    const result = spreadTainted({ y: 2 } as Record<string, number>, t);
+    const result = spreadTainted({ y: 2 }, t);
     expect(result.value).toEqual({ y: 2, x: 1 });
     expect(result.level).toBe('DERIVED_UNTRUSTED');
   });

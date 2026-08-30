@@ -59,13 +59,21 @@
     "example:openai-agents": "tsx examples/openai-agents-sdk-integration.ts",
     "bench": "tsx bench/args-clone.ts",
     "bench:minhash": "tsx bench/minhash-sketch-tradeoff.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"corpus/**/*.ts\" \"examples/**/*.ts\" \"bench/**/*.ts\" \"*.{js,ts}\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"corpus/**/*.ts\" \"examples/**/*.ts\" \"bench/**/*.ts\" \"*.{js,ts}\""
   },
   "devDependencies": {
     "@types/node": "^26.3.0",
     "@vitest/coverage-v8": "^4.1.11",
+    "eslint": "^10.9.1",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.6",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
+    "typescript-eslint": "^8.68.0",
     "vitest": "^4.1.11"
   }
 }

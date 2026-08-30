@@ -77,7 +77,10 @@ export function serializeRegistry(registry: TaintRegistry): SerializedTaintRecor
  * aren't among `records` are left alone; an id present in both is replaced
  * in place (see `TaintRegistry.restore()`).
  */
-export function restoreRegistry(records: readonly SerializedTaintRecord[], into: TaintRegistry): void {
+export function restoreRegistry(
+  records: readonly SerializedTaintRecord[],
+  into: TaintRegistry,
+): void {
   for (const record of records) {
     into.restore({
       ...record,
@@ -99,7 +102,9 @@ export function restoreRegistry(records: readonly SerializedTaintRecord[], into:
  *   const state = serializeBrokerState(broker);
  *   await fs.writeFile('session.json', JSON.stringify(state));
  */
-export function serializeBrokerState(broker: Pick<ToolCallBroker, 'scope' | 'registry'>): SerializedBrokerState {
+export function serializeBrokerState(
+  broker: Pick<ToolCallBroker, 'scope' | 'registry'>,
+): SerializedBrokerState {
   return {
     watermark: {
       level: broker.scope.watermark.level,

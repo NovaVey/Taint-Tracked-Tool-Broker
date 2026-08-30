@@ -17,6 +17,8 @@ If it's purely additive and doesn't touch gating behavior at all, delete this se
 - [ ] `npm run build` — clean
 - [ ] `npm run corpus` — all passing (state the pass count)
 - [ ] `npm run coverage` — meets `vitest.config.ts`'s thresholds (or the PR explains why a threshold was deliberately lowered)
+- [ ] `npm run lint` — clean (fix the code, not the rule — see CONTRIBUTING.md)
+- [ ] `npm run format:check` — clean
 - [ ] Added/updated a test that would fail without this change (`test/*.spec.ts` and/or a `corpus/cases.ts` entry)
 - [ ] Docs updated where relevant (`README.md`, `DESIGN.md`, `GAPS.md`, `docs/classifying-tools.md`, `CHANGELOG.md`)
 

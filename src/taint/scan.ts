@@ -69,8 +69,8 @@ export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanRe
   function visit(node: unknown, path: string): void {
     if (node === null || node === undefined) return;
     if (typeof node === 'object') {
-      if (visited.has(node as object)) return;
-      visited.add(node as object);
+      if (visited.has(node)) return;
+      visited.add(node);
     }
 
     // Layer 1 fast path: a still-wrapped TaintedValue carries its own level
@@ -115,7 +115,9 @@ export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanRe
     // this point (computed via bump() during the walk, not from this array),
     // so this truncation is a pure explainability-list size bound, never a
     // policy-affecting one.
-    matches.sort((a, b) => LEVEL_ORDER[b.record.level] - LEVEL_ORDER[a.record.level] || b.score - a.score);
+    matches.sort(
+      (a, b) => LEVEL_ORDER[b.record.level] - LEVEL_ORDER[a.record.level] || b.score - a.score,
+    );
     matches.length = MAX_SCAN_MATCHES;
   }
   return { matches, floor };

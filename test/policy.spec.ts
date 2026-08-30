@@ -1,9 +1,21 @@
 import { describe, expect, it } from 'vitest';
-import { defaultPolicy, type PolicyDecision, type SinkClass, type TaintContext, type TaintLevel, type ToolCall } from '../src/index.js';
+import {
+  defaultPolicy,
+  type PolicyDecision,
+  type SinkClass,
+  type TaintContext,
+  type TaintLevel,
+  type ToolCall,
+} from '../src/index.js';
 
 const CALL: ToolCall = { id: 'c1', toolName: 'test_sink', args: {}, sessionId: 's1' };
 
-function ctx(scopeLevel: TaintLevel, sinkClass: SinkClass, privateDataSeen: boolean, argFingerprintFloor: TaintLevel = 'CLEAN'): TaintContext {
+function ctx(
+  scopeLevel: TaintLevel,
+  sinkClass: SinkClass,
+  privateDataSeen: boolean,
+  argFingerprintFloor: TaintLevel = 'CLEAN',
+): TaintContext {
   return { matchedRecords: [], scopeLevel, argFingerprintFloor, privateDataSeen, sinkClass };
 }
 
@@ -64,7 +76,9 @@ describe('defaultPolicy matrix (DESIGN.md §7.2)', () => {
 
     it('does not re-tighten when the floor merely matches what scopeLevel already reflects', async () => {
       // scopeLevel already DERIVED_UNTRUSTED; a same-level fingerprint match adds no new information.
-      expect(await decide('DERIVED_UNTRUSTED', 'MUTATE', false, 'DERIVED_UNTRUSTED')).toBe('ALLOW_WITH_WARNING');
+      expect(await decide('DERIVED_UNTRUSTED', 'MUTATE', false, 'DERIVED_UNTRUSTED')).toBe(
+        'ALLOW_WITH_WARNING',
+      );
     });
 
     it('never loosens an already-BLOCK verdict', async () => {

@@ -26,10 +26,14 @@ npm run typecheck   # tsc --noEmit
 npm test             # vitest — unit tests + the injection corpus
 npm run corpus       # just the corpus, with a readable pass/fail table
 npm run coverage     # vitest --coverage, enforced against vitest.config.ts's thresholds
+npm run lint         # eslint . — type-aware (typescript-eslint), enforced in CI
+npm run format       # prettier --write over src/test/corpus/examples/bench
 npm run build        # emit dist/, exactly what CI and the release workflow run
 ```
 
-All five must pass clean before opening a PR — CI runs typecheck/build/test/corpus on Node 20/22/24, plus a separate coverage job (see `.github/workflows/ci.yml`), so there's nothing hidden that only fails in CI. If your change lowers coverage below `vitest.config.ts`'s thresholds, either add the missing test coverage or, if the drop is deliberate and justified, lower the specific threshold in the same PR and say why in the PR description — don't leave CI red with no explanation.
+All seven must pass clean before opening a PR — CI runs typecheck/build/test/corpus on Node 20/22/24, plus separate coverage and lint jobs (see `.github/workflows/ci.yml`), so there's nothing hidden that only fails in CI. If your change lowers coverage below `vitest.config.ts`'s thresholds, either add the missing test coverage or, if the drop is deliberate and justified, lower the specific threshold in the same PR and say why in the PR description — don't leave CI red with no explanation.
+
+A lint finding is a real finding, not noise to silence — `eslint.config.js`'s own two deliberate deviations from the defaults (`no-floating-promises` turned on, `require-await` turned off) are both explained in the config file's comments; match that standard if you add another. Prefer fixing the actual code over an `eslint-disable` comment; when a rule is genuinely wrong for a specific line (not just inconvenient), a narrowly-scoped `eslint-disable-next-line` with a comment explaining *why* it's a false positive is fine — see `test/scan.spec.ts`'s and `test/scope-and-wrapper.spec.ts`'s existing ones for the expected level of detail. Never add a repo- or file-wide disable to make a finding go away.
 
 ## What a good PR looks like
 

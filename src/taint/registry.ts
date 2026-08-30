@@ -62,7 +62,16 @@
  * sizes. Not shipped; the numbers are real and reproducible.
  */
 
-import type { Fingerprint, FuzzyLookupOpts, ProvenanceTag, SensitivityLabel, TaintLevel, TaintMatch, TaintRecord, TaintRegistry } from '../types.js';
+import type {
+  Fingerprint,
+  FuzzyLookupOpts,
+  ProvenanceTag,
+  SensitivityLabel,
+  TaintLevel,
+  TaintMatch,
+  TaintRecord,
+  TaintRegistry,
+} from '../types.js';
 import { LEVEL_ORDER, maxLevel } from '../types.js';
 import { buildFingerprint, exactHash, hammingDistance, overlapCoefficient } from './fingerprint.js';
 
@@ -100,13 +109,21 @@ export class InMemoryTaintRegistry implements TaintRegistry {
   /** Also the source of truth for insertion order — Map preserves it, and FIFO eviction reads straight off it. */
   private readonly byExactHash = new Map<string, TaintRecord>();
   /** band index -> band value -> candidate record ids sharing that band. */
-  private readonly simhashIndex: Array<Map<number, Set<string>>> = Array.from({ length: SIMHASH_BANDS }, () => new Map());
+  private readonly simhashIndex: Array<Map<number, Set<string>>> = Array.from(
+    { length: SIMHASH_BANDS },
+    () => new Map<number, Set<string>>(),
+  );
   /** shingle hash -> candidate record ids sharing that shingle. */
   private readonly shingleIndex = new Map<number, Set<string>>();
 
   constructor(opts: InMemoryTaintRegistryOpts = {}) {
-    if (opts.maxEntries !== undefined && (!Number.isInteger(opts.maxEntries) || opts.maxEntries < 1)) {
-      throw new RangeError(`InMemoryTaintRegistry maxEntries must be a positive integer, got ${opts.maxEntries}.`);
+    if (
+      opts.maxEntries !== undefined &&
+      (!Number.isInteger(opts.maxEntries) || opts.maxEntries < 1)
+    ) {
+      throw new RangeError(
+        `InMemoryTaintRegistry maxEntries must be a positive integer, got ${opts.maxEntries}.`,
+      );
     }
     this.maxEntries = opts.maxEntries;
   }
@@ -134,8 +151,11 @@ export class InMemoryTaintRegistry implements TaintRegistry {
       // relevant fields and must only ever strengthen.
       existing.level = maxLevel(existing.level, level);
       existing.sensitivity = {
-        containsPrivateData: existing.sensitivity.containsPrivateData || sensitivity.containsPrivateData,
-        categories: Array.from(new Set([...existing.sensitivity.categories, ...sensitivity.categories])),
+        containsPrivateData:
+          existing.sensitivity.containsPrivateData || sensitivity.containsPrivateData,
+        categories: Array.from(
+          new Set([...existing.sensitivity.categories, ...sensitivity.categories]),
+        ),
       };
       return existing;
     }
@@ -238,7 +258,10 @@ export class InMemoryTaintRegistry implements TaintRegistry {
    * candidate scan are unchanged, only the redundant second fingerprint
    * computation is removed.
    */
-  lookupCombined(text: string, opts: FuzzyLookupOpts = {}): { exact: TaintRecord | undefined; fuzzy: TaintMatch[] } {
+  lookupCombined(
+    text: string,
+    opts: FuzzyLookupOpts = {},
+  ): { exact: TaintRecord | undefined; fuzzy: TaintMatch[] } {
     if (text.length < MIN_TEXT_LEN_FOR_FUZZY) {
       // Below the fuzzy floor, lookupFuzzy() always returns [] without ever
       // building a fingerprint — mirror that here too rather than paying for
@@ -295,7 +318,9 @@ export class InMemoryTaintRegistry implements TaintRegistry {
     // guarantees the single highest-severity match always survives the cap
     // (FuzzyLookupOpts.maxMatches's doc comment), so truncating here can
     // only ever drop lower-value explainability, never a floor-raising match.
-    matches.sort((a, b) => LEVEL_ORDER[b.record.level] - LEVEL_ORDER[a.record.level] || b.score - a.score);
+    matches.sort(
+      (a, b) => LEVEL_ORDER[b.record.level] - LEVEL_ORDER[a.record.level] || b.score - a.score,
+    );
     if (matches.length > maxMatches) matches.length = maxMatches;
     return matches;
   }
@@ -323,8 +348,11 @@ export class InMemoryTaintRegistry implements TaintRegistry {
         ...existing,
         level: maxLevel(existing.level, record.level),
         sensitivity: {
-          containsPrivateData: existing.sensitivity.containsPrivateData || record.sensitivity.containsPrivateData,
-          categories: Array.from(new Set([...existing.sensitivity.categories, ...record.sensitivity.categories])),
+          containsPrivateData:
+            existing.sensitivity.containsPrivateData || record.sensitivity.containsPrivateData,
+          categories: Array.from(
+            new Set([...existing.sensitivity.categories, ...record.sensitivity.categories]),
+          ),
         },
       };
       this.unindexRecord(existing);

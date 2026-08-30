@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { createBroker, jsonSafeClone, NonCloneableArgsError, type ToolExecutor } from '../src/index.js';
+import {
+  createBroker,
+  jsonSafeClone,
+  NonCloneableArgsError,
+  type ToolExecutor,
+} from '../src/index.js';
 
 describe('jsonSafeClone', () => {
   it('deep-clones plain objects and arrays — an independent copy, not a shared reference', () => {
@@ -57,7 +62,13 @@ describe('jsonSafeClone', () => {
   });
 
   it('works end-to-end as a custom cloneArgs, and still fails loud (NonCloneableArgsError) on a type it rejects', async () => {
-    const shellExec: ToolExecutor = { name: 'shell_exec', capabilities: { capabilities: ['exec:shell'] }, async execute(args) { return `ran: ${JSON.stringify(args)}`; } };
+    const shellExec: ToolExecutor = {
+      name: 'shell_exec',
+      capabilities: { capabilities: ['exec:shell'] },
+      async execute(args) {
+        return `ran: ${JSON.stringify(args)}`;
+      },
+    };
     const broker = createBroker({ cloneArgs: jsonSafeClone });
     broker.register(shellExec);
 
@@ -66,6 +77,8 @@ describe('jsonSafeClone', () => {
     // cloning either way).
     await expect(broker.call('shell_exec', { cmd: 'echo hi' })).resolves.toContain('ran:');
     // A non-JSON-safe arg surfaces as NonCloneableArgsError, same contract as structuredClone throwing.
-    await expect(broker.call('shell_exec', { cmd: 'x', when: new Date() })).rejects.toBeInstanceOf(NonCloneableArgsError);
+    await expect(broker.call('shell_exec', { cmd: 'x', when: new Date() })).rejects.toBeInstanceOf(
+      NonCloneableArgsError,
+    );
   });
 });

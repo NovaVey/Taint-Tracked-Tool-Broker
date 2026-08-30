@@ -31,46 +31,58 @@ interface MatrixCell {
   reasonWithPrivateData: string;
 }
 
-const MATRIX: Record<Exclude<TaintLevel, 'CLEAN'>, Record<Exclude<SinkClass, 'NONE'>, MatrixCell>> = {
+const MATRIX: Record<
+  Exclude<TaintLevel, 'CLEAN'>,
+  Record<Exclude<SinkClass, 'NONE'>, MatrixCell>
+> = {
   RAW_UNTRUSTED: {
     EXEC: {
       without: 'BLOCK',
       withPrivateData: 'BLOCK',
-      reasonWithout: 'EXEC sink while untrusted content is live in this scope — unconditional block regardless of private-data exposure.',
-      reasonWithPrivateData: 'EXEC sink while untrusted content is live in this scope — unconditional block regardless of private-data exposure.',
+      reasonWithout:
+        'EXEC sink while untrusted content is live in this scope — unconditional block regardless of private-data exposure.',
+      reasonWithPrivateData:
+        'EXEC sink while untrusted content is live in this scope — unconditional block regardless of private-data exposure.',
     },
     MUTATE: {
       without: 'REQUIRE_APPROVAL',
       withPrivateData: 'BLOCK',
       reasonWithout: 'MUTATE sink while untrusted content is live in this scope.',
-      reasonWithPrivateData: 'MUTATE sink while untrusted content is live in scope AND private data has been read this scope (lethal-trifecta escalation).',
+      reasonWithPrivateData:
+        'MUTATE sink while untrusted content is live in scope AND private data has been read this scope (lethal-trifecta escalation).',
     },
     EXFIL: {
       without: 'REQUIRE_APPROVAL',
       withPrivateData: 'BLOCK',
       reasonWithout: 'EXFIL sink while untrusted content is live in this scope.',
-      reasonWithPrivateData: 'EXFIL sink with untrusted content live in scope AND private data read this scope — full lethal trifecta.',
+      reasonWithPrivateData:
+        'EXFIL sink with untrusted content live in scope AND private data read this scope — full lethal trifecta.',
     },
   },
   DERIVED_UNTRUSTED: {
     EXEC: {
       without: 'REQUIRE_APPROVAL',
       withPrivateData: 'REQUIRE_APPROVAL',
-      reasonWithout: 'EXEC sink after content was only quarantine-derived — still requires approval unconditionally, never gated only by the trifecta.',
+      reasonWithout:
+        'EXEC sink after content was only quarantine-derived — still requires approval unconditionally, never gated only by the trifecta.',
       reasonWithPrivateData:
         'EXEC sink after content was only quarantine-derived — still requires approval unconditionally, never gated only by the trifecta.',
     },
     MUTATE: {
       without: 'ALLOW_WITH_WARNING',
       withPrivateData: 'REQUIRE_APPROVAL',
-      reasonWithout: 'MUTATE sink after quarantine-derived exposure only; no private data read this scope.',
-      reasonWithPrivateData: 'MUTATE sink after quarantine-derived exposure, with private data also read this scope.',
+      reasonWithout:
+        'MUTATE sink after quarantine-derived exposure only; no private data read this scope.',
+      reasonWithPrivateData:
+        'MUTATE sink after quarantine-derived exposure, with private data also read this scope.',
     },
     EXFIL: {
       without: 'ALLOW_WITH_WARNING',
       withPrivateData: 'REQUIRE_APPROVAL',
-      reasonWithout: 'EXFIL sink after quarantine-derived exposure only; no private data read this scope.',
-      reasonWithPrivateData: 'EXFIL sink after quarantine-derived exposure, with private data also read this scope (full trifecta).',
+      reasonWithout:
+        'EXFIL sink after quarantine-derived exposure only; no private data read this scope.',
+      reasonWithPrivateData:
+        'EXFIL sink after quarantine-derived exposure, with private data also read this scope (full trifecta).',
     },
   },
 };
@@ -98,7 +110,9 @@ function baseDecision(taint: TaintContext): PolicyDecision {
   }
 
   const cell = MATRIX[scopeLevel][sinkClass];
-  return privateDataSeen ? toDecision(cell.withPrivateData, cell.reasonWithPrivateData) : toDecision(cell.without, cell.reasonWithout);
+  return privateDataSeen
+    ? toDecision(cell.withPrivateData, cell.reasonWithPrivateData)
+    : toDecision(cell.without, cell.reasonWithout);
 }
 
 export const defaultPolicy: PolicyFn = (_call, taint) => {

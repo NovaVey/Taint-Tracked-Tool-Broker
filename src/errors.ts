@@ -23,7 +23,9 @@ export class ReservedToolNameError extends TaintBrokerError {
 
 export class UnknownToolError extends TaintBrokerError {
   constructor(toolName: string) {
-    super(`No tool registered with name "${toolName}". Tools must be registered via broker.register()/broker.wrap() before being called.`);
+    super(
+      `No tool registered with name "${toolName}". Tools must be registered via broker.register()/broker.wrap() before being called.`,
+    );
     this.name = 'UnknownToolError';
   }
 }
@@ -86,7 +88,7 @@ export class DualRoleToolError extends TaintBrokerError {
         'A single call to such a tool could read and act on untrusted content before the watermark that gates its own ' +
         'sink behavior is ever raised. Split it into a source-only call and a separate sink-only call, mark it trusted ' +
         'if its source content is genuinely not attacker-influenceable, or use the fetch-and-quarantine pattern in ' +
-        'DESIGN.md §6.2\'s implementation note. See GAPS.md.',
+        "DESIGN.md §6.2's implementation note. See GAPS.md.",
     );
     this.name = 'DualRoleToolError';
   }
@@ -190,7 +192,7 @@ export class ReentrantCallError extends TaintBrokerError {
   constructor(toolName: string) {
     super(
       `Reentrant broker.call("${toolName}", ...) detected: a tool's execute() (or something it awaited) called ` +
-        "broker.call() again on the same broker instance before the outer call finished. This is not supported — it " +
+        'broker.call() again on the same broker instance before the outer call finished. This is not supported — it ' +
         'would deadlock the serialization lock that makes watermark raises atomic across concurrently-dispatched ' +
         "calls. If a tool needs another registered tool's behavior, call its execute() directly instead of going " +
         'back through the broker.',

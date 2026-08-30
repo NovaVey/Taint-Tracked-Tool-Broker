@@ -15,10 +15,20 @@ export interface DefineSourceOpts {
 }
 
 /** Builds a source-only ToolExecutor (isSource: true, no sink capabilities) — the common "fetch/read" shape. */
-export function defineSource<A = unknown, R = unknown>(name: string, execute: (args: A) => Promise<R>, opts: DefineSourceOpts = {}): ToolExecutor<A, R> {
-  const executor: ToolExecutor<A, R> = { name, capabilities: { capabilities: [] }, isSource: true, execute };
+export function defineSource<A = unknown, R = unknown>(
+  name: string,
+  execute: (args: A) => Promise<R>,
+  opts: DefineSourceOpts = {},
+): ToolExecutor<A, R> {
+  const executor: ToolExecutor<A, R> = {
+    name,
+    capabilities: { capabilities: [] },
+    isSource: true,
+    execute,
+  };
   if (opts.trusted !== undefined) executor.trusted = opts.trusted;
-  if (opts.readsPrivateData !== undefined) executor.capabilities.readsPrivateData = opts.readsPrivateData;
+  if (opts.readsPrivateData !== undefined)
+    executor.capabilities.readsPrivateData = opts.readsPrivateData;
   return executor;
 }
 
@@ -39,6 +49,7 @@ export function defineSink<A = unknown, R = unknown>(
   const executor: ToolExecutor<A, R> = { name, capabilities: { capabilities }, execute };
   if (opts.isSource !== undefined) executor.isSource = opts.isSource;
   if (opts.trusted !== undefined) executor.trusted = opts.trusted;
-  if (opts.readsPrivateData !== undefined) executor.capabilities.readsPrivateData = opts.readsPrivateData;
+  if (opts.readsPrivateData !== undefined)
+    executor.capabilities.readsPrivateData = opts.readsPrivateData;
   return executor;
 }

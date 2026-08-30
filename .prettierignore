@@ -1,0 +1,12 @@
+dist
+coverage
+node_modules
+package-lock.json
+
+# The long-form docs (README/DESIGN/GAPS/CHANGELOG/etc.) have deliberate
+# prose formatting — wrapped paragraphs, tables, specific list structure.
+# Prettier's markdown formatter would reformat that in ways that are hard
+# to review and not what this project's lint/format tooling is for (code
+# style, not prose). Scoped out here as a safety net even though the
+# format/format:check scripts already only target *.ts/*.js.
+*.md
