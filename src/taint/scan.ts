@@ -11,7 +11,7 @@
  */
 
 import type { TaintLevel, TaintMatch, TaintRegistry } from '../types.js';
-import { maxLevel } from '../types.js';
+import { LEVEL_ORDER, maxLevel } from '../types.js';
 import { isTaintedValue } from './wrapper.js';
 
 export interface ScanResult {
@@ -19,6 +19,14 @@ export interface ScanResult {
   /** Union of every matched record's level — floors (never lowers) a policy verdict. */
   floor: TaintLevel;
 }
+
+// Bounds the final ScanResult.matches array size across an entire args tree
+// (many string leaves, each potentially contributing several fuzzy matches).
+// Purely a size bound on the returned explainability list — `floor` is
+// accumulated independently via bump() as the tree is walked, not re-derived
+// from `matches` afterward, so truncating this array can never affect a
+// policy verdict, only how many matched records an audit/approval UI sees.
+const MAX_SCAN_MATCHES = 50;
 
 export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanResult {
   const matches: TaintMatch[] = [];
@@ -28,12 +36,20 @@ export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanRe
   };
 
   function checkStringLeaf(text: string, path: string): void {
-    const exact = registry.lookupExact(text);
+    // lookupCombined() (when the registry provides it — InMemoryTaintRegistry
+    // does) computes the text's fingerprint once instead of twice: calling
+    // lookupExact() then lookupFuzzy() separately re-hashes the same text a
+    // second time inside lookupFuzzy()'s own buildFingerprint() call. See
+    // TaintRegistry.lookupCombined()'s doc comment in types.ts. Falls back to
+    // the two separate calls for a custom registry that doesn't implement it.
+    const { exact, fuzzy } = registry.lookupCombined
+      ? registry.lookupCombined(text)
+      : { exact: registry.lookupExact(text), fuzzy: registry.lookupFuzzy(text) };
     if (exact) {
       matches.push({ record: exact, matchType: 'exact', argPath: path, score: 1 });
       bump(exact.level);
     }
-    for (const match of registry.lookupFuzzy(text)) {
+    for (const match of fuzzy) {
       matches.push({ ...match, argPath: path });
       bump(match.record.level);
     }
@@ -93,5 +109,14 @@ export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanRe
   }
 
   visit(args, '');
+  if (matches.length > MAX_SCAN_MATCHES) {
+    // Level first, score second — same rationale as InMemoryTaintRegistry's
+    // own per-lookup cap (registry.ts): `floor` above is already fixed by
+    // this point (computed via bump() during the walk, not from this array),
+    // so this truncation is a pure explainability-list size bound, never a
+    // policy-affecting one.
+    matches.sort((a, b) => LEVEL_ORDER[b.record.level] - LEVEL_ORDER[a.record.level] || b.score - a.score);
+    matches.length = MAX_SCAN_MATCHES;
+  }
   return { matches, floor };
 }

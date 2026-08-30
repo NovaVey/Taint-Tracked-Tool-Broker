@@ -52,13 +52,14 @@
  * opportunity (GAPS.md #8), never open a hole in the core gate.
  */
 
-import type { FuzzyLookupOpts, ProvenanceTag, SensitivityLabel, TaintLevel, TaintMatch, TaintRecord, TaintRegistry } from '../types.js';
-import { maxLevel } from '../types.js';
+import type { Fingerprint, FuzzyLookupOpts, ProvenanceTag, SensitivityLabel, TaintLevel, TaintMatch, TaintRecord, TaintRegistry } from '../types.js';
+import { LEVEL_ORDER, maxLevel } from '../types.js';
 import { buildFingerprint, exactHash, hammingDistance, overlapCoefficient } from './fingerprint.js';
 
 const DEFAULT_SIMHASH_MAX_DISTANCE = 3; // out of 64 bits
 const DEFAULT_OVERLAP_MIN = 0.6;
 const MIN_TEXT_LEN_FOR_FUZZY = 40; // §4.2: "≥40-char substring window"
+const DEFAULT_MAX_FUZZY_MATCHES = 20; // FuzzyLookupOpts.maxMatches default — see its doc comment in types.ts
 
 const SIMHASH_BANDS = 8; // 64 / 8 = 8 bits/band; guarantees candidate recall for any simhashMaxDistance < 8 (see file header)
 const SIMHASH_BAND_BITS = 64 / SIMHASH_BANDS;
@@ -217,9 +218,32 @@ export class InMemoryTaintRegistry implements TaintRegistry {
 
   lookupFuzzy(text: string, opts: FuzzyLookupOpts = {}): TaintMatch[] {
     if (text.length < MIN_TEXT_LEN_FOR_FUZZY) return [];
+    return this.fuzzyMatchesForFingerprint(buildFingerprint(text), opts);
+  }
+
+  /**
+   * lookupExact() + lookupFuzzy() sharing one buildFingerprint() call — see
+   * the interface doc comment (types.ts) for why this exists. Behaviorally
+   * identical to calling both separately: the exact check and the fuzzy
+   * candidate scan are unchanged, only the redundant second fingerprint
+   * computation is removed.
+   */
+  lookupCombined(text: string, opts: FuzzyLookupOpts = {}): { exact: TaintRecord | undefined; fuzzy: TaintMatch[] } {
+    if (text.length < MIN_TEXT_LEN_FOR_FUZZY) {
+      // Below the fuzzy floor, lookupFuzzy() always returns [] without ever
+      // building a fingerprint — mirror that here too rather than paying for
+      // one just to compute an exact hash lookupExact() can get more cheaply.
+      return { exact: this.lookupExact(text), fuzzy: [] };
+    }
+    const fp = buildFingerprint(text);
+    const exact = this.byExactHash.get(fp.exactHash);
+    return { exact, fuzzy: this.fuzzyMatchesForFingerprint(fp, opts) };
+  }
+
+  private fuzzyMatchesForFingerprint(fp: Fingerprint, opts: FuzzyLookupOpts): TaintMatch[] {
     const simhashMaxDistance = opts.simhashMaxDistance ?? DEFAULT_SIMHASH_MAX_DISTANCE;
     const overlapMin = opts.jaccardMin ?? DEFAULT_OVERLAP_MIN;
-    const fp = buildFingerprint(text);
+    const maxMatches = opts.maxMatches ?? DEFAULT_MAX_FUZZY_MATCHES;
 
     // Candidate generation: union of every record sharing an LSH band with
     // this simhash, plus every record sharing at least one shingle. Exact
@@ -255,7 +279,14 @@ export class InMemoryTaintRegistry implements TaintRegistry {
         matches.push({ record, matchType: 'shingle', argPath: '', score: overlap });
       }
     }
-    matches.sort((a, b) => b.score - a.score);
+    // Level first, score second — a pathological registry (many
+    // attacker-chosen near-duplicates) can produce far more candidates than
+    // any caller wants back; maxMatches bounds that. Sorting by level first
+    // guarantees the single highest-severity match always survives the cap
+    // (FuzzyLookupOpts.maxMatches's doc comment), so truncating here can
+    // only ever drop lower-value explainability, never a floor-raising match.
+    matches.sort((a, b) => LEVEL_ORDER[b.record.level] - LEVEL_ORDER[a.record.level] || b.score - a.score);
+    if (matches.length > maxMatches) matches.length = maxMatches;
     return matches;
   }
 

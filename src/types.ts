@@ -105,6 +105,17 @@ export interface FuzzyLookupOpts {
    * and taint/fingerprint.ts.
    */
   jaccardMin?: number;
+  /**
+   * Caps how many TaintMatch entries lookupFuzzy() returns for a single
+   * query, defending against a pathological registry (many attacker-chosen
+   * near-duplicate records all fuzzy-matching the same later text) producing
+   * an unbounded match list. Survivors are chosen by taint level first, then
+   * score — so this can never drop the single highest-level match, which is
+   * the only one that can affect a policy verdict's floor (Layer 2 only ever
+   * tightens, never loosens — see TaintContext.argFingerprintFloor). Default
+   * 20; a caller that genuinely wants every candidate can pass a large value.
+   */
+  maxMatches?: number;
 }
 
 export interface TaintRegistry {
@@ -138,6 +149,21 @@ export interface TaintRegistry {
    * persistence.ts.
    */
   restore(record: TaintRecord): void;
+
+  /**
+   * Optional hot-path combination of lookupExact() + lookupFuzzy() in one
+   * call, computing the text's fingerprint only once instead of twice
+   * (lookupExact() hashes the text directly; lookupFuzzy() separately calls
+   * buildFingerprint(), which redundantly recomputes that same exact hash
+   * as part of building the full fingerprint). scanArgsForTaint() — the
+   * mandatory pre-dispatch scan run on every gated call — uses this when a
+   * registry provides it, and falls back to the two separate calls
+   * otherwise. Optional (not required by the interface) so an existing
+   * custom TaintRegistry implementation that only implements lookupExact()/
+   * lookupFuzzy() keeps working unchanged, at the cost of the redundant
+   * hash this exists to skip. InMemoryTaintRegistry implements it.
+   */
+  lookupCombined?(text: string, opts?: FuzzyLookupOpts): { exact: TaintRecord | undefined; fuzzy: TaintMatch[] };
 }
 
 // ---------------------------------------------------------------------------
