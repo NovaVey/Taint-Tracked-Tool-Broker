@@ -192,7 +192,7 @@ export interface TaintWatermark {
   sources: ProvenanceTag[];
 }
 
-export type ScopeKind = 'session' | 'turn';
+export type ScopeKind = 'session' | 'turn' | 'turn-decay';
 
 export interface TaintScope {
   kind: ScopeKind;
@@ -204,9 +204,15 @@ export interface TaintScope {
  * Whether `startNewTurn()` clears the watermark. 'session' (the default) never
  * clears until an explicit declassify(); 'turn' is a lower-friction opt-in
  * that trades soundness for usability — see GAPS.md #2 (cross-turn latent
- * influence is a named, accepted gap of 'turn' mode).
+ * influence is a named, accepted gap of 'turn' mode). 'turn-decay' is a
+ * bounded middle ground: the watermark persists across
+ * `BrokerOptions.turnDecayWindow` consecutive turns with no NEW exposure
+ * before clearing, instead of clearing at the very next turn boundary
+ * regardless. `turnDecayWindow: 1` is exactly equivalent to `'turn'` — it
+ * generalizes 'turn' mode rather than replacing it. See DESIGN.md's
+ * implementation note and GAPS.md #2.
  */
-export type ResetScope = 'turn' | 'session';
+export type ResetScope = 'turn' | 'session' | 'turn-decay';
 
 // ---------------------------------------------------------------------------
 // Sinks (§7.1)

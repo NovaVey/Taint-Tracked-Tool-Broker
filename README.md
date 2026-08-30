@@ -74,7 +74,7 @@ Read [`DESIGN.md`](./DESIGN.md) for why each of these choices was made, includin
 npm run corpus
 ```
 
-Runs [`corpus/cases.ts`](./corpus/cases.ts): 14 cases across 12 attack classes — direct verbatim injection, light reformatting, inline paraphrase (the "summarize, then act" bypass), boolean decision-laundering, the sanctioned quarantine path, lethal-trifecta escalation, translation/encoding evasion, plan-freeze catching an unplanned privileged action, and two *true, asserted* known gaps (untracked context-injection channels, and cross-turn latent influence under `resetScope: 'turn'`). The corpus is also run under `npm test`, so a change that silently narrows coverage — or silently starts overclaiming it — fails CI, not just a manual read of `GAPS.md`.
+Runs [`corpus/cases.ts`](./corpus/cases.ts): 15 cases across 12 attack classes — direct verbatim injection, light reformatting, inline paraphrase (the "summarize, then act" bypass), boolean decision-laundering, the sanctioned quarantine path, lethal-trifecta escalation, translation/encoding evasion, plan-freeze catching an unplanned privileged action, `resetScope: 'turn-decay'` narrowing (not closing) the cross-turn gap, and two *true, asserted* known gaps (untracked context-injection channels, and cross-turn latent influence under `resetScope: 'turn'`). The corpus is also run under `npm test`, so a change that silently narrows coverage — or silently starts overclaiming it — fails CI, not just a manual read of `GAPS.md`.
 
 ## Known gaps
 

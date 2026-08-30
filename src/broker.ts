@@ -13,6 +13,7 @@ import type {
   CallResult,
   PlanStep,
   PolicyFn,
+  ProvenanceTag,
   QuarantineFn,
   QuarantineImpl,
   QuarantineSourceResult,
@@ -49,8 +50,20 @@ import {
 
 export interface BrokerOptions {
   sessionId?: string;
-  /** 'session' (default) never resets until an explicit declassify(); 'turn' trades soundness for usability — GAPS.md #2. */
+  /** 'session' (default) never resets until an explicit declassify(); 'turn' trades soundness for usability — GAPS.md #2. 'turn-decay' is a bounded middle ground — see turnDecayWindow. */
   resetScope?: ResetScope;
+  /**
+   * Required when `resetScope` is `'turn-decay'`; ignored otherwise. The
+   * number of consecutive turns with no NEW exposure (no watermark raise)
+   * required before the watermark clears. Must be a positive integer.
+   * `turnDecayWindow: 1` is exactly equivalent to `resetScope: 'turn'`
+   * (clears at the very next turn boundary) — turn-decay generalizes 'turn'
+   * mode, it doesn't replace it. No default is picked for you: this is a
+   * security-relevant magic number (how many turns of residual risk you're
+   * accepting in exchange for less approval friction) the integrator must
+   * choose deliberately. See DESIGN.md's implementation note and GAPS.md #2.
+   */
+  turnDecayWindow?: number;
   policy?: PolicyFn;
   approvalChannel?: ApprovalChannel;
   auditSink?: AuditSink;
@@ -102,6 +115,14 @@ function blockedMessage(toolName: string, decision: { action: string; reason?: s
 class Broker implements ToolCallBroker {
   private readonly sessionId: string;
   private readonly resetScopeMode: ResetScope;
+  /** Only meaningful when resetScopeMode === 'turn-decay'; validated non-undefined in the constructor for that mode. */
+  private readonly turnDecayWindow: number | undefined;
+  // 'turn-decay' mode's own counter: turns crossed (via startNewTurn())
+  // since the watermark was last raised. Reset to 0 by every watermark
+  // raise (raiseWatermarkAndResetDecay()); incremented by startNewTurn()
+  // only while the watermark is non-CLEAN. Inert (never read) in 'turn'/
+  // 'session' mode.
+  private turnsSinceExposure = 0;
   private readonly policy: PolicyFn;
   private readonly approvalChannel: ApprovalChannel | undefined;
   private readonly auditSink: AuditSink;
@@ -132,6 +153,17 @@ class Broker implements ToolCallBroker {
   constructor(opts: BrokerOptions = {}) {
     this.sessionId = opts.sessionId ?? randomUUID();
     this.resetScopeMode = opts.resetScope ?? 'session';
+    if (this.resetScopeMode === 'turn-decay') {
+      if (!Number.isInteger(opts.turnDecayWindow) || (opts.turnDecayWindow as number) < 1) {
+        throw new RangeError(
+          `createBroker({ resetScope: 'turn-decay' }) requires turnDecayWindow to be a positive integer, got ${opts.turnDecayWindow}. ` +
+            "This is a deliberate security-relevant choice (how many turns of residual cross-turn exposure risk to accept) — there is no default.",
+        );
+      }
+      this.turnDecayWindow = opts.turnDecayWindow;
+    } else {
+      this.turnDecayWindow = undefined;
+    }
     this.policy = opts.policy ?? defaultPolicy;
     this.approvalChannel = opts.approvalChannel;
     this.auditSink = opts.auditSink ?? NOOP_AUDIT;
@@ -150,7 +182,7 @@ class Broker implements ToolCallBroker {
     this.summarize = createQuarantine({
       impl: opts.quarantineImpl ?? unconfiguredQuarantineImpl,
       registry: this.registry,
-      raiseToDerivedUntrusted: (tag) => raiseWatermark(this.currentScope, 'DERIVED_UNTRUSTED', tag),
+      raiseToDerivedUntrusted: (tag) => this.raiseWatermarkAndResetDecay('DERIVED_UNTRUSTED', tag),
       getScope: () => this.currentScope.watermark,
       auditSink: this.auditSink,
     });
@@ -158,6 +190,19 @@ class Broker implements ToolCallBroker {
 
   get scope(): Readonly<TaintScope> {
     return this.currentScope;
+  }
+
+  /**
+   * The one path every watermark raise in this class must go through
+   * (instead of calling the imported raiseWatermark() directly): resets
+   * 'turn-decay' mode's turnsSinceExposure counter to 0 on every NEW
+   * exposure, so the decay window restarts from the latest exposure rather
+   * than the first. A no-op write in 'turn'/'session' mode — cheap enough
+   * not to bother branching on resetScopeMode here.
+   */
+  private raiseWatermarkAndResetDecay(level: TaintLevel, tag?: ProvenanceTag): void {
+    raiseWatermark(this.currentScope, level, tag);
+    this.turnsSinceExposure = 0;
   }
 
   /** Best-effort deep clone for args snapshotting; throws NonCloneableArgsError rather than silently degrading — see GAPS.md #16. */
@@ -432,7 +477,7 @@ class Broker implements ToolCallBroker {
     if (source.text !== undefined) {
       this.registry.register(source.text, provenance, level, NOT_SENSITIVE);
     }
-    raiseWatermark(this.currentScope, level, provenance);
+    this.raiseWatermarkAndResetDecay(level, provenance);
     recordTrivialAudit(
       this.auditSink,
       {
@@ -465,39 +510,74 @@ class Broker implements ToolCallBroker {
     this.markContextExposure({ toolName: 'pasted-content', note: `user-pasted content exposure: ${note}`, ...(text !== undefined ? { text } : {}) }, level);
   }
 
+  /**
+   * Shared by 'turn' mode (called every startNewTurn()) and 'turn-decay'
+   * mode (called only once its decay window has elapsed, from within
+   * startNewTurn()'s own branch below): actually clears the scope to a
+   * fresh CLEAN watermark, resets the declared plan alongside it, and
+   * audits a discarded non-CLEAN watermark.
+   *
+   * A declared plan (declarePlan(), §11) is a commitment tied to the
+   * exposure episode it was made against. Leaving it in place across a
+   * reset that just cleared that episode's watermark would silently
+   * constrain unrelated future actions — with no way for the agent to know
+   * a plan is even still in effect — and fixes nothing, since plan-freeze
+   * is additive: a stale plan can only ever cause spurious blocking, never
+   * a bypass.
+   *
+   * Only worth an audit entry when there was something to discard —
+   * routine resets of an already-CLEAN scope are not a safety-relevant
+   * event and shouldn't add audit-log noise. Discarding a genuinely
+   * non-CLEAN watermark is exactly the moment GAPS.md #2's cross-turn risk
+   * crystallizes, though, and (unlike declassify()) had no audit trail
+   * before this. `buildReason` is only invoked when there's something to
+   * audit, and receives the pre-clear level/hadPlan so each caller can
+   * phrase its own reason text without duplicating this snapshot/clear
+   * sequence.
+   */
+  private clearScopeForTurnReset(kind: 'turn' | 'turn-decay', buildReason: (priorLevel: TaintLevel, hadPlan: boolean) => string): void {
+    const priorLevel = this.currentScope.watermark.level;
+    const priorPrivateDataSeen = this.currentScope.watermark.privateDataSeen;
+    const hadPlan = this.plan !== undefined;
+    this.currentScope = createScope(kind, randomUUID());
+    this.plan = undefined;
+    this.planCursor = 0;
+    this.turnsSinceExposure = 0;
+    if (priorLevel !== 'CLEAN') {
+      recordTrivialAudit(
+        this.auditSink,
+        { action: 'ALLOW_WITH_WARNING', reason: buildReason(priorLevel, hadPlan) },
+        { id: randomUUID(), toolName: '__tttb_turn_reset', args: {}, sessionId: this.sessionId },
+        { level: priorLevel, privateDataSeen: priorPrivateDataSeen },
+        true,
+      );
+    }
+  }
+
   startNewTurn(): void {
     if (this.resetScopeMode === 'turn') {
-      const priorLevel = this.currentScope.watermark.level;
-      const priorPrivateDataSeen = this.currentScope.watermark.privateDataSeen;
-      const hadPlan = this.plan !== undefined;
-      this.currentScope = createScope('turn', randomUUID());
-      // A declared plan (declarePlan(), §11) is a commitment tied to the
-      // exposure episode it was made against. Leaving it in place across a
-      // turn boundary that just cleared that episode's watermark would
-      // silently constrain unrelated future actions in the new turn — with
-      // no way for the agent to know a plan is even still in effect — and
-      // fixes nothing, since plan-freeze is additive: a stale plan can only
-      // ever cause spurious blocking, never a bypass.
-      this.plan = undefined;
-      this.planCursor = 0;
-      // Only worth an audit entry when there was something to discard —
-      // routine per-turn resets of an already-CLEAN scope are not a
-      // safety-relevant event and shouldn't add audit-log noise on a
-      // per-turn cadence. Discarding a genuinely non-CLEAN watermark is
-      // exactly the moment GAPS.md #2's cross-turn risk crystallizes,
-      // though, and (unlike declassify()) had no audit trail before this.
-      if (priorLevel !== 'CLEAN') {
-        recordTrivialAudit(
-          this.auditSink,
-          {
-            action: 'ALLOW_WITH_WARNING',
-            reason: `startNewTurn(): turn boundary discarded a ${priorLevel} watermark${hadPlan ? ' and its declared plan' : ''} under resetScope:'turn'. See GAPS.md #2.`,
-          },
-          { id: randomUUID(), toolName: '__tttb_turn_reset', args: {}, sessionId: this.sessionId },
-          { level: priorLevel, privateDataSeen: priorPrivateDataSeen },
-          true,
+      this.clearScopeForTurnReset(
+        'turn',
+        (priorLevel, hadPlan) =>
+          `startNewTurn(): turn boundary discarded a ${priorLevel} watermark${hadPlan ? ' and its declared plan' : ''} under resetScope:'turn'. See GAPS.md #2.`,
+      );
+    } else if (this.resetScopeMode === 'turn-decay') {
+      // Nothing to decay from an already-CLEAN scope — stay silent, same as
+      // 'turn' mode's own early exit (via clearScopeForTurnReset()'s own
+      // priorLevel !== 'CLEAN' check). Checked here too so a CLEAN scope
+      // never even advances turnsSinceExposure — the counter only means
+      // "turns since the CURRENT exposure episode started."
+      if (this.currentScope.watermark.level === 'CLEAN') return;
+      this.turnsSinceExposure++;
+      if (this.turnsSinceExposure >= this.turnDecayWindow!) {
+        const window = this.turnDecayWindow;
+        this.clearScopeForTurnReset(
+          'turn-decay',
+          (priorLevel, hadPlan) =>
+            `startNewTurn(): turn-decay window (${window} turn(s) with no new exposure) elapsed — discarded a ${priorLevel} watermark${hadPlan ? ' and its declared plan' : ''} under resetScope:'turn-decay'. See GAPS.md #2.`,
         );
       }
+      // else: still within the decay window — watermark persists untouched, no audit noise (nothing changed yet).
     }
     // 'session' mode: no-op by design — the watermark persists for the whole session (§4.1).
   }
@@ -512,6 +592,13 @@ class Broker implements ToolCallBroker {
     const priorLevel = this.currentScope.watermark.level;
     const priorPrivateDataSeen = this.currentScope.watermark.privateDataSeen;
     declassifyScope(this.currentScope);
+    // Defensive, not load-bearing: a stale nonzero counter left over from
+    // before this declassify() is already inert while the scope reads
+    // CLEAN (startNewTurn()'s 'turn-decay' branch returns early on CLEAN,
+    // and any future raise resets the counter itself anyway) — reset here
+    // too so the invariant is locally obvious, not something a future
+    // change could accidentally depend on non-local reasoning to keep true.
+    this.turnsSinceExposure = 0;
     recordTrivialAudit(
       this.auditSink,
       {
@@ -560,7 +647,7 @@ class Broker implements ToolCallBroker {
           : NOT_SENSITIVE;
         this.registry.register(text, provenance, 'RAW_UNTRUSTED', sensitivity);
       }
-      raiseWatermark(this.currentScope, 'RAW_UNTRUSTED', provenance);
+      this.raiseWatermarkAndResetDecay('RAW_UNTRUSTED', provenance);
     }
   }
 }

@@ -19,6 +19,8 @@ export interface CorpusCase {
   /** One of the canonical attack classes documented in corpus/cases.ts / GAPS.md. */
   attackClass: string;
   resetScope?: ResetScope; // default 'session'
+  /** Required (and only meaningful) when resetScope is 'turn-decay' — see BrokerOptions.turnDecayWindow. */
+  turnDecayWindow?: number;
   /**
    * If set, calls broker.declarePlan() immediately after registering
    * fixtures — i.e. before `setup`, so the scope is still guaranteed CLEAN
@@ -101,6 +103,7 @@ export async function runCorpusCase(c: CorpusCase): Promise<CorpusOutcome> {
   const auditLog: AuditEvent[] = [];
   const broker = createBroker({
     resetScope: c.resetScope ?? 'session',
+    ...(c.turnDecayWindow !== undefined ? { turnDecayWindow: c.turnDecayWindow } : {}),
     auditSink: { record: (e) => auditLog.push(e) },
     // No human present by default: REQUIRE_APPROVAL always denies in the
     // corpus, so "was this call ever safe to auto-execute" is exactly what

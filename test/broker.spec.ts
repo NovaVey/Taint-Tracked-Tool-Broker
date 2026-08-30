@@ -344,6 +344,123 @@ describe('startNewTurn / declassify', () => {
   });
 });
 
+describe("resetScope: 'turn-decay' (GAPS.md #2's bounded middle ground)", () => {
+  it('createBroker() throws RangeError when turnDecayWindow is missing, zero, negative, or non-integer', () => {
+    expect(() => createBroker({ resetScope: 'turn-decay' })).toThrow(RangeError);
+    expect(() => createBroker({ resetScope: 'turn-decay', turnDecayWindow: 0 })).toThrow(RangeError);
+    expect(() => createBroker({ resetScope: 'turn-decay', turnDecayWindow: -1 })).toThrow(RangeError);
+    expect(() => createBroker({ resetScope: 'turn-decay', turnDecayWindow: 1.5 })).toThrow(RangeError);
+  });
+
+  it('a broker with no exposure ever is unaffected by startNewTurn() — no audit noise', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ resetScope: 'turn-decay', turnDecayWindow: 3, auditSink: { record: (e) => events.push(e) } });
+    broker.startNewTurn();
+    broker.startNewTurn();
+    expect(broker.scope.watermark.level).toBe('CLEAN');
+    expect(events).toEqual([]);
+  });
+
+  it('turnDecayWindow:1 behaves exactly like resetScope:"turn" — clears at the very next turn boundary', async () => {
+    const broker = createBroker({ resetScope: 'turn-decay', turnDecayWindow: 1 });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+    broker.startNewTurn();
+    expect(broker.scope.watermark.level).toBe('CLEAN');
+  });
+
+  it('turnDecayWindow:3 keeps the watermark live through two additional turns, then clears on the third', async () => {
+    const broker = createBroker({ resetScope: 'turn-decay', turnDecayWindow: 3 });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {}); // turn 1: exposure happens
+    expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+
+    broker.startNewTurn(); // entering turn 2 — 1 turn since exposure, window not yet met
+    expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+
+    broker.startNewTurn(); // entering turn 3 — 2 turns since exposure, still not met
+    expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+
+    broker.startNewTurn(); // entering turn 4 — 3 turns since exposure, window met: clears
+    expect(broker.scope.watermark.level).toBe('CLEAN');
+  });
+
+  it('a NEW exposure during the decay window restarts the countdown from the latest exposure, not the first', async () => {
+    const broker = createBroker({ resetScope: 'turn-decay', turnDecayWindow: 2 });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {}); // turn 1: first exposure
+
+    broker.startNewTurn(); // entering turn 2 — 1 turn since exposure; without a new exposure this would clear next turn
+    expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+
+    await broker.call('fetch_url', {}); // turn 2: a SECOND exposure resets the counter to 0
+    broker.startNewTurn(); // entering turn 3 — only 1 turn since the SECOND exposure, window (2) not yet met
+    expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+
+    broker.startNewTurn(); // entering turn 4 — 2 turns since the second exposure, now met
+    expect(broker.scope.watermark.level).toBe('CLEAN');
+  });
+
+  it('the plan resets exactly when the watermark clears, not on every intermediate startNewTurn() during the decay window', async () => {
+    const broker = createBroker({ resetScope: 'turn-decay', turnDecayWindow: 2 });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register(shellExec());
+    broker.declarePlan([{ toolName: 'shell_exec' }]);
+    await broker.call('fetch_url', {});
+
+    broker.startNewTurn(); // entering turn 2 — watermark still live, plan should still be in effect
+    // A call to an unplanned tool is still gated by plan-freeze here — a
+    // mismatched tool would throw UnplannedPrivilegedActionError. shell_exec
+    // IS the planned step, so it proceeds to the normal (still-gating) policy check.
+    await expect(broker.call('shell_exec', { cmd: 'x' })).rejects.toBeInstanceOf(ToolCallBlockedError);
+
+    broker.startNewTurn(); // entering turn 3 — window (2) met, watermark AND plan clear together
+    expect(broker.scope.watermark.level).toBe('CLEAN');
+    // Turn 3, no plan re-declared: an unrelated privileged call must not be
+    // blocked by a leftover plan/cursor from before the reset.
+    broker.register({ name: 'send_email', capabilities: { capabilities: ['net:email'] }, async execute() { return 'sent'; } });
+    await expect(broker.call('send_email', {})).resolves.toBe('sent');
+  });
+
+  it('audits the discarded watermark once the decay window elapses, under __tttb_turn_reset, mentioning the window', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ resetScope: 'turn-decay', turnDecayWindow: 2, auditSink: { record: (e) => events.push(e) } });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    events.length = 0; // drop the fetch_url source-call's own audit event
+
+    broker.startNewTurn(); // within the window — no audit yet
+    expect(events).toEqual([]);
+
+    broker.startNewTurn(); // window elapses — audited
+    expect(events).toHaveLength(1);
+    expect(events[0]?.call.toolName).toBe('__tttb_turn_reset');
+    expect(events[0]?.verdict.action).toBe('ALLOW_WITH_WARNING');
+    expect(events[0]?.verdict.action === 'ALLOW_WITH_WARNING' && events[0].verdict.reason).toContain('turn-decay window (2 turn(s)');
+    expect(events[0]?.taint.scopeLevel).toBe('RAW_UNTRUSTED'); // the level that got discarded, not the resulting CLEAN
+  });
+
+  it('declassify() still clears immediately, ignoring the decay window entirely', async () => {
+    const broker = createBroker({ resetScope: 'turn-decay', turnDecayWindow: 5 });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+    broker.declassify('reviewed and cleared by a human', 'alice@example.com');
+    expect(broker.scope.watermark.level).toBe('CLEAN');
+
+    // A fresh exposure after declassify() starts its own independent countdown.
+    await broker.call('fetch_url', {});
+    expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+    for (let i = 0; i < 4; i++) {
+      broker.startNewTurn();
+      expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+    }
+    broker.startNewTurn();
+    expect(broker.scope.watermark.level).toBe('CLEAN');
+  });
+});
+
 describe('broker.summarize() (quarantine path)', () => {
   it('rejects a sourceTaintRecordId the registry does not know', async () => {
     const broker = createBroker({ quarantineImpl: stubQuarantineImpl });
