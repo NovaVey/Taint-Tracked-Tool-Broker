@@ -3,11 +3,14 @@ import {
   createBroker,
   InMemoryTaintRegistry,
   NOT_SENSITIVE,
+  PlanNotDeclarableError,
   restoreBrokerState,
   restoreRegistry,
   serializeBrokerState,
   serializeRegistry,
   ToolCallBlockedError,
+  UnplannedPrivilegedActionError,
+  type ApprovalChannel,
   type ProvenanceTag,
   type SerializedBrokerState,
   type ToolExecutor,
@@ -122,5 +125,40 @@ describe('broker state persistence (serializeBrokerState / restoreBrokerState) �
     const custom = new InMemoryTaintRegistry({ maxEntries: 5 });
     const { registry } = restoreBrokerState(state, () => custom);
     expect(registry).toBe(custom);
+  });
+
+  it('a declared plan does NOT survive serializeBrokerState()/restoreBrokerState() — plan-freeze protection is silently lost, and cannot be re-declared afterward (DESIGN.md §11, GAPS.md #12)', async () => {
+    const alwaysApprove: ApprovalChannel = { requestApproval: async () => true };
+    const sendEmail = (): ToolExecutor => ({ name: 'send_email', capabilities: { capabilities: ['net:email'] }, async execute() { return 'sent'; } });
+
+    const producer = createBroker({ approvalChannel: alwaysApprove });
+    producer.register({ name: 'fetch_url', capabilities: { capabilities: [] }, isSource: true, async execute() { return SOURCE; } });
+    producer.register(sendEmail());
+    // Committed plan does not include send_email as the next step.
+    producer.declarePlan([{ toolName: 'some_other_tool' }]);
+
+    await producer.call('fetch_url', {});
+    expect(producer.scope.watermark.level).toBe('RAW_UNTRUSTED');
+
+    // On the ORIGINAL broker, plan-freeze rejects this outright — even
+    // though the approval channel above would happily grant it — because it
+    // doesn't match the next committed step.
+    await expect(producer.call('send_email', {})).rejects.toBeInstanceOf(UnplannedPrivilegedActionError);
+
+    // Export/restore across a simulated process boundary.
+    const wire: SerializedBrokerState = throughJSON(serializeBrokerState(producer));
+    const consumer = createBroker({ ...restoreBrokerState(wire), approvalChannel: alwaysApprove });
+    consumer.register(sendEmail());
+
+    // Re-declaring the same plan on the restored broker is impossible — the
+    // restored watermark is already non-CLEAN, so declarePlan() throws.
+    expect(() => consumer.declarePlan([{ toolName: 'some_other_tool' }])).toThrow(PlanNotDeclarableError);
+
+    // The IDENTICAL call that was blocked on producer now succeeds on
+    // consumer: restoreBrokerState() only restores the watermark and
+    // registry, never a declared plan — plan-freeze's extra protection is
+    // silently gone, not merely weaker, and there is no way to get it back
+    // once the state has been restored.
+    await expect(consumer.call('send_email', {})).resolves.toBe('sent');
   });
 });

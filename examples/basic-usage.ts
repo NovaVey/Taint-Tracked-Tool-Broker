@@ -8,7 +8,10 @@
  *   2. The same underlying attack, but paraphrased with zero literal
  *      overlap with the source -> still BLOCK (the load-bearing case,
  *      DESIGN.md §6.1 — this is what a fingerprint-only broker would miss).
- *   3. The sanctioned summarize() path landing at a lighter tier.
+ *   3. The sanctioned summarize() path: a mock quarantineImpl that actually
+ *      classifies the untrusted page (into a narrow, schema-enforced set of
+ *      outcomes) instead of just echoing a fixed value, landing at a
+ *      lighter tier without the injected instruction ever passing through.
  */
 
 import { createBroker, exactHash, ToolCallBlockedError, type QuarantineImpl, type ToolExecutor } from '../src/index.js';
@@ -80,13 +83,37 @@ async function section2_paraphraseBypass(): Promise<void> {
   }
 }
 
+// A narrow, pre-approved set of outcomes — not free text. This is the
+// actual safety property GAPS.md #4 names: a wide-open schema here would let
+// an injected payload ride through quarantine largely intact, since
+// DERIVED_UNTRUSTED policy is deliberately lighter than RAW_UNTRUSTED. An
+// enum-shaped schema like this one is what makes the tier downgrade below
+// actually mean something.
+const CONTENT_TOPICS = ['general-content', 'suspicious-content'] as const;
+type ContentTopic = (typeof CONTENT_TOPICS)[number];
+const topicSchema = {
+  parse(value: unknown): ContentTopic {
+    if (typeof value === 'string' && (CONTENT_TOPICS as readonly string[]).includes(value)) return value as ContentTopic;
+    throw new Error(`quarantine output "${String(value)}" is not one of the allowed topics`);
+  },
+};
+
 async function section3_sanctionedSummarize(): Promise<void> {
   console.log('\n=== 3. Sanctioned summarize() path ===');
 
-  // A real integration passes a capability-less LLM call here. This stub
-  // just returns a fixed, schema-shaped value to keep the example offline.
-  const quarantineImpl: QuarantineImpl = async (_text, opts) =>
-    (opts.schema ? opts.schema.parse('reviewed') : 'SUMMARY: reviewed') as never;
+  // A real integration passes a capability-less LLM call here — no tool
+  // access, no conversation history beyond `text`/`opts.instructions`
+  // (DESIGN.md §6.2). This mock simulates that shape realistically instead
+  // of just ignoring its input: it classifies `text` into one of the narrow
+  // set of topics above and deliberately never reproduces anything that
+  // reads like an embedded instruction — the same behavior a real LLM asked
+  // to classify (not repeat) the page would have. `opts.schema.parse()` is
+  // what actually enforces the narrow output shape here, same as it would
+  // against a real model's response.
+  const quarantineImpl: QuarantineImpl = async (text, opts) => {
+    const topic: ContentTopic = /curl|wget|rm -rf|\| ?sh\b/i.test(text) ? 'suspicious-content' : 'general-content';
+    return (opts.schema ? opts.schema.parse(topic) : topic) as never;
+  };
 
   const broker = createBroker({ quarantineImpl });
 
@@ -111,9 +138,9 @@ async function section3_sanctionedSummarize(): Promise<void> {
   const quarantined = await broker.summarize(MALICIOUS_PAGE, {
     sessionId: 'example-session',
     sourceTaintRecordId: record.id,
-    schema: { parse: (x) => x as string },
+    schema: topicSchema,
   });
-  console.log('quarantined result:', quarantined.text, '| scope watermark:', broker.scope.watermark.level);
+  console.log('quarantined result:', quarantined.text, '(the injected instruction never made it through) | scope watermark:', broker.scope.watermark.level);
 
   const result = await wrappedWrite.execute({ path: '/tmp/status.json', contents: quarantined.text });
   console.log('write_file result:', result, '(ALLOW_WITH_WARNING — never a silent clean allow)');
