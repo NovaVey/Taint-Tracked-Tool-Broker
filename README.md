@@ -93,6 +93,7 @@ npm test            # vitest (unit tests + the injection corpus)
 npm run corpus      # just the corpus, with a readable pass/fail table
 npm run build       # emit dist/
 npm run bench       # structuredClone vs jsonSafeClone args-cloning benchmark
+npm run bench:minhash  # why fixed-size MinHash sketches were investigated and NOT shipped for the registry (DESIGN.md)
 ```
 
 See [`CHANGELOG.md`](./CHANGELOG.md) for what's changed.

@@ -54,6 +54,7 @@
     "example:mcp": "tsx examples/mcp-integration.ts",
     "example:tool-loop": "tsx examples/anthropic-tool-loop.ts",
     "bench": "tsx bench/args-clone.ts",
+    "bench:minhash": "tsx bench/minhash-sketch-tradeoff.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
