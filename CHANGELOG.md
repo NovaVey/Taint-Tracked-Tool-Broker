@@ -4,6 +4,8 @@ All notable changes to this project are documented here. Format loosely follows 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-31
+
 ### Security
 
 A two-pass, multi-agent adversarial review (11 dimensions, then a second, deliberately different-in-kind 8 dimensions — active exploit construction, concurrency stress, DoS/resource-exhaustion among them) of the entire repository found three genuine critical-severity defects, all in `src/broker.ts`. None are content-matching evasions or gating-policy holes — like every prior review pass, they're correctness/robustness defects in code paths adjacent to the safety-critical ones, this time load-bearing enough to warrant this section rather than "Fixed" below. See DESIGN.md's own implementation notes (§ "a stale gating decision could still execute", § "one broker instance is one session") for the full before/after and the regression that caught a flawed first attempt at the fix.
