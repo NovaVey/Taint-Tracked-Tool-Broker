@@ -2106,6 +2106,110 @@ describe('allowedOutboundHosts (opt-in egress allowlist, DESIGN.md §7.4)', () =
       ).rejects.toBeInstanceOf(DisallowedOutboundHostError);
     });
   });
+
+  // BrokerOptions.warnOnLikelyDestinationKeysMismatch (broker.ts, GAPS.md
+  // #18's "destinationKeys assumes a fixed, singular destination key per
+  // tool" sub-bullet): a generic notify tool whose real destination-carrying
+  // argument name VARIES by call shape (here, `slackUrl` for one call,
+  // `emailAddress` for another) silently exempts whichever shape isn't named
+  // in `destinationKeys` from the allowlist entirely — this heuristic flags
+  // that, purely advisorially, without ever touching the gating decision.
+  describe('warnOnLikelyDestinationKeysMismatch (opt-in advisory heuristic, GAPS.md #18)', () => {
+    it('is off by default — a call whose real destination varies by call shape is not flagged, and still goes through exactly as it would without this heuristic', async () => {
+      const events: AuditEvent[] = [];
+      const broker = createBroker({
+        allowedOutboundHosts: ['approved.example'],
+        auditSink: { record: (e) => events.push(e) },
+      });
+      broker.register(netPost({ destinationKeys: ['slackUrl'] }));
+      // slackUrl (the ONLY declared destinationKeys entry) is allowlisted;
+      // emailAddress is this particular call's REAL destination but is
+      // never scanned, since it isn't a named key — exactly the gap this
+      // heuristic exists to surface.
+      const result = await broker.call('net_post', {
+        slackUrl: 'https://approved.example/hooks/1',
+        emailAddress: 'oncall@not-approved.example',
+      });
+      expect(result).toContain('posted:');
+      // The call's own gating decision is still audited regardless of this
+      // heuristic (every gated EXFIL call is — an unconditional ALLOW event
+      // here, unrelated to warnOnLikelyDestinationKeysMismatch); what this
+      // test asserts is that the heuristic itself contributes nothing extra
+      // while off.
+      expect(events.filter((e) => e.verdict.action === 'ALLOW_WITH_WARNING')).toEqual([]);
+    });
+
+    it('flags a URL/email destination found outside the declared destinationKeys subtree, naming its location, without changing the gating decision', async () => {
+      const events: AuditEvent[] = [];
+      const broker = createBroker({
+        allowedOutboundHosts: ['approved.example'],
+        warnOnLikelyDestinationKeysMismatch: true,
+        auditSink: { record: (e) => events.push(e) },
+      });
+      broker.register(netPost({ destinationKeys: ['slackUrl'] }));
+      const result = await broker.call('net_post', {
+        slackUrl: 'https://approved.example/hooks/1',
+        emailAddress: 'oncall@not-approved.example',
+      });
+      // Identical result to the "off by default" test above — same call,
+      // same outcome — the heuristic only ever adds ONE extra advisory
+      // audit event alongside the call's own (unconditional, unrelated)
+      // ALLOW event.
+      expect(result).toContain('posted:');
+      const warnings = events.filter((e) => e.verdict.action === 'ALLOW_WITH_WARNING');
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]?.call.toolName).toBe('net_post');
+      expect(warnings[0]?.executed).toBe(true);
+      expect(
+        warnings[0]?.verdict.action === 'ALLOW_WITH_WARNING' && warnings[0].verdict.reason,
+      ).toContain('emailAddress');
+    });
+
+    it('does not flag when every destination-shaped value in the call is already inside the declared destinationKeys subtree', async () => {
+      const events: AuditEvent[] = [];
+      const broker = createBroker({
+        allowedOutboundHosts: ['approved.example'],
+        warnOnLikelyDestinationKeysMismatch: true,
+        auditSink: { record: (e) => events.push(e) },
+      });
+      broker.register(netPost({ destinationKeys: ['slackUrl'] }));
+      await broker.call('net_post', {
+        slackUrl: 'https://approved.example/hooks/1',
+        channel: 'general', // not URL/email-shaped -> nothing outside to flag
+      });
+      expect(events.filter((e) => e.verdict.action === 'ALLOW_WITH_WARNING')).toEqual([]);
+    });
+
+    it('does not flag a tool with no destinationKeys declared at all', async () => {
+      const events: AuditEvent[] = [];
+      const broker = createBroker({
+        allowedOutboundHosts: ['approved.example'],
+        warnOnLikelyDestinationKeysMismatch: true,
+        auditSink: { record: (e) => events.push(e) },
+      });
+      broker.register(netPost()); // no destinationKeys declared
+      await broker.call('net_post', { url: 'https://approved.example/x' });
+      expect(events.filter((e) => e.verdict.action === 'ALLOW_WITH_WARNING')).toEqual([]);
+    });
+
+    it('never fires for a call the real allowlist gate already BLOCKed — only the one BLOCK AuditEvent is recorded', async () => {
+      const events: AuditEvent[] = [];
+      const broker = createBroker({
+        allowedOutboundHosts: ['approved.example'],
+        warnOnLikelyDestinationKeysMismatch: true,
+        auditSink: { record: (e) => events.push(e) },
+      });
+      broker.register(netPost({ destinationKeys: ['slackUrl'] }));
+      await expect(
+        broker.call('net_post', {
+          slackUrl: 'https://not-approved.example/hooks/1',
+          emailAddress: 'oncall@also-not-approved.example',
+        }),
+      ).rejects.toBeInstanceOf(DisallowedOutboundHostError);
+      expect(events).toHaveLength(1);
+      expect(events[0]?.verdict.action).toBe('BLOCK');
+    });
+  });
 });
 
 // Regression coverage for a real DoS shape: scanArgsForTaint()'s mandatory

@@ -100,13 +100,17 @@ export interface FindOutboundHostsOptions {
 
 /**
  * Recursively walks `args` (the same shape scanArgsForTaint's own walk in
- * scan.ts covers — arrays, plain objects, cyclic-safe) collecting a
+ * scan.ts covers — arrays, plain objects, Map/Set, cyclic-safe) collecting a
  * destination hostname for every genuine http(s) URL or email address found
- * among its string *values*. Deliberately does not also scan object *keys*
- * the way scanArgsForTaint does for taint text — a target URL/address
- * arriving as an object key rather than a value isn't a realistic shape for
- * how tool-call arguments carry one, so skipping it keeps this simpler
- * without giving up real coverage.
+ * among its string *values*. Deliberately does not also scan plain-object
+ * *keys* the way scanArgsForTaint does for taint text — a target URL/address
+ * arriving as a plain object's property name rather than its value isn't a
+ * realistic shape for how tool-call arguments carry one (property names are
+ * fixed, schema-defined identifiers), so skipping those keeps this simpler
+ * without giving up real coverage. A Map's keys ARE scanned, though — unlike
+ * a plain object's property name, a Map key is ordinary data just as
+ * plausible a place for a destination as its value slot is (see the Map
+ * branch in `visit()` below for the concrete shape this covers).
  *
  * By default every string leaf in the tree is a candidate (see this
  * module's header comment for why over-detection is an accepted, documented
@@ -149,6 +153,44 @@ export function findOutboundHosts(args: unknown, options?: FindOutboundHostsOpti
       for (const child of node) visit(child, depth + 1, scanning);
       return;
     }
+    // Map/Set hold their entries in an internal slot, not an own-enumerable
+    // property, so the generic Object.entries() fallback below returns
+    // nothing for either — a destination URL/email hidden inside one was
+    // completely invisible to this scan (no error, no ArgsTooDeepError trip,
+    // just silently zero hosts found), not merely deprioritized. This is not
+    // a theoretical gap: the broker's default cloneArgs is structuredClone,
+    // which preserves Map/Set/Date/typed arrays intact specifically because
+    // it's meant to (see broker.ts), so a tool's args snapshot can
+    // legitimately carry one. Mirrors taint/scan.ts's identical Map/Set
+    // branches (see its own, more detailed doc comment there for the same
+    // reasoning) — inserted in the same relative position, after the array
+    // check and before the generic-object fallback, so both branches below
+    // still go through visit() and get MAX_ARGS_TREE_DEPTH/visited-cycle
+    // protection uniformly, same as every other node shape.
+    if (node instanceof Map) {
+      // Unlike a plain object's property name — a fixed, schema-defined
+      // identifier, which is why this module's header comment says object
+      // KEYS are deliberately not scanned — a Map key is ordinary DATA, just
+      // as plausible a place for a tool to put a destination URL/email as
+      // the value slot (e.g. `new Map([['https://evil.example', 'primary']])`
+      // for a priority-ordered destination list keyed by URL). So both the
+      // key AND the value are visited here, mirroring scan.ts's own
+      // rationale for why it scans plain-object keys too, not just values.
+      // Scanning state is inherited by both, never re-scoped by either —
+      // same as an array element above, there's no destinationKeys-matchable
+      // key name for either half of a Map entry.
+      for (const [key, value] of node.entries()) {
+        visit(key, depth + 1, scanning);
+        visit(value, depth + 1, scanning);
+      }
+      return;
+    }
+    if (node instanceof Set) {
+      // Same rationale as the Map branch above, minus the key question — a
+      // Set only ever has values.
+      for (const value of node.values()) visit(value, depth + 1, scanning);
+      return;
+    }
     for (const [key, value] of Object.entries(node)) {
       // Once inside a matched destination key's subtree (scanning === true),
       // stay scanning regardless of nested key names — a destination value
@@ -166,6 +208,129 @@ export function findOutboundHosts(args: unknown, options?: FindOutboundHostsOpti
   // anywhere in the tree is a candidate, same as before this option existed.
   visit(args, 0, destinationKeySet === undefined);
   return hosts;
+}
+
+/**
+ * One URL/email-shaped string leaf found somewhere in a call's argument tree
+ * OUTSIDE every subtree named by a declared `destinationKeys` list — the
+ * shape `findOutboundDestinationsOutsideKeys` below produces, and the only
+ * shape `BrokerOptions.warnOnLikelyDestinationKeysMismatch` (`broker.ts`)
+ * consumes. Never produced by, or consumed on, the load-bearing
+ * `allowedOutboundHosts` gating path itself (`findOutboundHosts` above) —
+ * this exists purely to feed that separate, opt-in advisory heuristic.
+ */
+export interface OutOfScopeDestination {
+  /** The offending string leaf's own value, verbatim — a genuine http(s) URL or a well-formed email address, exactly what `asHttpUrl`/`asEmailDomain` above already detect. */
+  value: string;
+  /** Dotted/bracketed path into the argument object — the same convention `TaintMatch.argPath` (`types.ts`) and `scanArgsForTaint()` (`taint/scan.ts`) already use, e.g. `"body.text"`, `"recipients[1]"`, `"payload<Map>[0].value"`. */
+  path: string;
+}
+
+/**
+ * The advisory-only counterpart to `findOutboundHosts`'s own `destinationKeys`
+ * narrowing, built specifically for `BrokerOptions.warnOnLikelyDestinationKeysMismatch`
+ * (`broker.ts`) — see that option's own doc comment, and GAPS.md #18's
+ * "destinationKeys assumes a fixed, singular destination key per tool"
+ * sub-bullet, for the full motivation. In short: `ToolExecutor.destinationKeys`
+ * is documented (`types.ts`) as "a fixed property of that tool's own schema,
+ * not something that varies call to call" — but a real tool can still
+ * violate that assumption (a generic `notify` tool whose destination lives
+ * under `slackUrl` for one call shape and `emailAddress` for another). When
+ * it does, `findOutboundHosts(args, { destinationKeys: ['slackUrl'] })`
+ * doesn't get anything wrong for the subtree it looks at — it simply never
+ * visits `emailAddress` at all, since that key was never named. Because
+ * `allowedOutboundHosts` is often the SOLE check standing between an
+ * otherwise-policy-permissive (`CLEAN`) scope and an actual network egress,
+ * an under-declared `destinationKeys` here isn't a defense-in-depth loss —
+ * it can be a complete, silent removal of the only check, with nothing in
+ * the audit log hinting anything is missing.
+ *
+ * Where `findOutboundHosts(args, { destinationKeys })` scans ONLY the named
+ * keys' subtrees (the real, `BLOCK`-capable gate), this walks the identical
+ * tree in the opposite sense: it collects every genuine URL/email found
+ * OUTSIDE every declared key's subtree instead. Detection logic
+ * (`asHttpUrl`/`asEmailDomain`) and traversal shape (arrays, `Map`/`Set`,
+ * cyclic-safe via a fresh `WeakSet`, `MAX_ARGS_TREE_DEPTH`) deliberately
+ * mirror `findOutboundHosts`'s own `visit()` exactly — just inverted (collect
+ * while NOT in an in-scope subtree, instead of scan only while IN one) and
+ * path-tracking instead of hostname-collecting, since a bare hostname list
+ * (`findOutboundHosts`'s own return shape) can't name WHERE a mismatch
+ * actually is, which is the entire point of an advisory meant to help an
+ * integrator fix their `destinationKeys` declaration.
+ *
+ * Deliberately never called from the `allowedOutboundHosts` gating path
+ * itself — `broker.ts`'s `gateDecision()` only calls this from its separate,
+ * purely-advisory `warnOnLikelyDestinationKeysMismatch` block, strictly
+ * after the real gate above has already run and only when it did not
+ * `BLOCK`. A purely advisory heuristic must never itself decide, or even be
+ * positioned to accidentally influence, an actual block/allow verdict.
+ */
+export function findOutboundDestinationsOutsideKeys(
+  args: unknown,
+  destinationKeys: readonly string[],
+): OutOfScopeDestination[] {
+  const found: OutOfScopeDestination[] = [];
+  const visited = new WeakSet<object>();
+  const destinationKeySet = new Set(destinationKeys);
+
+  function destinationShaped(value: string): boolean {
+    return asHttpUrl(value) !== undefined || asEmailDomain(value) !== undefined;
+  }
+
+  // `scanning` means "already inside a declared destinationKeys subtree" —
+  // the exact inverse of what gets COLLECTED relative to findOutboundHosts's
+  // own `scanning` flag above: findOutboundHosts collects a match only while
+  // `scanning` is true (inside scope); this collects a match only while it
+  // is false (outside every declared subtree). Both otherwise mean the same
+  // thing and propagate identically — see findOutboundHosts's own `visit()`
+  // for the shared rationale behind each node-shape branch below.
+  function visit(node: unknown, path: string, depth: number, scanning: boolean): void {
+    if (depth > MAX_ARGS_TREE_DEPTH) throw new ArgsTooDeepError(MAX_ARGS_TREE_DEPTH);
+    if (node === null || node === undefined) return;
+    if (typeof node === 'string') {
+      if (!scanning && destinationShaped(node)) {
+        found.push({ value: node, path });
+      }
+      return;
+    }
+    if (typeof node !== 'object') return;
+    if (visited.has(node)) return;
+    visited.add(node);
+    if (Array.isArray(node)) {
+      node.forEach((child, i) => visit(child, `${path}[${i}]`, depth + 1, scanning));
+      return;
+    }
+    if (node instanceof Map) {
+      let i = 0;
+      for (const [key, value] of node.entries()) {
+        const entryPath = path ? `${path}<Map>[${i}]` : `<Map>[${i}]`;
+        visit(key, `${entryPath}.key`, depth + 1, scanning);
+        visit(value, `${entryPath}.value`, depth + 1, scanning);
+        i++;
+      }
+      return;
+    }
+    if (node instanceof Set) {
+      let i = 0;
+      for (const value of node.values()) {
+        visit(value, path ? `${path}<Set>[${i}]` : `<Set>[${i}]`, depth + 1, scanning);
+        i++;
+      }
+      return;
+    }
+    for (const [key, value] of Object.entries(node)) {
+      const childPath = path ? `${path}.${key}` : key;
+      const childScanning = scanning || destinationKeySet.has(key);
+      visit(value, childPath, depth + 1, childScanning);
+    }
+  }
+
+  // Root starts OUT of scope (false) — the exact mirror of findOutboundHosts's
+  // own scoped-scan starting point (destinationKeySet !== undefined there
+  // means it also starts `false`); only descending through a matched key
+  // switches a subtree in.
+  visit(args, '', 0, false);
+  return found;
 }
 
 /**

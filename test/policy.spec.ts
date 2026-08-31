@@ -19,8 +19,16 @@ function ctx(
   privateDataSeen: boolean,
   argFingerprintFloor: TaintLevel = 'CLEAN',
   matchedRecords: TaintMatch[] = [],
+  hasUnattributedSubstantialContent = false,
 ): TaintContext {
-  return { matchedRecords, scopeLevel, argFingerprintFloor, privateDataSeen, sinkClass };
+  return {
+    matchedRecords,
+    scopeLevel,
+    argFingerprintFloor,
+    privateDataSeen,
+    sinkClass,
+    hasUnattributedSubstantialContent,
+  };
 }
 
 async function decide(...args: Parameters<typeof ctx>): Promise<PolicyDecision['action']> {
@@ -28,12 +36,12 @@ async function decide(...args: Parameters<typeof ctx>): Promise<PolicyDecision['
   return d.action;
 }
 
-/** A minimal, otherwise-irrelevant TaintRecord for building TaintMatch fixtures below — every field the QUARANTINE_AND_RETRY eligibility check doesn't itself read is filled with an inert placeholder. */
-function record(level: TaintLevel, toolName = 'fetch_url'): TaintRecord {
+/** A minimal, otherwise-irrelevant TaintRecord for building TaintMatch fixtures below — every field the QUARANTINE_AND_RETRY eligibility check doesn't itself read is filled with an inert placeholder. `id` defaults to 'rec-1' (the original single-source fixture shape every pre-existing test in this file relies on); pass a distinct `id` to model TWO matches naming DIFFERENT underlying sources (the "different source records" decoy-match guard, see default-policy.ts's bestQuarantineCandidate()). */
+function record(level: TaintLevel, toolName = 'fetch_url', id = 'rec-1'): TaintRecord {
   return {
-    id: 'rec-1',
+    id,
     provenance: {
-      id: 'rec-1',
+      id,
       sourceCallId: 'call-1',
       toolName,
       sessionId: 's1',
@@ -41,7 +49,7 @@ function record(level: TaintLevel, toolName = 'fetch_url'): TaintRecord {
     },
     level,
     sensitivity: { containsPrivateData: false, categories: [] },
-    fingerprint: { exactHash: 'rec-1', simhash: 0n, shingleHashes: new Uint32Array(), length: 0 },
+    fingerprint: { exactHash: id, simhash: 0n, shingleHashes: new Uint32Array(), length: 0 },
     confidence: 1,
   };
 }
@@ -51,8 +59,10 @@ function match(
   score: number,
   level: TaintLevel = 'RAW_UNTRUSTED',
   argPath = 'cmd',
+  recordId = 'rec-1',
+  toolName = 'fetch_url',
 ): TaintMatch {
-  return { record: record(level), matchType, argPath, score };
+  return { record: record(level, toolName, recordId), matchType, argPath, score };
 }
 
 describe('defaultPolicy matrix (DESIGN.md §7.2)', () => {
@@ -217,6 +227,80 @@ describe('defaultPolicy matrix (DESIGN.md §7.2)', () => {
           match('exact', 1, 'DERIVED_UNTRUSTED'),
         ]),
       ).toBe('ALLOW_WITH_WARNING');
+    });
+
+    describe("decoy-match guards — bestQuarantineCandidate() must not treat an unrelated match as explaining THIS call's risk", () => {
+      // Reproduces the confirmed exploit from bestQuarantineCandidate()'s own
+      // doc comment: an EXEC call whose actual dangerous argument (`cmd`)
+      // matches nothing at all in the registry, sitting alongside a SECOND
+      // argument (`justification`) that happens to be an exact copy of some
+      // unrelated, previously-registered untrusted text. Pre-fix,
+      // matchedRecords held exactly one qualifying entry (the decoy) and
+      // bestQuarantineCandidate() picked it unconditionally, producing
+      // QUARANTINE_AND_RETRY with a reason naming the decoy's source as the
+      // "actionable fix" — completely unrelated to `cmd`, the argument that
+      // actually makes this call dangerous. This must resolve to the same
+      // plain BLOCK an EXEC/RAW_UNTRUSTED call gets with no candidate at all.
+      it('does NOT trigger when the only qualifying match is an unrelated decoy and the args carry substantial unmatched content elsewhere (the confirmed exploit)', async () => {
+        const decoyMatch = match(
+          'exact',
+          1,
+          'RAW_UNTRUSTED',
+          'justification',
+          'rec-1',
+          'fetch_benign',
+        );
+        const action = await decide(
+          'RAW_UNTRUSTED',
+          'EXEC',
+          false,
+          'CLEAN',
+          [decoyMatch],
+          // The real broker sets this from scanArgsForTaint() finding a
+          // substantial (>= 40 char) `cmd` string with zero matches of its
+          // own — modeled directly here since this is a unit test against a
+          // synthetic TaintContext, not the real scan.
+          true,
+        );
+        expect(action).toBe('BLOCK');
+      });
+
+      it('DOES still trigger for the identical decoy match when hasUnattributedSubstantialContent is false (matched content is genuinely the whole story)', async () => {
+        // Sanity check that the guard above is actually keyed off
+        // hasUnattributedSubstantialContent, not off argPath/toolName naming
+        // — same single decoy-shaped match, but nothing else in the (modeled)
+        // args tree is unaccounted for, so this is indistinguishable from an
+        // ordinary single-source positive case and must still qualify.
+        const decision = await defaultPolicy(
+          CALL,
+          ctx(
+            'RAW_UNTRUSTED',
+            'EXEC',
+            false,
+            'CLEAN',
+            [match('exact', 1, 'RAW_UNTRUSTED', 'justification', 'rec-1', 'fetch_benign')],
+            false,
+          ),
+        );
+        expect(decision.action).toBe('QUARANTINE_AND_RETRY');
+      });
+
+      it('does NOT trigger when qualifying matches name two DIFFERENT source records, even with no unattributed content', async () => {
+        const matchA = match('exact', 1, 'RAW_UNTRUSTED', 'body.a', 'rec-a', 'fetch_a');
+        const matchB = match('exact', 1, 'RAW_UNTRUSTED', 'body.b', 'rec-b', 'fetch_b');
+        const action = await decide('RAW_UNTRUSTED', 'MUTATE', false, 'CLEAN', [matchA, matchB]);
+        expect(action).toBe('REQUIRE_APPROVAL');
+      });
+
+      it('still resolves to a single candidate when two matches name the SAME source at different argPaths', async () => {
+        const matchA = match('exact', 1, 'RAW_UNTRUSTED', 'body.a');
+        const matchB = match('exact', 1, 'RAW_UNTRUSTED', 'body.b');
+        const decision = await defaultPolicy(
+          CALL,
+          ctx('RAW_UNTRUSTED', 'MUTATE', false, 'CLEAN', [matchA, matchB]),
+        );
+        expect(decision.action).toBe('QUARANTINE_AND_RETRY');
+      });
     });
   });
 });

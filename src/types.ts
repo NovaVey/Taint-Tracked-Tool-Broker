@@ -385,6 +385,49 @@ export interface TaintContext {
   argFingerprintFloor: TaintLevel;
   privateDataSeen: boolean;
   sinkClass: SinkClass;
+  /**
+   * Mirrors `taint/scan.ts`'s `ScanResult.hasUnattributedSubstantialContent`
+   * — see that field's own doc comment for the exact bar (a string leaf of
+   * at least `UNATTRIBUTED_CONTENT_MIN_LENGTH` chars with zero taint matches
+   * at all, not even a weak fuzzy one). `defaultPolicy`'s
+   * `bestQuarantineCandidate()` (`policy/default-policy.ts`) is this field's
+   * only reader: it withholds QUARANTINE_AND_RETRY when this is `true`,
+   * because a qualifying match sitting next to a chunk of text Layer 2 has
+   * no story for at all might be an unrelated decoy, not the actual reason
+   * this call is risky — see that function's doc comment for the concrete
+   * exploit this closes. Like `argFingerprintFloor`, this is a Layer 2
+   * signal a `PolicyFn` may read, but unlike it, this one never tightens
+   * anything on its own — it only ever narrows an already-permissive
+   * decision (offering the softer QUARANTINE_AND_RETRY verdict in place of
+   * BLOCK/REQUIRE_APPROVAL), never gates a call that would otherwise be
+   * ALLOWed. A hand-written `PolicyFn` that doesn't implement
+   * QUARANTINE_AND_RETRY at all is free to ignore this field entirely.
+   * Administrative `TaintContext`s built for non-sink audit events
+   * (`internal-audit.ts`'s `trivialTaintContext()`, `quarantine.ts`'s own
+   * audit records, `broker.ts`'s `auditArgsTooDeep()`) always set this
+   * `false` — honestly reflecting that no real args scan ran, the same
+   * convention those sites already use for `matchedRecords`/
+   * `argFingerprintFloor`.
+   *
+   * **Optional, not required — deliberately, for API stability.** Every
+   * `TaintContext` this library itself constructs (the broker's real
+   * dispatch path, both internal-audit call sites, both `quarantine.ts`
+   * sites) always sets this explicitly; it is typed optional only so a
+   * `TaintContext` object literal written before this field existed —
+   * plausibly, a hand-built fixture in a custom `PolicyFn`'s own test
+   * suite, since `TaintContext` is a public, integrator-facing parameter
+   * type (§7.3) — still type-checks unchanged after this field was added
+   * post-`1.0.0`. Per this project's versioning policy (README.md
+   * "Versioning"), a NEW REQUIRED field on an already-public interface is
+   * exactly the kind of shape change `1.0.0` commits to only ever doing
+   * behind a major bump; making it optional avoids that bump for what is,
+   * functionally, an additive Layer 2 signal. A reader must therefore treat
+   * `undefined` the same as `true` (the conservative direction — decline to
+   * offer `QUARANTINE_AND_RETRY`), never the same as `false`; see
+   * `bestQuarantineCandidate()`'s own `!== false` check for the concrete
+   * convention.
+   */
+  hasUnattributedSubstantialContent?: boolean;
 }
 
 export type PolicyDecision =
@@ -462,6 +505,27 @@ export interface AuditEvent {
 }
 
 export interface AuditSink {
+  /**
+   * **`event` is not naturally JSON-safe — do not hand it straight to
+   * `JSON.stringify()` (directly, or via a JSON-based log shipper: pino,
+   * Winston-JSON, a Datadog/CloudWatch agent).** When `event.taint.matchedRecords`
+   * is non-empty — the ordinary, expected case for a real fuzzy- or
+   * exact-matched attack, not an edge case — each entry's `record.fingerprint`
+   * (`Fingerprint`, above) carries `simhash: bigint` and
+   * `shingleHashes: Uint32Array`. `JSON.stringify` THROWS on a `bigint`
+   * (`TypeError: Do not know how to serialize a BigInt`) and silently
+   * mangles a `Uint32Array` into a plain index-keyed object — so the single
+   * most obvious `AuditSink` implementation, `record(e) { console.log(JSON.stringify(e)) }`,
+   * crashes on the very first audited event that carries a fuzzy-matched
+   * record. Use `serializeAuditEvent()` (`src/persistence.ts`) first —
+   * `JSON.stringify(serializeAuditEvent(event))` — which converts exactly
+   * these two fields to JSON-safe forms (a decimal string, a plain number
+   * array) via the same conversion `serializeRegistry()` already uses for a
+   * `TaintRecord` exported for cross-process persistence (GAPS.md #12);
+   * everything else on `AuditEvent` is already plain JSON-safe data. This is
+   * purely a converter an integrator opts into inside their own
+   * `record()` — `AuditEvent`'s own shape is unchanged.
+   */
   record(event: AuditEvent): void;
 }
 

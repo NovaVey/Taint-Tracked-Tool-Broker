@@ -26,6 +26,23 @@
  * content — that still requires the receiving side to actually restore and
  * use this state (or to call `markContextExposure()` itself).
  *
+ * A third, narrower JSON-safety gotcha shares this file's fingerprint
+ * conversion but is NOT about crossing a process boundary at all:
+ * `AuditEvent.taint.matchedRecords[].record.fingerprint` (`types.ts`) can
+ * carry the exact same `bigint`/`Uint32Array` fields the moment a gated
+ * call's arguments fuzzy- or exact-match a previously-registered record —
+ * which is precisely the ordinary, expected case for a real attack, not an
+ * edge case. The single most obvious thing an integrator does with
+ * `AuditSink.record(event)` — hand `event` to `JSON.stringify` directly, or
+ * to any JSON-based log shipper (pino, Winston-JSON, a Datadog/CloudWatch
+ * agent) — THROWS (`TypeError: Do not know how to serialize a BigInt`) on
+ * the very first audited event carrying a fuzzy-matched record, not merely
+ * mangles it the way `shingleHashes` alone would. `serializeAuditEvent()`
+ * below closes this the same way `serializeRegistry()` closes it for a
+ * registry export, reusing the identical per-record conversion (see
+ * `AuditSink`'s own doc comment in `types.ts` for the integrator-facing
+ * warning this fixes).
+ *
  * A declared plan (`broker.declarePlan()`, DESIGN.md §11) DOES survive
  * `serializeBrokerState()`/`restoreBrokerState()`, including the exact
  * cursor position it was at when exported — see
@@ -58,8 +75,11 @@
  */
 
 import type {
+  AuditEvent,
   PlanState,
   PlanStep,
+  TaintContext,
+  TaintMatch,
   TaintRecord,
   TaintRegistry,
   TaintWatermark,
@@ -314,9 +334,22 @@ function validateSerializedBrokerState(state: SerializedBrokerState): void {
   }
 }
 
-/** Exports every record in `registry` to a JSON-safe array. Counterpart: restoreRegistry(). */
-export function serializeRegistry(registry: TaintRegistry): SerializedTaintRecord[] {
-  return registry.entries().map((record) => ({
+/**
+ * Converts one `TaintRecord` to its JSON-safe `SerializedTaintRecord` shape —
+ * the one place that actually knows how to turn `fingerprint.simhash`
+ * (`bigint`) and `fingerprint.shingleHashes` (`Uint32Array`) into JSON-safe
+ * values. Factored out of `serializeRegistry()` (the original, and still the
+ * primary, caller) so `serializeAuditEvent()` below can reuse the identical
+ * conversion for a `TaintRecord` reached via `AuditEvent.taint.matchedRecords`
+ * instead of via `TaintRegistry.entries()`, rather than a second,
+ * independently-maintained copy of the same three-field mapping drifting out
+ * of sync with this one. Not exported: both public entry points below take a
+ * whole registry or a whole event, matching every other function in this
+ * file, so there is no call site that needs a single record's conversion on
+ * its own.
+ */
+function serializeTaintRecord(record: TaintRecord): SerializedTaintRecord {
+  return {
     ...record,
     fingerprint: {
       exactHash: record.fingerprint.exactHash,
@@ -324,7 +357,83 @@ export function serializeRegistry(registry: TaintRegistry): SerializedTaintRecor
       shingleHashes: Array.from(record.fingerprint.shingleHashes),
       length: record.fingerprint.length,
     },
-  }));
+  };
+}
+
+/** Exports every record in `registry` to a JSON-safe array. Counterpart: restoreRegistry(). */
+export function serializeRegistry(registry: TaintRegistry): SerializedTaintRecord[] {
+  return registry.entries().map(serializeTaintRecord);
+}
+
+/** JSON-safe encoding of a `TaintMatch` — same idea as `SerializedTaintRecord`, one level up: only `record` needs conversion, `matchType`/`argPath`/`score` are already JSON-safe. */
+export interface SerializedTaintMatch extends Omit<TaintMatch, 'record'> {
+  record: SerializedTaintRecord;
+}
+
+/**
+ * JSON-safe encoding of an `AuditEvent` — see this file's header for why
+ * this is needed at all: `event.taint.matchedRecords[].record.fingerprint`
+ * carries the same non-JSON-safe `simhash`/`shingleHashes` fields
+ * `SerializedTaintRecord` exists to convert, and unlike the registry-export
+ * path above, an `AuditEvent` reaches an integrator's own `AuditSink`
+ * whether or not they ever call `serializeRegistry()`/`serializeBrokerState()`
+ * at all — every gated call produces one. Every other `AuditEvent` field
+ * (`verdict`, `call.id`/`toolName`/`sessionId`, `taint.scopeLevel`/
+ * `argFingerprintFloor`/`privateDataSeen`/`sinkClass`/
+ * `hasUnattributedSubstantialContent`, `at`, `executed`) is already a plain
+ * string/number/boolean/plain-object value with no conversion need — see
+ * `types.ts`'s `AuditEvent`/`TaintContext`/`ToolCall`/`PolicyDecision` for
+ * the full shape. `call.args` is deliberately left untouched: it is
+ * `unknown`, under the calling integrator's own tool's control, not this
+ * library's — the same reasoning `BrokerOptions.cloneArgs`/
+ * `NonCloneableArgsError` (`json-safe-clone.ts`) already applies to it
+ * elsewhere; an integrator whose own tool args carry a non-JSON-safe value
+ * needs their own handling for that, orthogonal to the gotcha this function
+ * closes.
+ */
+export interface SerializedAuditEvent extends Omit<AuditEvent, 'taint'> {
+  taint: Omit<TaintContext, 'matchedRecords'> & { matchedRecords: SerializedTaintMatch[] };
+}
+
+/**
+ * Converts `event` into a JSON-safe `SerializedAuditEvent` — the fix for the
+ * confirmed production footgun this file's header describes: `AuditSink`'s
+ * own doc comment (`types.ts`) documents `JSON.stringify(event)` as unsafe
+ * and points here. Typical use, mirroring `serializeRegistry()`'s own
+ * `JSON.stringify(state)` idiom above:
+ *
+ *   const auditSink: AuditSink = {
+ *     record(event) {
+ *       console.log(JSON.stringify(serializeAuditEvent(event)));
+ *     },
+ *   };
+ *
+ * Deliberately returns a JSON-safe VALUE, not an already-stringified
+ * `string` — consistent with `serializeRegistry()`/`serializeBrokerState()`
+ * above, which do the same and leave the actual `JSON.stringify()` call to
+ * the caller. That keeps this useful beyond a bare `console.log`: a caller
+ * that wants pretty-printing (`JSON.stringify(x, null, 2)`), a replacer, or
+ * to hand the object to a structured (not string) log sink can do so without
+ * an unnecessary stringify-then-reparse round trip.
+ *
+ * Purely a converter — never mutates `event`, never touches the broker,
+ * registry, or watermark, and (unlike `serializeRegistry()`/
+ * `restoreRegistry()`) has no restore-side counterpart: an `AuditEvent` is a
+ * one-way, write-only log record, not state a broker is ever reconstructed
+ * from, so there is nothing to round-trip back INTO a `TaintRecord`/
+ * `TaintRegistry` the way `restoreRegistry()` does for a genuine export.
+ */
+export function serializeAuditEvent(event: AuditEvent): SerializedAuditEvent {
+  return {
+    ...event,
+    taint: {
+      ...event.taint,
+      matchedRecords: event.taint.matchedRecords.map((match) => ({
+        ...match,
+        record: serializeTaintRecord(match.record),
+      })),
+    },
+  };
 }
 
 /**
