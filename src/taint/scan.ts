@@ -19,7 +19,56 @@ export interface ScanResult {
   matches: TaintMatch[];
   /** Union of every matched record's level — floors (never lowers) a policy verdict. */
   floor: TaintLevel;
+  /**
+   * True when at least one string leaf in the scanned args tree is at or
+   * above `UNATTRIBUTED_CONTENT_MIN_LENGTH` chars and produced NO taint
+   * match at all — not `exact`, not even a below-threshold `fuzzy` one that
+   * `lookupFuzzy()` itself declined to return. This is a narrower, weaker
+   * question than `floor`/`matches`: it says nothing about whether the SCOPE
+   * is tainted (that's the watermark's job, §4.1, never this scan's), only
+   * whether THIS call's own arguments contain a chunk of text Layer 2 has no
+   * story for at all.
+   *
+   * Exists for exactly one consumer: `defaultPolicy`'s
+   * `bestQuarantineCandidate()` (`policy/default-policy.ts`), which uses it
+   * to withhold QUARANTINE_AND_RETRY confidence when a qualifying match
+   * might be an unrelated decoy sitting alongside genuinely dangerous but
+   * untraceable content elsewhere in the same call's argument tree — see
+   * that function's own doc comment for the exact exploit this closes and
+   * why a fingerprint match's mere PRESENCE in the tree was never sufficient
+   * evidence that it explains the call's actual risk. Never itself gates or
+   * tightens anything the way `floor` does — a call with unattributed
+   * substantial content is not thereby more suspicious than the watermark
+   * already says it is; it only means Layer 2 cannot vouch for the WHOLE
+   * picture, so a feature that both replaces a BLOCK/REQUIRE_APPROVAL
+   * verdict AND names a specific "fix this" source should decline rather
+   * than guess.
+   */
+  hasUnattributedSubstantialContent: boolean;
 }
+
+/**
+ * The length (chars) a string leaf must reach before its complete absence
+ * from every taint match (`exact` and `fuzzy` both empty) counts as
+ * "unattributed substantial content" (`ScanResult.hasUnattributedSubstantialContent`
+ * above) rather than being ignored as a short, structurally-necessary field
+ * — a file path, a recipient address, an id, a URL used as a plain
+ * identifier. Every one of those appears, unmatched, in at least one of the
+ * shipped QUARANTINE_AND_RETRY corpus/unit-test positive cases (a
+ * `write_file` call's `path`, a `send_email` call's `to`) sitting right next
+ * to the argument that actually carries the matched untrusted content; a
+ * threshold of 0 (treating ANY unmatched leaf as disqualifying) would make
+ * `bestQuarantineCandidate()` reject those too, which would defeat the
+ * feature entirely rather than close the decoy-match hole it's meant to
+ * close. 40 deliberately reuses the same rough magnitude this codebase
+ * already treats as "not a trivial short field" elsewhere (see
+ * `corpus/cases.ts`'s own `QUOTED_EXCERPT_EMAIL_BODY` comment, "a >40-char
+ * quoted excerpt") rather than inventing an unrelated number — it comfortably
+ * clears realistic path/id/email/short-URL fields while still catching a
+ * realistic unmatched instruction or command string sitting in a sibling
+ * argument.
+ */
+const UNATTRIBUTED_CONTENT_MIN_LENGTH = 40;
 
 // Bounds the final ScanResult.matches array size across an entire args tree
 // (many string leaves, each potentially contributing several fuzzy matches).
@@ -44,6 +93,7 @@ const MAX_ARGS_TREE_DEPTH = 500;
 export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanResult {
   const matches: TaintMatch[] = [];
   let floor: TaintLevel = 'CLEAN';
+  let hasUnattributedSubstantialContent = false;
   const bump = (level: TaintLevel): void => {
     floor = maxLevel(floor, level);
   };
@@ -65,6 +115,15 @@ export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanRe
     for (const match of fuzzy) {
       matches.push({ ...match, argPath: path });
       bump(match.record.level);
+    }
+    // See ScanResult.hasUnattributedSubstantialContent's own doc comment for
+    // why this is length-gated rather than firing on any unmatched leaf, and
+    // why "no fuzzy match at all" (as opposed to "no QUALIFYING fuzzy match")
+    // is the right bar here: a leaf with a weak fuzzy hit still has SOME
+    // Layer 2 story, however thin, whereas zero hits means the registry has
+    // no candidate explanation for this text whatsoever.
+    if (!exact && fuzzy.length === 0 && text.length >= UNATTRIBUTED_CONTENT_MIN_LENGTH) {
+      hasUnattributedSubstantialContent = true;
     }
   }
 
@@ -177,5 +236,5 @@ export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanRe
     );
     matches.length = MAX_SCAN_MATCHES;
   }
-  return { matches, floor };
+  return { matches, floor, hasUnattributedSubstantialContent };
 }

@@ -64,6 +64,7 @@ export function trivialTaintContext(scope: {
     argFingerprintFloor: 'CLEAN',
     privateDataSeen: scope.privateDataSeen,
     sinkClass: 'NONE',
+    hasUnattributedSubstantialContent: false,
   };
 }
 

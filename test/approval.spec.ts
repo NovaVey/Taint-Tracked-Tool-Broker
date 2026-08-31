@@ -59,6 +59,7 @@ function fixtureTaint(): TaintContext {
     argFingerprintFloor: 'CLEAN',
     privateDataSeen: false,
     sinkClass: 'NONE',
+    hasUnattributedSubstantialContent: false,
   };
 }
 function fixtureDecision(approvalToken: string): RequireApprovalDecision {

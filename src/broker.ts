@@ -42,7 +42,12 @@ import {
   raiseWatermark,
 } from './taint/scope.js';
 import { scanArgsForTaint } from './taint/scan.js';
-import { findOutboundHosts, isAllowedOutboundHost } from './taint/egress.js';
+import {
+  findOutboundDestinationsOutsideKeys,
+  findOutboundHosts,
+  isAllowedOutboundHost,
+  type OutOfScopeDestination,
+} from './taint/egress.js';
 import { exactHash, toRegistrableText } from './taint/fingerprint.js';
 import { defaultPolicy } from './policy/default-policy.js';
 import { createQuarantine, unconfiguredQuarantineImpl } from './quarantine.js';
@@ -221,6 +226,49 @@ export interface BrokerOptions {
    * sets your own (case-insensitive substring match against the tool name).
    */
   warnOnLikelyUnclassifiedSink?: boolean | readonly string[];
+  /**
+   * Opt-in advisory heuristic for GAPS.md #18's "destinationKeys assumes a
+   * fixed, singular destination key per tool" sub-bullet, mirroring
+   * `warnOnLikelyUnmarkedSource`/`warnOnLikelyUnclassifiedSink` above:
+   * `ToolExecutor.destinationKeys` (`types.ts`) is documented as "a fixed
+   * property of that tool's own schema, not something that varies call to
+   * call" — but a real tool can still violate that assumption (a generic
+   * `notify` tool whose destination lives under `slackUrl` for one call
+   * shape and `emailAddress` for another). When it does,
+   * `destinationKeys: ['slackUrl']` doesn't just narrow the scan
+   * imperfectly — it silently EXEMPTS every call shaped the other way from
+   * the allowlist entirely, since `findOutboundHosts` was never asked to
+   * look at `emailAddress` in the first place. Because `allowedOutboundHosts`
+   * is often the SOLE check standing between an otherwise-policy-permissive
+   * (`CLEAN`) scope and a real network egress, this isn't a defense-in-depth
+   * loss like an ordinary false negative — it can be a complete, silent
+   * removal of the only check, with nothing in the audit log hinting
+   * anything is missing.
+   *
+   * When enabled, every call to a tool that declares a non-empty
+   * `destinationKeys` AND that has already cleared the `allowedOutboundHosts`
+   * gate above (i.e. did NOT throw `DisallowedOutboundHostError` — a call
+   * that was already BLOCKed already has its own `BLOCK` `AuditEvent`; this
+   * only adds context to a call that got past that check) is additionally
+   * scanned, via `findOutboundDestinationsOutsideKeys` (`taint/egress.ts`),
+   * for a URL- or email-shaped string ANYWHERE in its argument tree OUTSIDE
+   * every subtree named by `destinationKeys`. If one is found, an
+   * `ALLOW_WITH_WARNING` `AuditEvent` names it — the exact argument path and
+   * the offending value — without changing anything about what actually
+   * happened: not the gating decision this call already received, not
+   * `destinationKeys` itself, nothing. Purely advisory, exactly like its two
+   * siblings, and subject to the identical over-detection tradeoff
+   * `findOutboundHosts`'s own header comment names for the whole-tree
+   * default scan: a benign field that merely happens to contain, in its
+   * entirety, a URL or email address (unrelated to this tool's real
+   * destination) can false-positive here too — that is the cost of a
+   * heuristic that can't know a field's true role any better than
+   * `findOutboundHosts` itself can, only where to point a human to check.
+   * Off by default; only ever consulted when `allowedOutboundHosts` is also
+   * configured, mirroring `destinationKeys` itself being "inert otherwise"
+   * (`types.ts`'s own doc comment on that field).
+   */
+  warnOnLikelyDestinationKeysMismatch?: boolean;
 }
 
 const DEFAULT_UNMARKED_SOURCE_WARN_THRESHOLD = 200;
@@ -269,6 +317,7 @@ class Broker implements ToolCallBroker {
   private readonly allowedOutboundHosts:
     readonly string[] | ((hostname: string) => boolean) | undefined;
   private readonly warnOnLikelyUnclassifiedSink: readonly string[] | undefined;
+  private readonly warnOnLikelyDestinationKeysMismatch: boolean;
   private readonly tools = new Map<string, ToolExecutor>();
   private currentScope: TaintScope;
 
@@ -332,6 +381,7 @@ class Broker implements ToolCallBroker {
             opts.warnOnLikelyUnclassifiedSink === undefined
           ? undefined
           : opts.warnOnLikelyUnclassifiedSink;
+    this.warnOnLikelyDestinationKeysMismatch = opts.warnOnLikelyDestinationKeysMismatch === true;
     this.registry = opts.registry ?? new InMemoryTaintRegistry();
     this.currentScope = createScope(this.resetScopeMode, this.sessionId);
     if (opts.initialWatermark) {
@@ -712,13 +762,17 @@ class Broker implements ToolCallBroker {
 
   /** Builds a fresh TaintContext from the CURRENT watermark — the same shape captured once at the top of the (former) gated dispatch path, now re-derivable on demand so it can be recomputed after an async gap. */
   private buildTaintContext(argsSnapshot: unknown, sinkClass: SinkClass): TaintContext {
-    const { matches, floor } = scanArgsForTaint(argsSnapshot, this.registry);
+    const { matches, floor, hasUnattributedSubstantialContent } = scanArgsForTaint(
+      argsSnapshot,
+      this.registry,
+    );
     return {
       matchedRecords: matches,
       scopeLevel: this.currentScope.watermark.level,
       argFingerprintFloor: floor,
       privateDataSeen: this.currentScope.watermark.privateDataSeen,
       sinkClass,
+      hasUnattributedSubstantialContent,
     };
   }
 
@@ -876,6 +930,52 @@ class Broker implements ToolCallBroker {
         });
         throw new DisallowedOutboundHostError(toolName, disallowedHosts);
       }
+
+      // Opt-in, purely advisory (GAPS.md #18's "destinationKeys assumes a
+      // fixed, singular destination key per tool" sub-bullet): only reached
+      // once this call has already cleared the real gate above (a BLOCKed
+      // call already threw and got its own BLOCK AuditEvent above — this
+      // never re-audits that), and only when the registered tool actually
+      // declared a non-empty destinationKeys — a tool with none already gets
+      // findOutboundHosts()'s original whole-tree scan, so there is no
+      // "outside the declared path" for a real destination to hide in. See
+      // BrokerOptions.warnOnLikelyDestinationKeysMismatch's own doc comment
+      // for the full motivation (a generic `notify` tool whose destination
+      // key varies by call shape) and findOutboundDestinationsOutsideKeys()'s
+      // (taint/egress.ts) for exactly what this scans and why it needs its
+      // own tree walk rather than reusing `hosts` above.
+      if (
+        this.warnOnLikelyDestinationKeysMismatch &&
+        tool.destinationKeys !== undefined &&
+        tool.destinationKeys.length > 0
+      ) {
+        let outOfScope: OutOfScopeDestination[];
+        try {
+          // Defensive, not currently reachable via this call path — same
+          // reasoning as the `hosts` scan above: this walks the SAME
+          // argsSnapshot at the SAME depth bound (500), so a tree deep
+          // enough to make THIS throw would already have made the earlier
+          // buildTaintContext()/findOutboundHosts() calls throw first.
+          outOfScope = findOutboundDestinationsOutsideKeys(argsSnapshot, tool.destinationKeys);
+        } catch (error) {
+          if (error instanceof ArgsTooDeepError) this.auditArgsTooDeep(call, sinkClass, error);
+          throw error;
+        }
+        if (outOfScope.length > 0) {
+          const first = outOfScope[0]!;
+          const more = outOfScope.length > 1 ? `, and ${outOfScope.length - 1} more` : '';
+          recordTrivialAudit(
+            this.auditSink,
+            {
+              action: 'ALLOW_WITH_WARNING',
+              reason: `Advisory: tool "${toolName}" declares destinationKeys ${JSON.stringify(tool.destinationKeys)}, but this call's arguments also contain what looks like a destination (a URL or email address) OUTSIDE every declared key's subtree, at "${first.path}" ("${first.value}"${more}). If this tool's real destination-carrying argument name varies by call shape (GAPS.md #18), BrokerOptions.allowedOutboundHosts may be silently NOT scanning this call's actual destination — this warning never changes the gating decision or destinationKeys itself.`,
+            },
+            call,
+            this.currentScope.watermark,
+            true,
+          );
+        }
+      }
     }
 
     const decision = await this.policy(call, taint);
@@ -900,6 +1000,7 @@ class Broker implements ToolCallBroker {
       argFingerprintFloor: 'CLEAN',
       privateDataSeen: this.currentScope.watermark.privateDataSeen,
       sinkClass,
+      hasUnattributedSubstantialContent: false,
     };
     this.auditSink.record({
       verdict: { action: 'BLOCK', reason: error.message },
