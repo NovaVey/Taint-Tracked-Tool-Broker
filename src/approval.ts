@@ -19,6 +19,46 @@
  */
 
 import type { ApprovalChannel, RequireApprovalDecision, TaintContext, ToolCall } from './types.js';
+import { TaintBrokerError } from './errors.js';
+
+/**
+ * Thrown by `createDeferredApprovalChannel()`'s `requestApproval()` when
+ * `decision.approvalToken` is already in use by another request still
+ * awaiting resolution.
+ *
+ * `pending` is keyed by `approvalToken` alone, and nothing in this module
+ * generates that token — it comes from whatever `PolicyFn` produced the
+ * `RequireApprovalDecision` (see `types.js`'s doc comment on
+ * `RequireApprovalDecision.approvalToken`). A single shared
+ * `DeferredApprovalChannel` is a natural pattern for e.g. one human-approval
+ * queue serving multiple `ToolCallBroker` instances, and a custom
+ * `PolicyFn`'s token generation is not guaranteed globally unique across all
+ * of them. Silently overwriting the colliding map entry (the pre-fix
+ * behavior) would orphan the earlier request forever: its `settle` closure
+ * becomes unreachable, so neither `resolve()` nor a configured `timeoutMs`
+ * can ever settle its promise again — a permanent hang with no error and no
+ * audit trail. Matching this project's fail-loud philosophy elsewhere
+ * (`NonCloneableArgsError`, `ReservedToolNameError`, etc. in errors.ts),
+ * this fails loud at the moment of collision instead, while the FIRST
+ * request's entry is still untouched in `pending` and can still be resolved
+ * normally by whoever holds its token.
+ *
+ * If you hit this in practice, make sure your `PolicyFn`'s approval-token
+ * generation is actually collision-resistant (a UUID or similarly
+ * high-entropy value) — see DESIGN.md §7's note on `RequireApprovalDecision`.
+ */
+export class DuplicateApprovalTokenError extends TaintBrokerError {
+  constructor(approvalToken: string) {
+    super(
+      `createDeferredApprovalChannel(): a request for approvalToken "${approvalToken}" is already pending. ` +
+        'Two concurrent requestApproval() calls used the same token, which would otherwise silently orphan the ' +
+        "earlier request's promise (it can never be resolved or timed out again once its map entry is " +
+        'overwritten). Make sure your PolicyFn generates a collision-resistant approvalToken (e.g. a UUID) — ' +
+        'especially important if multiple ToolCallBroker instances share one DeferredApprovalChannel.',
+    );
+    this.name = 'DuplicateApprovalTokenError';
+  }
+}
 
 export interface DeferredApprovalChannel extends ApprovalChannel {
   /**
@@ -75,6 +115,18 @@ export function createDeferredApprovalChannel(
       decision: RequireApprovalDecision,
     ): Promise<boolean> {
       return new Promise<boolean>((resolvePromise) => {
+        // Fail loud on a token collision rather than silently overwriting
+        // an in-flight request's map entry below — see
+        // DuplicateApprovalTokenError's doc comment for why an overwrite
+        // would permanently orphan the earlier request. Thrown here,
+        // synchronously inside the executor, this simply rejects THIS
+        // call's returned promise (standard Promise-executor semantics) —
+        // the colliding earlier entry in `pending` is left completely
+        // untouched, so it can still be resolved normally.
+        if (pending.has(decision.approvalToken)) {
+          throw new DuplicateApprovalTokenError(decision.approvalToken);
+        }
+
         let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
         const settle = (granted: boolean): void => {
           if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
@@ -83,7 +135,19 @@ export function createDeferredApprovalChannel(
         };
         pending.set(decision.approvalToken, settle);
         opts.onPending?.(decision.approvalToken, call, taint, decision);
-        if (opts.timeoutMs !== undefined) {
+        // onPending() may synchronously resolve this very request (e.g. an
+        // integrator's auto-approval rule calling channel.resolve() before
+        // its own callback returns) — settle() then runs to completion,
+        // including pending.delete(), before timeoutHandle has even been
+        // assigned below. Unconditionally scheduling the timeout in that
+        // case would leak a live setTimeout that nothing can ever clear
+        // (settle()'s own clearTimeout(timeoutHandle) guard had nothing to
+        // clear when it ran), holding the event loop open for the full
+        // duration for no purpose. pending.has(...) reflects exactly
+        // whether that already happened: only this call's own settle()
+        // could have deleted this token (collisions are rejected above),
+        // so its absence here means this request already settled.
+        if (opts.timeoutMs !== undefined && pending.has(decision.approvalToken)) {
           timeoutHandle = setTimeout(() => settle(false), opts.timeoutMs);
         }
       });

@@ -24,6 +24,20 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
+      # Everything above/below this line exercises src/ TypeScript through
+      # either tsc's *type checker* (typecheck) or esbuild's transpilation
+      # (vitest/tsx, for test/corpus) — never the actual JavaScript tsc
+      # emits into dist/, which is the exact thing `npm publish` ships.
+      # This step closes that gap: it loads dist/index.js with Node's own
+      # ESM loader (no transpiler in between) and runs one real gated call
+      # through it, so a regression confined to tsc's emit can't reach npm
+      # invisibly. See scripts/smoke-test-dist.mjs's header for the full
+      # rationale, and GAPS.md's CI-coverage entry. Run across the whole
+      # Node matrix, not just one version, since the thing under test here
+      # is specifically "does compiled dist/ load and run correctly under
+      # Node's ESM loader" — that is exactly the kind of behavior that can
+      # legitimately vary by Node version, unlike the coverage job below.
+      - run: node scripts/smoke-test-dist.mjs
       - run: npm test
       - run: npm run corpus
 

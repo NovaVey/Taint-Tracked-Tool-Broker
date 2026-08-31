@@ -229,6 +229,58 @@ describe('ToolCallBroker.call()', () => {
     expect(broker.scope.watermark.privateDataSeen).toBe(true);
   });
 
+  it('a tool that is BOTH an untrusted source AND a private-data reader joins both escalator reasons into one audit event, and registers the private-data sensitivity on the resulting TaintRecord', async () => {
+    // This tool sits at the intersection of two independent escalator
+    // triggers in finishDispatch()'s NONE-sinkClass advisory-audit block:
+    // isUntrustedSource(tool) and tool.capabilities.readsPrivateData. Each
+    // trigger pushes its own sentence onto a shared `reasons` array that is
+    // then joined with ' ' — a regression that turned that `if`/`if` pair
+    // into an `if`/`else if` (or that otherwise let one branch overwrite the
+    // other, e.g. by reassigning `reason` instead of pushing) would still
+    // leave watermark.privateDataSeen true (the assertion above), so it
+    // would sail through the whole suite undetected without a test that
+    // actually inspects the joined audit text. Same intersection also drives
+    // applyPostExecutionEffects()'s sensitivity derivation: a source tool's
+    // content is only registered with sensitivity:{containsPrivateData:true,
+    // categories:[...]} instead of the default NOT_SENSITIVE when the
+    // *source* tool itself also declares readsPrivateData (§4.2) — that
+    // branch is unreachable by isSource:true alone, and registry.spec.ts's
+    // own direct registry.register() tests never exercise this broker-level
+    // derivation, so it needs its own broker.call()-driven check here too.
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    const secret = 'sk-live-doubly-tainted';
+    broker.register({
+      name: 'read_creds_untrusted',
+      capabilities: { capabilities: [], readsPrivateData: { categories: ['credentials'] } },
+      isSource: true, // not trusted — an untrusted source AND a private-data reader at once
+      async execute() {
+        return secret;
+      },
+    });
+
+    await broker.call('read_creds_untrusted', {});
+
+    expect(broker.scope.watermark.privateDataSeen).toBe(true);
+    expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+
+    // (1) The escalator-advisory audit reason must contain BOTH sentences,
+    // proving neither trigger silently clobbered the other.
+    expect(events).toHaveLength(1);
+    const reason =
+      (events[0]?.verdict.action === 'ALLOW_WITH_WARNING' && events[0].verdict.reason) || '';
+    expect(reason).toContain('untrusted source call raised the scope watermark to RAW_UNTRUSTED.');
+    expect(reason).toContain('private data was read this scope (lethal-trifecta escalator, §3.2).');
+
+    // (2) The TaintRecord applyPostExecutionEffects() registered for this
+    // source's content must carry the private-data sensitivity derived from
+    // the SAME tool's readsPrivateData declaration, not the NOT_SENSITIVE
+    // default that isUntrustedSource-only sources get.
+    const record = broker.registry.lookupExact(secret);
+    if (!record) throw new Error('setup failed: source not registered');
+    expect(record.sensitivity).toEqual({ containsPrivateData: true, categories: ['credentials'] });
+  });
+
   it('audits a NONE-sink call that reads private data even when it is not a source', async () => {
     const events: AuditEvent[] = [];
     const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
@@ -605,6 +657,50 @@ describe('startNewTurn / declassify', () => {
     expect(events[0]?.taint.scopeLevel).toBe('RAW_UNTRUSTED');
     expect(events[0]?.verdict.action).toBe('ALLOW_WITH_WARNING');
     expect(broker.scope.watermark.level).toBe('CLEAN');
+  });
+
+  it('declassify() also resets a declared plan, exactly like clearScopeForTurnReset() already does — a stale plan from a declassified episode must not constrain unrelated later actions', async () => {
+    const broker = createBroker();
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register(shellExec());
+    broker.declarePlan([{ toolName: 'shell_exec' }]);
+    await broker.call('fetch_url', {});
+    await expect(broker.call('shell_exec', { cmd: 'x' })).rejects.toBeInstanceOf(
+      ToolCallBlockedError,
+    ); // matches the plan, still gated by default policy — cursor advances to 1
+
+    broker.declassify('reviewed and cleared by a human', 'alice@example.com');
+    expect(broker.scope.watermark.level).toBe('CLEAN');
+    // No re-exposure, no plan re-declared: an unrelated privileged call on
+    // the now-CLEAN scope must not be blocked by the declassified episode's
+    // leftover plan/cursor (before the fix, `plan` stayed
+    // [{toolName:'shell_exec'}] with planCursor still at 1, so this call
+    // would mismatch plan[1] — 'no steps left' — and throw
+    // UnplannedPrivilegedActionError instead of going through the normal,
+    // here permissive, CLEAN-scope policy check).
+    broker.register({
+      name: 'send_email',
+      capabilities: { capabilities: ['net:email'] },
+      async execute() {
+        return 'sent';
+      },
+    });
+    await expect(broker.call('send_email', {})).resolves.toBe('sent');
+  });
+
+  it("declassify()'s audit reason mentions the discarded plan only when one was actually declared", async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.declarePlan([{ toolName: 'shell_exec' }]);
+    await broker.call('fetch_url', {});
+    events.length = 0;
+
+    broker.declassify('reviewed and cleared by a human', 'alice@example.com');
+    expect(events).toHaveLength(1);
+    expect(
+      events[0]?.verdict.action === 'ALLOW_WITH_WARNING' && events[0].verdict.reason,
+    ).toContain('its declared plan was discarded alongside it');
   });
 });
 
@@ -2031,5 +2127,171 @@ describe('ArgsTooDeepError (unbounded args-tree recursion)', () => {
     const broker = createBroker();
     broker.register(fetchUrl(MALICIOUS_PAGE));
     await expect(broker.call('fetch_url', deepArgs(TOO_DEEP))).resolves.toBe(MALICIOUS_PAGE);
+  });
+});
+
+// Regression coverage: a privileged call's execute() throwing AFTER being
+// ALLOWed/approved used to leave ZERO audit trail — the exception aborted
+// finalizeGated() before its audit call ever ran. An operator reviewing the
+// log after an incident (a network error, a permission error, a full disk —
+// entirely ordinary occurrences, not attacks) would see no record the call
+// was ever approved and attempted at all.
+describe('audit trail when an allowed/approved execute() throws', () => {
+  it('a CLEAN-scope ALLOW call whose execute() throws still records an audited attempt before the error propagates', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.register({
+      name: 'flaky_write',
+      capabilities: { capabilities: ['write:fs'] },
+      async execute() {
+        throw new Error('disk full');
+      },
+    });
+    await expect(broker.call('flaky_write', {})).rejects.toThrow('disk full');
+    expect(events).toHaveLength(1);
+    expect(events[0]?.executed).toBe(true);
+    expect(events[0]?.verdict.action).toBe('ALLOW');
+  });
+
+  it('an approved REQUIRE_APPROVAL call whose execute() throws also records an audited attempt, not silence', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      auditSink: { record: (e) => events.push(e) },
+      approvalChannel: { requestApproval: async () => true },
+    });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register({
+      name: 'flaky_send',
+      capabilities: { capabilities: ['net:email'] },
+      async execute() {
+        throw new Error('smtp timeout');
+      },
+    });
+    await broker.call('fetch_url', {});
+    events.length = 0; // drop fetch_url's own audit event; isolate flaky_send's
+
+    await expect(broker.call('flaky_send', {})).rejects.toThrow('smtp timeout');
+    expect(events).toHaveLength(1);
+    expect(events[0]?.executed).toBe(true);
+    expect(events[0]?.verdict.action).toBe('REQUIRE_APPROVAL');
+  });
+});
+
+// Regression coverage: startNewTurn()/clearScopeForTurnReset() reassigns
+// `this.currentScope` to a brand-new object synchronously and without any
+// lock — deliberately, since making it lock-aware would require an async,
+// breaking signature change for a race this narrow (see its own doc
+// comment). Without dispatch()'s captured `dispatchScope`, a turn-reset
+// firing while an untrusted source call is still in flight used to
+// misattribute that call's eventual watermark raise to the fresh,
+// unrelated post-reset scope instead of the turn it actually happened in —
+// silently pre-contaminating a genuinely new turn.
+describe('turn-reset race: an in-flight source call must not contaminate the new turn', () => {
+  function deferredSource(name: string) {
+    let startedResolve!: () => void;
+    const started = new Promise<void>((r) => {
+      startedResolve = r;
+    });
+    let settle!: (v: string) => void;
+    const result = new Promise<string>((r) => {
+      settle = r;
+    });
+    const tool: ToolExecutor = {
+      name,
+      capabilities: { capabilities: [] },
+      isSource: true,
+      async execute() {
+        startedResolve();
+        return result;
+      },
+    };
+    return { tool, started, resolve: (v: string) => settle(v) };
+  }
+
+  it('a source call raising the watermark AFTER a turn-reset already fired lands on the scope it actually started in, not the fresh post-reset one', async () => {
+    const broker = createBroker({ resetScope: 'turn' });
+    const { tool, started, resolve } = deferredSource('slow_fetch');
+    broker.register(tool);
+
+    const callPromise = broker.call('slow_fetch', {});
+    await started; // dispatch() has captured its scope and is now awaiting execute()'s slow result
+
+    // A turn boundary fires while the source call above is still in
+    // flight — an entirely ordinary orchestration timing (the agent
+    // harness's own "new turn" signal racing a slow fetch that spans the
+    // boundary), not attacker input.
+    broker.startNewTurn();
+    expect(broker.scope.watermark.level).toBe('CLEAN'); // fresh turn-2 scope, nothing raised on it yet
+
+    resolve('page content');
+    await callPromise;
+
+    // The exposure must land on the scope the call actually started in
+    // (turn 1's, now discarded/orphaned) — turn 2 must stay CLEAN, exactly
+    // as if the source call had genuinely completed before the boundary.
+    expect(broker.scope.watermark.level).toBe('CLEAN');
+
+    // Confirm turn 2 is genuinely unaffected, not just coincidentally still
+    // CLEAN: an unrelated privileged call right after must go through the
+    // permissive CLEAN-scope policy check, not be treated as tainted.
+    broker.register(shellExec());
+    await expect(broker.call('shell_exec', { cmd: 'echo hi' })).resolves.toContain('echo hi');
+  });
+
+  it('the misattributed exposure is still recorded — audited against the scope it actually happened in, not silently dropped', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      resetScope: 'turn',
+      auditSink: { record: (e) => events.push(e) },
+    });
+    const { tool, started, resolve } = deferredSource('slow_fetch');
+    broker.register(tool);
+
+    const callPromise = broker.call('slow_fetch', {});
+    await started;
+    broker.startNewTurn();
+    events.length = 0; // drop the turn-reset's own (silent, nothing-to-discard) bookkeeping
+
+    resolve('page content');
+    await callPromise;
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.call.toolName).toBe('slow_fetch');
+    expect(events[0]?.verdict.action).toBe('ALLOW_WITH_WARNING');
+    expect(
+      events[0]?.verdict.action === 'ALLOW_WITH_WARNING' && events[0].verdict.reason,
+    ).toContain('raised the scope watermark to RAW_UNTRUSTED');
+  });
+
+  it('readsPrivateData on a source is also attributed to the scope the call started in, not a scope reset mid-flight', async () => {
+    const broker = createBroker({ resetScope: 'turn' });
+    let startedResolve!: () => void;
+    const started = new Promise<void>((r) => {
+      startedResolve = r;
+    });
+    let settle!: (v: string) => void;
+    const result = new Promise<string>((r) => {
+      settle = r;
+    });
+    broker.register({
+      name: 'slow_creds_read',
+      capabilities: { capabilities: [], readsPrivateData: { categories: ['credentials'] } },
+      isSource: true,
+      async execute() {
+        startedResolve();
+        return result;
+      },
+    });
+
+    const callPromise = broker.call('slow_creds_read', {});
+    await started;
+    broker.startNewTurn();
+    expect(broker.scope.watermark.privateDataSeen).toBe(false); // fresh turn-2 scope
+
+    settle('secret');
+    await callPromise;
+
+    // privateDataSeen must not leak onto the new turn either.
+    expect(broker.scope.watermark.privateDataSeen).toBe(false);
   });
 });

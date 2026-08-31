@@ -95,6 +95,24 @@ describe('diffProposedArgs', () => {
     expect(diffs).toContainEqual({ path: 'x', actual: 1, counterfactual: 2 });
   });
 
+  it('finds a real divergence reached via a shared (DAG, not cyclic) reference on the actual side — the cycle guard must key on the (actual-node, counterfactual-node) PAIR, not on either side alone', () => {
+    // Regression test for a false-negative bug: an earlier cycle guard used
+    // two independent single-sided WeakSets ORed together
+    // (`visitedActual.has(aObj) || visitedCounterfactual.has(bObj)`), which
+    // incorrectly skipped comparing `other` below the moment `X` had been
+    // visited via the unrelated `shared` path — silently dropping the real
+    // `other.val` divergence and violating diffProposedArgs' own "never a
+    // false negative" guarantee (see its doc comment). structuredClone (the
+    // broker's default cloneArgs) preserves exactly this kind of shared
+    // sub-object structure, so this is not a contrived edge case.
+    const X = { val: 1 };
+    const actual = { shared: X, other: X };
+    const counterfactual = { shared: { val: 1 }, other: { val: 999 } };
+
+    const diffs = diffProposedArgs(actual, counterfactual);
+    expect(diffs).toEqual([{ path: 'other.val', actual: 1, counterfactual: 999 }]);
+  });
+
   it('throws a clean, catchable ArgsTooDeepError instead of overflowing the call stack on a pathologically deep tree', () => {
     let deepActual: unknown = 'bottom';
     let deepCounterfactual: unknown = 'different';

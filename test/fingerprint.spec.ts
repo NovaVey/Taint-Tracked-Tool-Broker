@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   buildFingerprint,
@@ -16,6 +17,43 @@ describe('exactHash', () => {
   it('is deterministic and content-sensitive', () => {
     expect(exactHash(SOURCE)).toBe(exactHash(SOURCE));
     expect(exactHash(SOURCE)).not.toBe(exactHash(SOURCE + '!'));
+  });
+
+  it('does not collide two distinct strings differing only in which lone/unpaired surrogate they contain', () => {
+    // Node's UTF-8 encoder is lossy for lone surrogates — it substitutes
+    // U+FFFD for *any* unpaired high or low surrogate before hashing, so
+    // naively hashing raw text made these two genuinely different strings
+    // hash identically. See fingerprint.ts's escapeLoneSurrogatesForHashing
+    // doc comment for the full mechanism.
+    const withLoneHighD800 = '\uD800X';
+    const withLoneHighD801 = '\uD801X';
+    expect(exactHash(withLoneHighD800)).not.toBe(exactHash(withLoneHighD801));
+
+    // Also cover the lone-low-surrogate half of the same bug.
+    const withLoneLowDC00 = 'X\uDC00';
+    const withLoneLowDC01 = 'X\uDC01';
+    expect(exactHash(withLoneLowDC00)).not.toBe(exactHash(withLoneLowDC01));
+
+    // And a lone surrogate must still be distinguishable from ordinary text
+    // that merely contains the literal replacement character.
+    expect(exactHash(withLoneHighD800)).not.toBe(exactHash('�X'));
+  });
+
+  it('is byte-for-byte unchanged (vs. hashing the raw UTF-8 bytes directly) for well-formed strings with no lone surrogates', () => {
+    const rawUtf8Hash = (text: string): string =>
+      createHash('sha256').update(text, 'utf8').digest('hex');
+
+    const wellFormed = [
+      SOURCE,
+      '',
+      'plain ascii text',
+      'emoji: 😀🚀✅ and more 👨‍👩‍👧‍👦', // includes surrogate pairs and a ZWJ sequence
+      '中文测试字符串 — CJK text, no surrogates in the BMP',
+      'a well-formed pair: 𐀀 (U+10000)',
+    ];
+    for (const text of wellFormed) {
+      expect(exactHash(text)).toBe(rawUtf8Hash(text));
+    }
   });
 });
 
@@ -88,5 +126,57 @@ describe('simhash / hammingDistance', () => {
     const unrelatedDistance = hammingDistance(base, computeSimhash(unrelated));
 
     expect(editedDistance).toBeLessThan(unrelatedDistance);
+  });
+
+  it('does NOT report a perfect/near-perfect match between two unrelated symbol-only (punctuation/emoji) texts', () => {
+    // normalize() strips everything outside letters/numbers/whitespace, so a
+    // text made entirely of punctuation/symbols normalizes to the empty
+    // string. Before the charShingles() fallback existed, wordShingles()
+    // returned [] for both of these, so computeSimhash() returned the fixed
+    // sentinel 0n for *both* regardless of their actual (very different)
+    // content — a spurious hammingDistance of 0, i.e. a "perfect" simhash
+    // match, between two texts sharing no real content. Both banners are
+    // >=40 chars, matching MIN_TEXT_LEN_FOR_FUZZY (registry.ts, DESIGN.md
+    // §4.2's "≥40-char substring window") so this is exactly the input
+    // shape the fuzzy-matching path is meant to handle.
+    const bannerA = '▓▓▓░░░▓▓▓░░░▓▓▓░░░▓▓▓░░░▓▓▓░░░▓▓▓░░░▓▓▓░░░'; // 42 chars
+    const bannerB = '♠♣♥♦♠♣♥♦♠♣♥♦♠♣♥♦♠♣♥♦♠♣♥♦♠♣♥♦♠♣♥♦♠♣♥♦♠♣♥♦'; // 40 chars, disjoint symbol set
+
+    const simhashA = computeSimhash(bannerA);
+    const simhashB = computeSimhash(bannerB);
+
+    // Pre-fix, both of these would be 0n.
+    expect(simhashA).not.toBe(0n);
+    expect(simhashB).not.toBe(0n);
+    expect(simhashA).not.toBe(simhashB);
+
+    // registry.ts's DEFAULT_SIMHASH_MAX_DISTANCE is 3 (out of 64 bits) —
+    // assert the distance is well clear of any plausible fuzzy-match
+    // threshold, not merely nonzero.
+    expect(hammingDistance(simhashA, simhashB)).toBeGreaterThan(3);
+  });
+});
+
+describe('wordShingles / shingleHashesOf fallback for symbol-only text', () => {
+  it('falls back to non-empty, content-sensitive shingles for a symbol-only text instead of []', () => {
+    const banner = '=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-';
+    // Sanity check that this text is entirely outside \p{L}\p{N}\s (i.e. it
+    // hits fingerprint.ts's normalize()-empties-out degenerate path) without
+    // importing normalize() itself, which is intentionally unexported.
+    expect(/^[^\p{L}\p{N}]+$/u.test(banner)).toBe(true);
+    expect(wordShingles(banner).length).toBeGreaterThan(0);
+  });
+
+  it('gives two distinct symbol-only texts disjoint (non-overlapping) shingle hash sets, not both empty', () => {
+    const bannerA = '▓▓▓░░░▓▓▓░░░▓▓▓░░░▓▓▓░░░▓▓▓░░░▓▓▓░░░▓▓▓░░░';
+    const bannerB = '♠♣♥♦♠♣♥♦♠♣♥♦♠♣♥♦♠♣♥♦♠♣♥♦♠♣♥♦♠♣♥♦♠♣♥♦♠♣♥♦';
+
+    const a = buildFingerprint(bannerA).shingleHashes;
+    const b = buildFingerprint(bannerB).shingleHashes;
+
+    // Pre-fix, both would be an empty Uint32Array (a spurious "identical" state).
+    expect(a.length).toBeGreaterThan(0);
+    expect(b.length).toBeGreaterThan(0);
+    expect(overlapCoefficient(a, b)).toBe(0);
   });
 });

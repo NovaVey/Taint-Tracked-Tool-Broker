@@ -85,4 +85,38 @@ describe('defaultPolicy matrix (DESIGN.md §7.2)', () => {
       expect(await decide('RAW_UNTRUSTED', 'EXEC', false, 'CLEAN')).toBe('BLOCK');
     });
   });
+
+  describe('QUARANTINE_AND_RETRY (doc/code gap — see GAPS.md)', () => {
+    // DESIGN.md §7.2 describes QUARANTINE_AND_RETRY as an active default-
+    // policy behavior, but MATRIX/baseDecision() never select it as a
+    // Verdict — the case in toDecision() exists only so that helper stays
+    // exhaustive over PolicyDecision['action'] for a hand-written PolicyFn,
+    // not because defaultPolicy itself ever returns it. This test
+    // exhaustively walks every (scopeLevel, sinkClass, privateDataSeen,
+    // argFingerprintFloor) combination defaultPolicy can be driven through
+    // and asserts none of them ever comes out as QUARANTINE_AND_RETRY, so
+    // that if a future edit to MATRIX or the Layer-2 tightening block ever
+    // starts constructing one, this fails loudly rather than silently
+    // shipping a behavior GAPS.md/DESIGN.md have not been updated to match.
+    it('is never produced by defaultPolicy for any reachable TaintContext', async () => {
+      const scopeLevels: TaintLevel[] = ['CLEAN', 'DERIVED_UNTRUSTED', 'RAW_UNTRUSTED'];
+      const sinkClasses: SinkClass[] = ['NONE', 'MUTATE', 'EXFIL', 'EXEC'];
+
+      for (const scopeLevel of scopeLevels) {
+        for (const sinkClass of sinkClasses) {
+          for (const privateDataSeen of [false, true]) {
+            for (const argFingerprintFloor of scopeLevels) {
+              const action = await decide(
+                scopeLevel,
+                sinkClass,
+                privateDataSeen,
+                argFingerprintFloor,
+              );
+              expect(action).not.toBe('QUARANTINE_AND_RETRY');
+            }
+          }
+        }
+      }
+    });
+  });
 });

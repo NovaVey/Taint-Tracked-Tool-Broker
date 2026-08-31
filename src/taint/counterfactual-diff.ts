@@ -115,17 +115,45 @@ function leafEqual(a: unknown, b: unknown): boolean {
  * array where the other side has a plain object) is itself reported as one
  * diff at that path, not descended into.
  *
- * Cycle-safe: `actual`/`counterfactual` are walked in parallel with
- * independent per-side visited-node tracking (mirroring taint/scan.ts's
- * single-tree cycle guard) — a node already visited on its OWN side is not
- * re-descended into, so a cyclic argument tree (structuredClone tolerates
- * cycles, and args are commonly snapshotted with it — see broker.ts)
- * cannot recurse forever.
+ * Cycle-safe: `actual`/`counterfactual` are walked in parallel with the
+ * cycle guard keyed on the PAIR of nodes currently being compared — a
+ * `WeakMap<object, WeakSet<object>>` from an `actual`-side node to the set
+ * of `counterfactual`-side nodes it has already been paired with. Only a
+ * re-visit of the EXACT SAME (aObj, bObj) pair short-circuits; a true cycle
+ * necessarily re-visits the same pair (walking the cycle back around lands
+ * on the same two objects being compared again), so this still terminates a
+ * cyclic argument tree (structuredClone tolerates cycles, and args are
+ * commonly snapshotted with it — see broker.ts) exactly as reliably as a
+ * naive single-tree guard would.
+ *
+ * This pairing is deliberate, not incidental: an earlier version of this
+ * guard used two INDEPENDENT single-sided `WeakSet`s (one per side) ORed
+ * together — `visitedActual.has(aObj) || visitedCounterfactual.has(bObj)`.
+ * That looks equivalent for a true cycle, but it is not, and it silently
+ * broke this function's own "never a false negative" guarantee (see
+ * `leafEqual`'s doc comment above) on any DAG-shaped tree, i.e. one where
+ * the SAME object is referenced from more than one path on either side —
+ * not a cycle at all, just ordinary shared structure, which
+ * `structuredClone` (the broker's default `cloneArgs`) preserves faithfully.
+ * Concretely: `const X = {val: 1}; const actual = {shared: X, other: X};`
+ * paired with `counterfactual = {shared: {val: 1}, other: {val: 999}}` has
+ * a real divergence at `other.val` — but the single-sided guard adds `X` to
+ * `visitedActual` while walking `shared`, then incorrectly refuses to
+ * re-descend into `X` at all when it reaches `other`, even though `other`
+ * is being compared against a DIFFERENT, never-before-seen counterfactual
+ * node. Keying on the pair instead of either side alone fixes exactly this:
+ * `(X, {val:1})` and `(X, {val:999})` are two distinct pairs, so both get
+ * walked, and the real divergence is found. See
+ * test/counterfactual-diff.spec.ts for the regression test built on this
+ * exact repro.
  */
 export function diffProposedArgs(actual: unknown, counterfactual: unknown): ArgDiff[] {
   const diffs: ArgDiff[] = [];
-  const visitedActual = new WeakSet<object>();
-  const visitedCounterfactual = new WeakSet<object>();
+  // Maps an `actual`-side node to the `counterfactual`-side nodes it has
+  // already been compared against, so the guard below can ask "have THIS
+  // pair been visited" rather than "has EITHER side been visited on ANY
+  // path" — see the doc comment above for why that distinction matters.
+  const visitedPairs = new WeakMap<object, WeakSet<object>>();
 
   function walk(a: unknown, b: unknown, path: string, depth: number): void {
     if (depth > MAX_ARGS_TREE_DEPTH) throw new ArgsTooDeepError(MAX_ARGS_TREE_DEPTH);
@@ -145,9 +173,13 @@ export function diffProposedArgs(actual: unknown, counterfactual: unknown): ArgD
     // Both are real objects/arrays here, of the same shape.
     const aObj = a as object;
     const bObj = b as object;
-    if (visitedActual.has(aObj) || visitedCounterfactual.has(bObj)) return;
-    visitedActual.add(aObj);
-    visitedCounterfactual.add(bObj);
+    let pairedWith = visitedPairs.get(aObj);
+    if (pairedWith?.has(bObj)) return;
+    if (!pairedWith) {
+      pairedWith = new WeakSet<object>();
+      visitedPairs.set(aObj, pairedWith);
+    }
+    pairedWith.add(bObj);
 
     if (shapeA === 'array') {
       const aArr = a as unknown[];

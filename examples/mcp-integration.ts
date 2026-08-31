@@ -47,6 +47,7 @@ interface McpToolDescriptor {
 interface McpClient {
   listTools(): Promise<McpToolDescriptor[]>;
   callTool(name: string, args: unknown): Promise<unknown>;
+  readResource(uri: string): Promise<unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -80,7 +81,7 @@ function createMcpDescriptionGuard(broker: ToolCallBroker): (tools: McpToolDescr
 }
 
 // ---------------------------------------------------------------------------
-// 2. tools/call and resources/read: ordinary source/sink wrapping.
+// 2. tools/call: ordinary source/sink wrapping.
 // ---------------------------------------------------------------------------
 
 async function demonstrateToolWiring(client: McpClient): Promise<void> {
@@ -89,7 +90,8 @@ async function demonstrateToolWiring(client: McpClient): Promise<void> {
 
   // A read-only MCP tool whose result is content the agent didn't
   // originate — wire it exactly like any other source tool. resources/read
-  // would be wired the same way; only the transport differs, not the shape.
+  // is wired the very same way — see demonstrateResourceRead() below — only
+  // the transport differs, not the shape.
   const fetchPage = broker.wrap({
     name: 'fetch_page',
     capabilities: { capabilities: [] },
@@ -131,7 +133,63 @@ async function demonstrateToolWiring(client: McpClient): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// 3. tools/list: the description rug-pull, caught by the guard above.
+// 3. resources/read: the SAME source/sink wrapping as tools/call.
+// ---------------------------------------------------------------------------
+
+/**
+ * `resources/read` is a distinct MCP method from `tools/call` — a different
+ * request shape, addressed by URI instead of by tool name — but as far as
+ * TTTB is concerned it is the identical case as demonstrateToolWiring()
+ * above: content the agent didn't originate, wrapped with `isSource: true`
+ * so it carries provenance into whatever sink consumes it next. This
+ * function exists specifically so that claim is backed by running code, not
+ * just asserted in the file header (see GAPS.md #1) — a reader who only
+ * skimmed the header previously had nothing to point to for this surface.
+ */
+async function demonstrateResourceRead(client: McpClient): Promise<void> {
+  console.log('\n=== resources/read: identical wrapping to tools/call, different transport ===');
+  const broker = createBroker();
+
+  // Same wrapping as fetchPage above — isSource: true, no declared
+  // capabilities, because reading a resource grants the agent no privilege
+  // of its own. Only the underlying transport call differs.
+  const readResource = broker.wrap({
+    name: 'read_resource',
+    capabilities: { capabilities: [] },
+    isSource: true,
+    async execute(args: { uri: string }) {
+      return client.readResource(args.uri);
+    },
+  });
+
+  const writeFile = broker.wrap({
+    name: 'write_file',
+    capabilities: { capabilities: ['write:fs'] },
+    async execute(args) {
+      return client.callTool('write_file', args);
+    },
+  });
+
+  const resource = await readResource.execute({ uri: 'mcp://docs/readme' });
+  console.log('read via MCP resources/read, scope watermark now:', broker.scope.watermark.level);
+
+  try {
+    await writeFile.execute({ path: '/tmp/out.txt', contents: resource });
+    console.log('UNEXPECTED: call was allowed');
+  } catch (err) {
+    if (err instanceof ToolCallBlockedError) {
+      console.log(
+        'resources/read content gates a sink exactly like tools/call content did above:',
+        err.decision.action,
+      );
+    } else {
+      throw err;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4. tools/list: the description rug-pull, caught by the guard above.
 // ---------------------------------------------------------------------------
 
 async function demonstrateDescriptionGuard(
@@ -171,6 +229,9 @@ function makeMockMcpClient(): McpClient & { rewriteDescription(name: string, nex
     ['write_file', 'Writes contents to a local file path.'],
     ['search_docs', 'Searches the internal documentation index and returns matching excerpts.'],
   ]);
+  const resources = new Map<string, string>([
+    ['mcp://docs/readme', 'Welcome to the docs. Nothing unusual here.'],
+  ]);
   return {
     async listTools() {
       return Array.from(tools, ([name, description]) => ({ name, description }));
@@ -178,6 +239,11 @@ function makeMockMcpClient(): McpClient & { rewriteDescription(name: string, nex
     async callTool(name: string, args: unknown) {
       if (name === 'fetch_page') return 'Welcome to the docs. Nothing unusual here.';
       return `[mock ${name}] ${JSON.stringify(args)}`;
+    },
+    async readResource(uri: string) {
+      const contents = resources.get(uri);
+      if (contents === undefined) throw new Error(`mock MCP server has no resource at ${uri}`);
+      return contents;
     },
     rewriteDescription(name: string, next: string) {
       tools.set(name, next);
@@ -188,6 +254,7 @@ function makeMockMcpClient(): McpClient & { rewriteDescription(name: string, nex
 async function main(): Promise<void> {
   const client = makeMockMcpClient();
   await demonstrateToolWiring(client);
+  await demonstrateResourceRead(client);
   await demonstrateDescriptionGuard(client);
 }
 

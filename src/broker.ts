@@ -582,6 +582,28 @@ class Broker implements ToolCallBroker {
     const tool = this.tools.get(toolName);
     if (!tool) throw new UnknownToolError(toolName);
 
+    // Captured once, synchronously, here at the very top — before any
+    // `await` — so it cannot itself be affected by a concurrent
+    // startNewTurn()/turn-reset. Used only by the NONE-sinkClass (source)
+    // branch below: its own post-execution effects (the watermark raise for
+    // an untrusted source, or markPrivateDataSeen) must land on the scope
+    // THIS call actually read from — the turn/episode it was dispatched
+    // within — not whichever scope happens to be `this.currentScope` by the
+    // time its (possibly slow) execute() finally resolves.
+    // startNewTurn()/clearScopeForTurnReset() reassigns `this.currentScope`
+    // to a brand-new object synchronously and without taking any lock
+    // (deliberately — see its own doc comment; making it lock-aware would
+    // require an async, breaking signature change for a race this narrow).
+    // Without capturing here, a reset firing while this source call is
+    // still in flight would silently misattribute its exposure to the NEW
+    // post-reset scope instead of the one it actually belongs to, leaving
+    // the genuinely-current turn pre-contaminated with an exposure that has
+    // nothing to do with it. The gated dispatch path doesn't need this: its
+    // own revalidateBeforeExecute() already deliberately re-reads the
+    // CURRENT scope right before ever executing — a live read there is
+    // correct by design, not the same bug.
+    const dispatchScope = this.currentScope;
+
     // One snapshot used everywhere a caller-visible record of "what was
     // requested" is needed (policy, approval, audit, AND execute()) — never
     // the live `args` object. Every execute() call site below clones from
@@ -611,7 +633,7 @@ class Broker implements ToolCallBroker {
       // watermark or the private-data flag is audited below, after those
       // effects are applied, so the recorded taint reflects the new state.
       const result = await tool.execute(this.cloneArgsOrThrow(toolName, argsSnapshot));
-      return this.finishDispatch(tool, call, sinkClass, result);
+      return this.finishDispatch(tool, call, sinkClass, result, dispatchScope);
     }
 
     // Gated (privileged sink): dispatchGated() manages its own multi-phase
@@ -832,8 +854,34 @@ class Broker implements ToolCallBroker {
       auditTaint = revalidated.taint;
       auditDecision = revalidated.decision;
       if (revalidated.proceed) {
-        result = await tool.execute(this.cloneArgsOrThrow(toolName, argsSnapshot));
+        // `executed` flips to true here, before execute() is even called —
+        // matching AuditEvent.executed's own documented meaning ("the
+        // underlying tool actually ran"), which is about whether policy let
+        // the call proceed past gating to execute() at all, not whether
+        // execute() itself happened to finish without throwing. Without
+        // this, a privileged tool whose execute() throws (a network error,
+        // a permission error, a full disk — an entirely ordinary
+        // occurrence, not an attack) left ZERO audit trail: the exception
+        // propagated out of this method before the audit call below was
+        // ever reached, so an operator reviewing the log after an incident
+        // would see no record the call was ever approved and attempted at
+        // all. The try/catch below exists specifically to still audit in
+        // that case — with the SAME shape the success path's own record
+        // below would have written — before re-throwing the real error
+        // unchanged.
         executed = true;
+        try {
+          result = await tool.execute(this.cloneArgsOrThrow(toolName, argsSnapshot));
+        } catch (error) {
+          this.auditSink.record({
+            verdict: auditDecision,
+            call,
+            taint: auditTaint,
+            at: Date.now(),
+            executed: true,
+          });
+          throw error;
+        }
       }
     }
     // BLOCK / QUARANTINE_AND_RETRY, a denied REQUIRE_APPROVAL, or a
@@ -851,7 +899,13 @@ class Broker implements ToolCallBroker {
       throw new ToolCallBlockedError(call, auditDecision, blockedMessage(toolName, auditDecision));
     }
 
-    return this.finishDispatch(tool, call, sinkClass, result);
+    // Gated calls always act on the LIVE scope here, deliberately — unlike
+    // the NONE-sinkClass/source path's captured `dispatchScope` (see
+    // dispatch()'s own doc comment): revalidateBeforeExecute() above already
+    // re-read the current watermark immediately before this point, so using
+    // `this.currentScope` for this call's own post-execution effects is
+    // consistent with the state that decision was actually made against.
+    return this.finishDispatch(tool, call, sinkClass, result, this.currentScope);
   }
 
   /**
@@ -918,21 +972,36 @@ class Broker implements ToolCallBroker {
     );
   }
 
-  /** Post-execution bookkeeping shared by both the NONE-sinkClass and gated dispatch paths — always runs under whatever lock the caller currently holds. */
+  /**
+   * Post-execution bookkeeping shared by both the NONE-sinkClass and gated
+   * dispatch paths — always runs under whatever lock the caller currently
+   * holds. `scope` is the TaintScope this specific call's effects (and the
+   * audit records about them) should be attributed to — see dispatch()'s
+   * own doc comment on `dispatchScope` for why this must be an explicit
+   * parameter rather than always reading `this.currentScope` fresh here:
+   * for the NONE-sinkClass/source path it's a scope CAPTURED at the start
+   * of this call's dispatch (so a concurrent turn-reset firing while a slow
+   * source call is still in flight can't misattribute its exposure to the
+   * wrong, post-reset turn); for the gated path it's always the live
+   * `this.currentScope`, since that path's own revalidateBeforeExecute()
+   * already re-reads the current watermark immediately before ever
+   * executing.
+   */
   private finishDispatch(
     tool: ToolExecutor,
     call: ToolCall,
     sinkClass: SinkClass,
     result: unknown,
+    scope: TaintScope,
   ): unknown {
     const toolName = call.toolName;
-    this.applyPostExecutionEffects(tool, call, result);
+    this.applyPostExecutionEffects(tool, call, result, scope);
 
     if (sinkClass === 'NONE' && (tool.capabilities.readsPrivateData || isUntrustedSource(tool))) {
       const reasons: string[] = [];
       if (isUntrustedSource(tool))
         reasons.push(
-          `untrusted source call raised the scope watermark to ${this.currentScope.watermark.level}.`,
+          `untrusted source call raised the scope watermark to ${scope.watermark.level}.`,
         );
       if (tool.capabilities.readsPrivateData)
         reasons.push('private data was read this scope (lethal-trifecta escalator, §3.2).');
@@ -940,7 +1009,7 @@ class Broker implements ToolCallBroker {
         this.auditSink,
         { action: 'ALLOW_WITH_WARNING', reason: reasons.join(' ') },
         call,
-        this.currentScope.watermark,
+        scope.watermark,
         true,
       );
     }
@@ -967,7 +1036,7 @@ class Broker implements ToolCallBroker {
             reason: `Advisory: tool "${toolName}" is not registered isSource:true but returned ${text.length} chars of text (>= the warnOnLikelyUnmarkedSource threshold of ${this.warnOnLikelyUnmarkedSource}). If this tool can return content the agent didn't originate, it likely should be isSource:true (GAPS.md #1) — this warning never changes the watermark or gates anything on its own.`,
           },
           call,
-          this.currentScope.watermark,
+          scope.watermark,
           true,
         );
       }
@@ -1147,6 +1216,19 @@ class Broker implements ToolCallBroker {
     // nothing) is the point of auditing this action at all.
     const priorLevel = this.currentScope.watermark.level;
     const priorPrivateDataSeen = this.currentScope.watermark.privateDataSeen;
+    // A declared plan (declarePlan(), §11) is a commitment tied to the
+    // exposure episode it was made against — the SAME reasoning
+    // clearScopeForTurnReset() (below) already applies to a turn-boundary
+    // reset applies here too, and this path was missing it: declassify()
+    // clears the watermark exactly like a turn reset does, but previously
+    // left `this.plan`/`this.planCursor` untouched, letting a plan declared
+    // for the now-cleared episode wrongly gate a later, unrelated one
+    // (plan-freeze is additive, so this can only ever cause spurious
+    // over-blocking, never a bypass — but it's a real, reproducible
+    // availability/correctness defect, not a hypothetical one).
+    const hadPlan = this.plan !== undefined;
+    this.plan = undefined;
+    this.planCursor = 0;
     declassifyScope(this.currentScope);
     // Defensive, not load-bearing: a stale nonzero counter left over from
     // before this declassify() is already inert while the scope reads
@@ -1159,7 +1241,7 @@ class Broker implements ToolCallBroker {
       this.auditSink,
       {
         action: 'ALLOW_WITH_WARNING',
-        reason: `declassify(): watermark manually cleared from ${priorLevel} — reason: "${reason}"; approved by ${approvedBy}.`,
+        reason: `declassify(): watermark manually cleared from ${priorLevel}${hadPlan ? ' (its declared plan was discarded alongside it)' : ''} — reason: "${reason}"; approved by ${approvedBy}.`,
       },
       {
         id: randomUUID(),
@@ -1172,11 +1254,23 @@ class Broker implements ToolCallBroker {
     );
   }
 
-  private applyPostExecutionEffects(tool: ToolExecutor, call: ToolCall, result: unknown): void {
+  /**
+   * `scope` is the TaintScope this call's effects apply to — see
+   * finishDispatch()'s own doc comment for why this is an explicit
+   * parameter (a captured, possibly-stale reference for the source path;
+   * always the live `this.currentScope` for the gated path) rather than
+   * this method always reading `this.currentScope` fresh itself.
+   */
+  private applyPostExecutionEffects(
+    tool: ToolExecutor,
+    call: ToolCall,
+    result: unknown,
+    scope: TaintScope,
+  ): void {
     const capabilities = tool.capabilities;
 
     if (capabilities.readsPrivateData) {
-      markPrivateDataSeen(this.currentScope);
+      markPrivateDataSeen(scope);
     }
 
     if (isUntrustedSource(tool)) {
@@ -1208,7 +1302,22 @@ class Broker implements ToolCallBroker {
           : NOT_SENSITIVE;
         this.registry.register(text, provenance, 'RAW_UNTRUSTED', sensitivity);
       }
-      this.raiseWatermarkAndResetDecay('RAW_UNTRUSTED', provenance);
+      // Not routed through raiseWatermarkAndResetDecay() (which always
+      // targets `this.currentScope`): `scope` here may be a reference
+      // CAPTURED at the start of this call's dispatch, deliberately not
+      // re-read — see dispatch()'s own doc comment on `dispatchScope`. The
+      // decay counter is broker-level (not per-scope) state, so only reset
+      // it when `scope` is still the LIVE scope; if a turn-reset already
+      // superseded it, that reset already zeroed the counter itself (and a
+      // scope that's been superseded is never read again, so leaving its
+      // own now-moot raise out of the counter's reasoning is harmless
+      // either way — this guard only prevents the opposite mistake, this
+      // call's late-arriving raise wrongly resetting the CURRENT scope's
+      // counter on the new scope's behalf).
+      raiseWatermark(scope, 'RAW_UNTRUSTED', provenance);
+      if (scope === this.currentScope) {
+        this.turnsSinceExposure = 0;
+      }
     }
   }
 }

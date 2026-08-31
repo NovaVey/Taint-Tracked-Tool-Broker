@@ -98,6 +98,18 @@ function toDecision(verdict: Verdict, reason: string): PolicyDecision {
     case 'BLOCK':
       return { action: 'BLOCK', reason };
     case 'QUARANTINE_AND_RETRY':
+      // NOTE: this case exists so toDecision() stays exhaustive over the
+      // PolicyDecision['action'] union (types.ts), and so a hand-written
+      // PolicyFn is free to route through this same helper if it wants to
+      // construct a QUARANTINE_AND_RETRY verdict of its own. But nothing in
+      // MATRIX or baseDecision() above — i.e. nothing defaultPolicy itself
+      // does — ever selects 'QUARANTINE_AND_RETRY' as a Verdict, so this
+      // branch is unreachable from defaultPolicy's own decision path and the
+      // shipped default policy never returns this action. Do not take
+      // QUARANTINE_AND_RETRY's presence here as evidence that defaultPolicy
+      // implements it; see GAPS.md for the tracked gap between this and the
+      // DESIGN.md §7.2 description of it as an active default-policy
+      // behavior.
       return { action: 'QUARANTINE_AND_RETRY', reason };
   }
 }

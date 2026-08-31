@@ -24,6 +24,7 @@ import {
   DisallowedOutboundHostError,
   exactHash,
   NOT_SENSITIVE,
+  QuarantineInputMismatchError,
   ToolCallBlockedError,
   UnplannedPrivilegedActionError,
 } from '../src/index.js';
@@ -61,6 +62,21 @@ export interface CorpusCase {
    */
   quarantine?: {
     rawText: string;
+    /**
+     * If set, this is the string actually passed as summarize()'s `text`
+     * argument, instead of `rawText` itself — modeling an attacker-controlled
+     * composite tool that registers one (genuine) fetched page as the taint
+     * source but then calls summarize() with different, unrelated text,
+     * attempting to launder arbitrary content through the lighter
+     * DERIVED_UNTRUSTED tier under a legitimate-looking sourceTaintRecordId.
+     * Defaults to `rawText` (byte-identical to the registered source) when
+     * unset — which is what every case except the provenance-spoof one uses,
+     * and which means exactHash(text) === sourceRecord.id always holds, so
+     * the length-ratio/shingle-coverage mismatch check in src/quarantine.ts
+     * (GAPS.md #4) is never reached at all for those cases. See the
+     * "quarantine-provenance-spoof-*" case in cases.ts for the one that sets this.
+     */
+    quarantineText?: string;
     toolName?: string;
     schema?: { parse(x: unknown): unknown };
     instructions?: string;
@@ -191,44 +207,61 @@ export async function runCorpusCase(c: CorpusCase): Promise<CorpusOutcome> {
     broker.startNewTurn();
   }
 
-  if (c.quarantine) {
-    const { rawText } = c.quarantine;
-    // Register directly rather than via broker.call(): this models a
-    // composite tool whose raw fetch is an internal implementation detail,
-    // never returned to its own caller — so the watermark stays untouched
-    // here and is raised only by summarize() itself, landing at
-    // DERIVED_UNTRUSTED rather than RAW_UNTRUSTED. See DESIGN.md §6.2.
-    const record = broker.registry.register(
-      rawText,
-      {
-        id: exactHash(rawText),
-        sourceCallId: 'corpus-internal-fetch',
-        toolName: c.quarantine.toolName ?? '__pre_registered__',
-        sessionId: 'corpus-session',
-        capturedAt: 0,
-      },
-      'RAW_UNTRUSTED',
-      NOT_SENSITIVE,
-    );
-    const opts: Parameters<typeof broker.summarize>[1] = {
-      sessionId: 'corpus-session',
-      sourceTaintRecordId: record.id,
-    };
-    if (c.quarantine.schema) opts.schema = c.quarantine.schema;
-    if (c.quarantine.instructions) opts.instructions = c.quarantine.instructions;
-    await broker.summarize(rawText, opts);
-  }
-
   let actualDecision: PolicyDecision['action'] | 'ERROR' = 'ERROR';
   let actualReason: string | undefined;
   let error: unknown;
 
+  // c.quarantine (when set) and c.actions are run inside ONE try/catch:
+  // a real composite tool's internal summarize() call and its caller's
+  // subsequent sink calls are not independently-failable steps from this
+  // harness's point of view — either can be the thing that actually blocks
+  // the attack, and prior to this both being unified here, a thrown
+  // QuarantineInputMismatchError (the mismatch-detection branch this exists
+  // to exercise — GAPS.md #4) would have propagated out of runCorpusCase()
+  // entirely uncaught, rather than producing a CorpusOutcome the way every
+  // other kind of rejection does.
   try {
+    if (c.quarantine) {
+      const { rawText } = c.quarantine;
+      // Register directly rather than via broker.call(): this models a
+      // composite tool whose raw fetch is an internal implementation detail,
+      // never returned to its own caller — so the watermark stays untouched
+      // here and is raised only by summarize() itself, landing at
+      // DERIVED_UNTRUSTED rather than RAW_UNTRUSTED. See DESIGN.md §6.2.
+      const record = broker.registry.register(
+        rawText,
+        {
+          id: exactHash(rawText),
+          sourceCallId: 'corpus-internal-fetch',
+          toolName: c.quarantine.toolName ?? '__pre_registered__',
+          sessionId: 'corpus-session',
+          capturedAt: 0,
+        },
+        'RAW_UNTRUSTED',
+        NOT_SENSITIVE,
+      );
+      const opts: Parameters<typeof broker.summarize>[1] = {
+        sessionId: 'corpus-session',
+        sourceTaintRecordId: record.id,
+      };
+      if (c.quarantine.schema) opts.schema = c.quarantine.schema;
+      if (c.quarantine.instructions) opts.instructions = c.quarantine.instructions;
+      // quarantineText (when set) models a provenance-spoof attempt: the
+      // text actually handed to summarize() diverges from rawText, the text
+      // that was registered as the source record — see CorpusCase's own doc
+      // comment above.
+      await broker.summarize(c.quarantine.quarantineText ?? rawText, opts);
+    }
+
     for (const step of c.actions) {
       await broker.call(step.tool, step.args ?? {});
     }
     const last = auditLog[auditLog.length - 1];
-    actualDecision = last ? last.verdict.action : 'ALLOW'; // no audit entries only if every action was a NONE-class sink
+    // No audit entries only if there was no quarantine step and every
+    // action was a NONE-class sink (quarantine's own success path also
+    // records an audit entry — src/quarantine.ts — so `last` is otherwise
+    // always defined by the time execution reaches here).
+    actualDecision = last ? last.verdict.action : 'ALLOW';
     actualReason = last && 'reason' in last.verdict ? last.verdict.reason : undefined;
   } catch (err) {
     error = err;
@@ -252,6 +285,28 @@ export async function runCorpusCase(c: CorpusCase): Promise<CorpusOutcome> {
       const last = auditLog[auditLog.length - 1];
       actualDecision = 'BLOCK';
       actualReason = last && 'reason' in last.verdict ? last.verdict.reason : undefined;
+    } else if (err instanceof QuarantineInputMismatchError) {
+      // Same shape as the two branches above: summarize()'s own
+      // input-provenance mismatch check (src/quarantine.ts, GAPS.md #4)
+      // records an equivalent BLOCK AuditEvent before throwing, so this
+      // reads it back the same way rather than needing its own case.
+      const last = auditLog[auditLog.length - 1];
+      actualDecision = 'BLOCK';
+      actualReason = last && 'reason' in last.verdict ? last.verdict.reason : undefined;
+    }
+    // Fallback that applies REGARDLESS of which branch above matched (or
+    // whether none did): always surface the underlying error's own message
+    // when nothing has set actualReason yet. Previously, any of this
+    // library's other nine exported error types (UnknownToolError,
+    // NonCloneableArgsError, ReentrantCallError, ArgsTooDeepError,
+    // QuarantineInputUnknownError, QuarantineSourceUnavailableError,
+    // ReservedToolNameError, PlanNotDeclarableError, DualRoleToolError, or
+    // any plain Error) collapsed to the opaque 'decision: expected X, got
+    // ERROR' with no hint of why — a future corpus-case author who mistypes
+    // a fixture key, or hits any less-common broker error path, now gets a
+    // diagnosable CI failure instead.
+    if (actualReason === undefined && err instanceof Error) {
+      actualReason = err.message;
     }
   }
 
