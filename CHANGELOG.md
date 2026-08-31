@@ -1,8 +1,12 @@
 # Changelog
 
-All notable changes to this project are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/), with the pre-1.0 caveat that a minor release may still include a breaking change while the public API stabilizes.
+All notable changes to this project are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/). As of `1.0.0`, the exported API surface (`src/index.ts`) is stable — no more breaking changes without a major bump. Releases before `1.0.0` could still include a breaking change in a minor release while the API stabilized; that caveat no longer applies.
 
 ## [Unreleased]
+
+## [1.0.0] - 2026-08-31
+
+First stable release. The three API-shape questions a pre-1.0 readiness review flagged as needing a decision before the surface could be frozen — `QUARANTINE_AND_RETRY` sitting unproduced in the `PolicyDecision` union, `findOutboundHosts`'s `destinationKeys` narrowing not reaching `BrokerOptions.allowedOutboundHosts`, and plan-freeze state not surviving `serializeBrokerState()`/`restoreBrokerState()` — are all resolved below. As of this tag, the exported surface (`src/index.ts`) follows ordinary SemVer: no more breaking changes without a major bump (see the header above).
 
 ### Added
 
