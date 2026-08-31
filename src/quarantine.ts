@@ -65,7 +65,8 @@ export interface CreateQuarantineOpts {
   impl: QuarantineImpl;
   registry: TaintRegistry;
   raiseToDerivedUntrusted: (tag: ProvenanceTag) => void;
-  getScope: () => { level: TaintLevel; privateDataSeen: boolean };
+  /** Also supplies `id` (the current `TaintScope.id`) for `TaintContext.scopeId` — see that field's own doc comment (types.ts). */
+  getScope: () => { id: string; level: TaintLevel; privateDataSeen: boolean };
   auditSink: AuditSink;
 }
 
@@ -144,6 +145,7 @@ export function createQuarantine(config: CreateQuarantineOpts): QuarantineFn {
             privateDataSeen: getScope().privateDataSeen,
             sinkClass: 'NONE',
             hasUnattributedSubstantialContent: false,
+            scopeId: getScope().id,
           },
           at: Date.now(),
           executed: false,
@@ -203,6 +205,7 @@ export function createQuarantine(config: CreateQuarantineOpts): QuarantineFn {
         privateDataSeen: getScope().privateDataSeen,
         sinkClass: 'NONE',
         hasUnattributedSubstantialContent: false,
+        scopeId: getScope().id,
       },
       at: Date.now(),
       executed: true,

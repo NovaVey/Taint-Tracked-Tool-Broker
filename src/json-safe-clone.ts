@@ -100,7 +100,30 @@ function cloneWithCycleGuard(value: unknown, ancestors: WeakSet<object>): unknow
   ancestors.add(value);
   const out: Record<string, unknown> = {};
   for (const key of Object.keys(value)) {
-    out[key] = cloneWithCycleGuard((value as Record<string, unknown>)[key], ancestors);
+    // Object.defineProperty, not `out[key] = ...`, and deliberately so: a
+    // source object built with an OWN enumerable property literally named
+    // "__proto__" (e.g. computed-property syntax `{ ["__proto__"]: {} }` —
+    // not the object-literal `__proto__:` shorthand, which sets the
+    // prototype instead of creating an own property) is a legitimate
+    // Object.keys()-visible key this loop must faithfully copy. But `out`
+    // is a fresh `{}` with no own "__proto__" property yet to shadow
+    // Object.prototype's inherited `__proto__` accessor — so a plain
+    // bracket assignment `out["__proto__"] = clonedValue` would hit that
+    // inherited setter instead of creating an own property: it silently
+    // REPLACES `out`'s actual prototype with `clonedValue` (or is a
+    // silent no-op if `clonedValue` isn't an object/null), corrupting the
+    // clone's shape and identity instead of faithfully copying the key.
+    // Object.defineProperty always creates/overwrites an own data
+    // property regardless of the key name, exactly like every other key
+    // this loop copies, sidestepping the inherited accessor entirely.
+    // Caught by the fast-check property test below via the exact
+    // `{ ["__proto__"]: {} }` shrunk counterexample.
+    Object.defineProperty(out, key, {
+      value: cloneWithCycleGuard((value as Record<string, unknown>)[key], ancestors),
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
   }
   ancestors.delete(value);
   return out;

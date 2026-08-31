@@ -57,3 +57,30 @@ A tool shaped like `run_code(code: string, context?: string): Output` that can b
 ## When you're still not sure
 
 Default toward the safer misclassification, not the more convenient one: `isSource: true` (not `trusted`) over assuming a result is inert, and a real `capabilities` entry over `[]`, when a tool's actual behavior is genuinely unclear to you. Over-declaring costs some approval friction (GAPS.md #3) for calls that turn out to have been safe; under-declaring costs the entire gate for calls that turn out not to be — a much worse trade, and the one this library has no way to catch after the fact.
+
+## Automating what this checklist can automate
+
+Everything above is a human-judgment checklist by necessity — questions 2 ("is this content genuinely not attacker-influenceable"), 3's harder half (a "read-only" call with a hidden side channel), and 4 all require reading a tool's real implementation, which this library cannot do. But two of the four questions — question 1's "does the name suggest a mutating action but the declared capabilities say `NONE`" mirror-image check, and its sibling for a source that forgot `isSource: true` — reduce to a mechanical check this library already ships as `createBroker({ warnOnLikelyUnmarkedSource, warnOnLikelyUnclassifiedSink })` (GAPS.md #1/#10, both `BrokerOptions` fields' own doc comments in `src/broker.ts`). Today those heuristics only ever surface as `AuditEvent`s emitted through a LIVE `Broker` instance — nothing previously told an integrator they can already get most of the way to a real pre-publish classification-lint step over a whole tool catalog, not just a running session's worth of calls, without building anything new.
+
+**The sink-side half — a pure, standalone lint, no broker required.** `warnOnLikelyUnclassifiedSink`'s registration-time keyword match (question 1's mirror image, question 3's easier half) is a pure function of a tool's `name` and its declared `capabilities` — it never needs a live call to evaluate, only the same static declaration a manifest/catalog file already has sitting in it. That match logic is exported directly as `likelyUnclassifiedSinkKeyword(name: string, keywords?: readonly string[]): string | undefined` (`src/broker.ts`, re-exported from `src/index.ts`) — the identical function `register()`/`wrap()`'s own `warnOnLikelyUnclassifiedSink` check now calls internally, not a reimplementation that could drift from it. Run it over an entire catalog with no broker, no `AuditSink`, and no `register()`/`wrap()` call at all:
+
+```ts
+import { likelyUnclassifiedSinkKeyword } from 'taint-tracked-tool-broker';
+
+for (const tool of myWholeToolCatalog) {
+  if (tool.capabilities.capabilities.length > 0) continue; // already classified as a sink
+  const matched = likelyUnclassifiedSinkKeyword(tool.name);
+  if (matched !== undefined) {
+    console.warn(
+      `${tool.name}: capabilities is empty but the name contains "${matched}" — ` +
+        'question 1 above says double-check this one before shipping.',
+    );
+  }
+}
+```
+
+This is a real manifest-style pre-publish lint — the kind a CI step can run over hundreds of tool declarations in one pass, long before any of them is ever registered against a live broker — not just a live-session advisory. `keywords` defaults to the same list `warnOnLikelyUnclassifiedSink: true` uses; pass your own to match a live broker's tuned list exactly, the same way `warnOnLikelyUnclassifiedSink: readonly string[]` already lets you tune a live broker.
+
+**The broader pattern — register the whole catalog against a broker, execute nothing, read the audit sink.** You don't have to hand-roll the loop above, or restrict yourself to only the sink-side check: `createBroker({ warnOnLikelyUnclassifiedSink: true, warnOnLikelyUnmarkedSource: true, auditSink: { record(e) { lintFindings.push(e); } } })`, then `broker.registerAll(myWholeToolCatalog)` (or a loop of `register()` calls) — zero `execute()`/`call()` calls needed for this to produce useful output. `register()`'s `warnOnLikelyUnclassifiedSink` check fires purely from registration, exactly like `likelyUnclassifiedSinkKeyword()` above, so this "runs the checklist as a lint step" idea holds for the sink-side heuristic without qualification: register the catalog, collect the `AuditEvent`s with `verdict.action === 'ALLOW_WITH_WARNING'` and `call.toolName === '__tttb_registration_warning'`, done.
+
+**The limitation worth stating explicitly, not implying away: this does NOT extend to `warnOnLikelyUnmarkedSource`.** That heuristic (GAPS.md #1's mirror image, `BrokerOptions.warnOnLikelyUnmarkedSource`'s own doc comment) fires from `finishDispatch()` after a real `execute()` call resolves, because the signal it needs — how many characters of text a `NONE`-sinkClass, non-`isSource` tool's result actually contains — is a runtime property of one specific call's return value, not a static property of the tool's declaration the way a `name`/`capabilities` pair is. There is no equivalent `likelyUnmarkedSourceLength()`-style pure function to extract here, and no amount of `register()`-only tooling can substitute for an actual call: a pure-registration pass over a catalog exercises the sink-side heuristic completely, but leaves the source-side heuristic entirely unevaluated for every tool in it. Getting real coverage from that half of the pattern means driving at least one representative call per tool that plausibly returns text — a fixture/mock harness feeding each tool a realistic-length canned response and checking the resulting `AuditEvent`s, closer to a smoke-test suite than a pure static lint. Both heuristics remain purely advisory either way (GAPS.md #1/#10): neither this standalone function nor the live-broker registration pattern above changes what's registered or gates anything on its own, and neither is a substitute for reading a tool's actual implementation against the four questions above.

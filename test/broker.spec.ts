@@ -6,6 +6,7 @@ import {
   DualRoleToolError,
   exactHash,
   InMemoryTaintRegistry,
+  likelyUnclassifiedSinkKeyword,
   NonCloneableArgsError,
   NOT_SENSITIVE,
   PlanNotDeclarableError,
@@ -188,6 +189,46 @@ describe('ToolCallBroker.call()', () => {
     expect(executed).toBe(false);
   });
 
+  it('a caught ToolCallBlockedError carries the TaintContext that actually explains the block — the matched fingerprint record, its argPath, and the scope level — not just the policy verdict', async () => {
+    // A real tainted-source-then-blocked-sink scenario, mirroring the BLOCK
+    // test above, but this time the sink call's args echo the exact
+    // untrusted text back — so Layer 2 (taint/scan.ts) produces a genuine
+    // `exact` TaintMatch, not just a bare watermark taint with nothing to
+    // point to. Before this fix, an integrator catching ToolCallBlockedError
+    // could see `err.decision` (the policy's verdict/reason) but had no way
+    // to see WHICH upstream content actually drove that verdict without
+    // separately wiring an AuditSink and correlating its events back to this
+    // call by id — exactly the gap this test pins shut.
+    const broker = createBroker();
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register(shellExec());
+    await broker.call('fetch_url', {});
+
+    const sourceRecord = broker.registry.lookupExact(MALICIOUS_PAGE);
+    if (!sourceRecord) throw new Error('setup failed: fetch_url result was not registered');
+
+    let caught: ToolCallBlockedError | undefined;
+    try {
+      await broker.call('shell_exec', { cmd: MALICIOUS_PAGE });
+    } catch (error) {
+      caught = error as ToolCallBlockedError;
+    }
+    expect(caught).toBeInstanceOf(ToolCallBlockedError);
+
+    // scopeLevel: the scope was RAW_UNTRUSTED at the moment this decision
+    // was made, not merely "some" TaintContext-shaped object.
+    expect(caught!.taint.scopeLevel).toBe('RAW_UNTRUSTED');
+
+    // matchedRecords/argPath: this call's `cmd` argument genuinely traces
+    // back, via an exact fingerprint match, to the malicious page fetch_url
+    // returned — the specific evidence a policy actually reasoned about,
+    // not something this test independently re-derives from the registry.
+    const match = caught!.taint.matchedRecords.find((m) => m.record.id === sourceRecord.id);
+    expect(match).toBeDefined();
+    expect(match!.argPath).toBe('cmd');
+    expect(match!.matchType).toBe('exact');
+  });
+
   it('REQUIRE_APPROVAL executes when the approval channel grants it, and stays blocked when denied', async () => {
     const broker = createBroker({ approvalChannel: { requestApproval: async () => true } });
     broker.register(fetchUrl(MALICIOUS_PAGE));
@@ -213,6 +254,78 @@ describe('ToolCallBroker.call()', () => {
     await expect(
       broker.call('send_email', { to: 'ops@example.com', body: 'summary' }),
     ).rejects.toBeInstanceOf(ToolCallBlockedError);
+  });
+
+  it('a REQUIRE_APPROVAL denied for "no approvalChannel configured" is distinguishable, in both the thrown error and the AuditEvent, from one a real approvalChannel actively denied (GAPS.md #20)', async () => {
+    // Both brokers reach the identical underlying policy verdict — an
+    // EXFIL sink (send_email) at RAW_UNTRUSTED with no private data seen —
+    // so any difference in the observed error/audit text below comes only
+    // from whether a channel was configured, not from a different verdict.
+    const noChannelEvents: AuditEvent[] = [];
+    const noChannelBroker = createBroker({
+      auditSink: { record: (e) => noChannelEvents.push(e) },
+    });
+    noChannelBroker.register(fetchUrl(MALICIOUS_PAGE));
+    noChannelBroker.register(sendEmail());
+    await noChannelBroker.call('fetch_url', {});
+    noChannelEvents.length = 0; // discard fetch_url's own ALLOW_WITH_WARNING audit event
+
+    const deniedEvents: AuditEvent[] = [];
+    const deniedBroker = createBroker({
+      approvalChannel: { requestApproval: async () => false },
+      auditSink: { record: (e) => deniedEvents.push(e) },
+    });
+    deniedBroker.register(fetchUrl(MALICIOUS_PAGE));
+    deniedBroker.register(sendEmail());
+    await deniedBroker.call('fetch_url', {});
+    deniedEvents.length = 0; // discard fetch_url's own ALLOW_WITH_WARNING audit event
+
+    let noChannelError: ToolCallBlockedError | undefined;
+    try {
+      await noChannelBroker.call('send_email', { to: 'ops@example.com', body: 'summary' });
+    } catch (error) {
+      noChannelError = error as ToolCallBlockedError;
+    }
+    let deniedError: ToolCallBlockedError | undefined;
+    try {
+      await deniedBroker.call('send_email', { to: 'ops@example.com', body: 'summary' });
+    } catch (error) {
+      deniedError = error as ToolCallBlockedError;
+    }
+
+    expect(noChannelError).toBeInstanceOf(ToolCallBlockedError);
+    expect(deniedError).toBeInstanceOf(ToolCallBlockedError);
+    expect(noChannelEvents).toHaveLength(1);
+    expect(deniedEvents).toHaveLength(1);
+
+    // Both AuditEvents are for the exact denied REQUIRE_APPROVAL verdict —
+    // asserted before narrowing so the `.reason` accesses below type-check
+    // against RequireApprovalDecision, not the wider PolicyDecision union
+    // (only some of whose members carry a `reason` at all).
+    expect(deniedEvents[0]!.verdict.action).toBe('REQUIRE_APPROVAL');
+    expect(noChannelEvents[0]!.verdict.action).toBe('REQUIRE_APPROVAL');
+    if (deniedEvents[0]!.verdict.action !== 'REQUIRE_APPROVAL') throw new Error('unreachable');
+    if (noChannelEvents[0]!.verdict.action !== 'REQUIRE_APPROVAL') throw new Error('unreachable');
+
+    // Same policy reason underneath both — proves the fix THREADS a note
+    // onto the policy's own text rather than replacing it.
+    const policyReason = 'EXFIL sink while untrusted content is live in this scope.';
+    expect(deniedError!.message).toContain(policyReason);
+    expect(deniedEvents[0]!.verdict.reason).toBe(policyReason);
+
+    // The no-channel case's message/reason is the SAME policy text plus a
+    // clearly distinguishing, specific note naming the actual cause.
+    const expectedNoChannelReason = `${policyReason} (no approvalChannel configured -- see BrokerOptions.approvalChannel)`;
+    expect(noChannelEvents[0]!.verdict.reason).toBe(expectedNoChannelReason);
+    expect(noChannelError!.message).toContain(expectedNoChannelReason);
+    expect((noChannelError!.decision as { reason?: string }).reason).toBe(expectedNoChannelReason);
+
+    // The two are genuinely different strings — a real channel denial must
+    // NEVER pick up the no-channel note (the channel here IS configured; it
+    // just returned false), and vice versa.
+    expect(noChannelError!.message).not.toBe(deniedError!.message);
+    expect(deniedError!.message).not.toContain('no approvalChannel configured');
+    expect(deniedEvents[0]!.verdict.reason).not.toContain('no approvalChannel configured');
   });
 
   it('records readsPrivateData exposure independent of the call taint', async () => {
@@ -308,6 +421,106 @@ describe('ToolCallBroker.call()', () => {
     await expect(wrappedShell.execute({ cmd: 'anything' })).rejects.toBeInstanceOf(
       ToolCallBlockedError,
     );
+  });
+});
+
+describe('AuditEvent.requestedAt (REQUIRE_APPROVAL wait latency)', () => {
+  it('is set only on a REQUIRE_APPROVAL verdict — undefined for ALLOW, ALLOW_WITH_WARNING, and BLOCK', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.register(fetchUrl(MALICIOUS_PAGE)); // ALLOW_WITH_WARNING (source raise)
+    broker.register(shellExec()); // EXEC sink, RAW_UNTRUSTED -> BLOCK, unconditionally
+    broker.register({
+      name: 'noop',
+      capabilities: { capabilities: [] },
+      async execute() {
+        return 'ok';
+      },
+    });
+
+    await broker.call('noop', {}); // NONE-sinkClass, no-op: no audit event at all
+    await broker.call('fetch_url', {}); // ALLOW_WITH_WARNING
+    await expect(broker.call('shell_exec', { cmd: 'x' })).rejects.toBeInstanceOf(
+      ToolCallBlockedError,
+    ); // BLOCK
+
+    expect(events).toHaveLength(2);
+    expect(events[0]?.verdict.action).toBe('ALLOW_WITH_WARNING');
+    expect(events[0]?.requestedAt).toBeUndefined();
+    expect(events[1]?.verdict.action).toBe('BLOCK');
+    expect(events[1]?.requestedAt).toBeUndefined();
+  });
+
+  it('is set (and lets latency be computed) for a granted REQUIRE_APPROVAL call, proportional to how long the channel actually took', async () => {
+    const APPROVAL_DELAY_MS = 40;
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      auditSink: { record: (e) => events.push(e) },
+      approvalChannel: {
+        async requestApproval() {
+          await new Promise((resolve) => setTimeout(resolve, APPROVAL_DELAY_MS));
+          return true;
+        },
+      },
+    });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register(sendEmail());
+    await broker.call('fetch_url', {});
+    events.length = 0; // isolate the send_email REQUIRE_APPROVAL event
+
+    await broker.call('send_email', { to: 'ops@example.com', body: 'x' });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.verdict.action).toBe('REQUIRE_APPROVAL');
+    expect(events[0]?.executed).toBe(true);
+    expect(events[0]?.requestedAt).toBeTypeOf('number');
+    // event.at - event.requestedAt is the documented latency computation
+    // (AuditEvent.requestedAt's own doc comment, types.ts) — it must be at
+    // least the artificial delay the channel actually waited (with a small
+    // tolerance for scheduling jitter, never a full extra delay's worth),
+    // and requestedAt itself must land no later than the final `at`.
+    const latency = events[0]!.at - events[0]!.requestedAt!;
+    expect(latency).toBeGreaterThanOrEqual(APPROVAL_DELAY_MS - 5);
+    expect(latency).toBeLessThan(APPROVAL_DELAY_MS + 2000);
+    expect(events[0]!.requestedAt!).toBeLessThanOrEqual(events[0]!.at);
+  });
+
+  it('is set for a DENIED REQUIRE_APPROVAL call too, including the genuine no-approvalChannel-configured fail-safe case', async () => {
+    const deniedEvents: AuditEvent[] = [];
+    const deniedBroker = createBroker({
+      approvalChannel: { requestApproval: async () => false },
+      auditSink: { record: (e) => deniedEvents.push(e) },
+    });
+    deniedBroker.register(fetchUrl(MALICIOUS_PAGE));
+    deniedBroker.register(sendEmail());
+    await deniedBroker.call('fetch_url', {});
+    deniedEvents.length = 0;
+    await expect(
+      deniedBroker.call('send_email', { to: 'ops@example.com', body: 'x' }),
+    ).rejects.toBeInstanceOf(ToolCallBlockedError);
+    expect(deniedEvents).toHaveLength(1);
+    expect(deniedEvents[0]?.verdict.action).toBe('REQUIRE_APPROVAL');
+    expect(deniedEvents[0]?.executed).toBe(false);
+    expect(deniedEvents[0]?.requestedAt).toBeTypeOf('number');
+
+    // No approvalChannel configured at all: dispatchGated() still reaches
+    // the identical phase-2 code path, it just resolves synchronously —
+    // requestedAt is still set (a near-zero, but real, latency), per
+    // AuditEvent.requestedAt's own doc comment.
+    const noChannelEvents: AuditEvent[] = [];
+    const noChannelBroker = createBroker({
+      auditSink: { record: (e) => noChannelEvents.push(e) },
+    });
+    noChannelBroker.register(fetchUrl(MALICIOUS_PAGE));
+    noChannelBroker.register(sendEmail());
+    await noChannelBroker.call('fetch_url', {});
+    noChannelEvents.length = 0;
+    await expect(
+      noChannelBroker.call('send_email', { to: 'ops@example.com', body: 'x' }),
+    ).rejects.toBeInstanceOf(ToolCallBlockedError);
+    expect(noChannelEvents).toHaveLength(1);
+    expect(noChannelEvents[0]?.requestedAt).toBeTypeOf('number');
+    expect(noChannelEvents[0]!.requestedAt!).toBeLessThanOrEqual(noChannelEvents[0]!.at);
   });
 });
 
@@ -566,6 +779,59 @@ describe('warnOnLikelyUnclassifiedSink (opt-in advisory heuristic, GAPS.md #10)'
   });
 });
 
+describe('likelyUnclassifiedSinkKeyword() (GAPS.md #10 keyword match, extracted as a standalone pure function)', () => {
+  it('matches a default keyword case-insensitively and returns the matched keyword itself', () => {
+    expect(likelyUnclassifiedSinkKeyword('write_file')).toBe('write');
+    expect(likelyUnclassifiedSinkKeyword('SEND_Email')).toBe('send');
+  });
+
+  it('returns undefined when nothing in the default list matches', () => {
+    expect(likelyUnclassifiedSinkKeyword('read_config')).toBeUndefined();
+  });
+
+  it('honors a custom keyword list instead of the default one', () => {
+    expect(likelyUnclassifiedSinkKeyword('write_file', ['frobnicate'])).toBeUndefined();
+    expect(likelyUnclassifiedSinkKeyword('frobnicate_widget', ['frobnicate'])).toBe('frobnicate');
+  });
+
+  it('needs no broker, AuditSink, or register()/wrap() call — usable as a pure manifest-lint function', () => {
+    // The point of the extraction: this is the entire lint step for a tool
+    // catalog entry, no ToolExecutor object or broker ceremony required.
+    const catalog = [
+      { name: 'write_file', capabilities: [] as string[] },
+      { name: 'read_config', capabilities: [] as string[] },
+      { name: 'delete_record', capabilities: ['irreversible:other'] }, // already classified — caller skips it
+    ];
+    const flagged = catalog
+      .filter((t) => t.capabilities.length === 0)
+      .map((t) => ({ name: t.name, matched: likelyUnclassifiedSinkKeyword(t.name) }))
+      .filter((t) => t.matched !== undefined);
+    expect(flagged).toEqual([{ name: 'write_file', matched: 'write' }]);
+  });
+
+  it("is the exact function register()'s warnOnLikelyUnclassifiedSink advisory now delegates to, not a parallel reimplementation", () => {
+    // Regression pin for the extraction itself: the live-broker advisory's
+    // matched keyword must be byte-identical to what the standalone
+    // function reports for the same name/keyword-list pair, since
+    // register() now calls this function internally instead of
+    // re-deriving the match inline.
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      warnOnLikelyUnclassifiedSink: true,
+      auditSink: { record: (e) => events.push(e) },
+    });
+    broker.register({
+      name: 'write_file',
+      capabilities: { capabilities: [] },
+      async execute() {
+        return 'ok';
+      },
+    });
+    const args = events[0]?.call.args as { toolName: string; matchedKeyword: string };
+    expect(args.matchedKeyword).toBe(likelyUnclassifiedSinkKeyword('write_file'));
+  });
+});
+
 describe('startNewTurn / declassify', () => {
   it("resetScope:'turn' clears the watermark on startNewTurn()", async () => {
     const broker = createBroker({ resetScope: 'turn' });
@@ -702,6 +968,104 @@ describe('startNewTurn / declassify', () => {
     expect(
       events[0]?.verdict.action === 'ALLOW_WITH_WARNING' && events[0].verdict.reason,
     ).toContain('its declared plan was discarded alongside it');
+  });
+});
+
+describe('TaintContext.scopeId (turn/scope correlation)', () => {
+  it('every AuditEvent from the same scope carries the same scopeId, matching broker.scope.id', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register(shellExec());
+    const scopeIdAtStart = broker.scope.id;
+
+    await broker.call('fetch_url', {}); // ALLOW_WITH_WARNING (source raise)
+    await expect(broker.call('shell_exec', { cmd: 'x' })).rejects.toBeInstanceOf(
+      ToolCallBlockedError,
+    ); // BLOCK
+
+    expect(events).toHaveLength(2);
+    for (const event of events) {
+      expect(event.taint.scopeId).toBe(scopeIdAtStart);
+    }
+    // resetScope: 'session' (the default) never mints a new scope after
+    // construction — grouping by scopeId degenerates to "the whole
+    // session," correctly, per TaintContext.scopeId's own doc comment.
+    expect(broker.scope.id).toBe(scopeIdAtStart);
+  });
+
+  it("resetScope: 'turn' mints a fresh scope id on startNewTurn() — a later call's event carries the NEW id, while the turn-reset event itself names the DISCARDED (prior) scope's id, not the new one", async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      resetScope: 'turn',
+      auditSink: { record: (e) => events.push(e) },
+    });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+
+    const turn1ScopeId = broker.scope.id;
+    await broker.call('fetch_url', {});
+    events.length = 0; // isolate what follows
+
+    broker.startNewTurn();
+    const turn2ScopeId = broker.scope.id;
+    expect(turn2ScopeId).not.toBe(turn1ScopeId);
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.call.toolName).toBe('__tttb_turn_reset');
+    // Mirrors taint.scopeLevel already reporting the PRIOR (discarded)
+    // level on this same event, never the resulting CLEAN one.
+    expect(events[0]?.taint.scopeId).toBe(turn1ScopeId);
+
+    // A fresh CLEAN scope now: a later call's own event carries the NEW
+    // scope's id, proving scopeId actually tracks live turn boundaries
+    // rather than being fixed at broker construction.
+    broker.register({
+      name: 'write_note',
+      capabilities: { capabilities: ['write:fs'] },
+      async execute() {
+        return 'ok';
+      },
+    });
+    await broker.call('write_note', {});
+    expect(events).toHaveLength(2);
+    expect(events[1]?.taint.scopeId).toBe(turn2ScopeId);
+    expect(events[1]?.taint.scopeId).not.toBe(turn1ScopeId);
+  });
+
+  it('declassify() does NOT mint a new scope id — its own audit event, and any later call, still carry the same id the cleared watermark belonged to', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    const scopeId = broker.scope.id;
+    await broker.call('fetch_url', {});
+    events.length = 0;
+
+    broker.declassify('reviewed and cleared by a human', 'alice@example.com');
+    // declassifyScope() mutates this.currentScope.watermark in place rather
+    // than replacing the scope object, unlike a turn-boundary reset — so,
+    // unlike the 'turn' test above, the id itself must NOT change here.
+    expect(broker.scope.id).toBe(scopeId);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.call.toolName).toBe('__tttb_declassify');
+    expect(events[0]?.taint.scopeId).toBe(scopeId);
+  });
+
+  it('broker.summarize() (quarantine path) audit events carry the current scope id too', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      auditSink: { record: (e) => events.push(e) },
+      quarantineImpl: stubQuarantineImpl,
+    });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    events.length = 0;
+
+    const record = broker.registry.lookupExact(MALICIOUS_PAGE);
+    if (!record) throw new Error('setup failed: fetch_url result was not registered');
+    await broker.summarize(MALICIOUS_PAGE, { sessionId: 's', sourceTaintRecordId: record.id });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.taint.scopeId).toBe(broker.scope.id);
   });
 });
 
@@ -2326,6 +2690,94 @@ describe('audit trail when an allowed/approved execute() throws', () => {
     expect(events).toHaveLength(1);
     expect(events[0]?.executed).toBe(true);
     expect(events[0]?.verdict.action).toBe('REQUIRE_APPROVAL');
+  });
+});
+
+// GAPS.md #24: AuditEvent.call.args was the tool call's real, cloned
+// argument object for every audited event, unredacted — a credential, an
+// API key, or a private-document excerpt reached whatever AuditSink an
+// integrator configured verbatim, with no seam to keep it out.
+// BrokerOptions.redactAuditArgs closes that seam; these tests prove it
+// actually transforms what the RAW configured sink receives (not just what
+// some intermediate value looks like) and that leaving it unset preserves
+// today's behavior byte-for-byte.
+describe('redactAuditArgs (opt-in audit-args redaction, GAPS.md #24)', () => {
+  it("replaces call.args with the configured redactor's return value before the raw AuditSink ever sees it", async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      auditSink: { record: (e) => events.push(e) },
+      redactAuditArgs: (call) => ({ redacted: true, toolName: call.toolName }),
+    });
+    broker.register(shellExec());
+
+    await broker.call('shell_exec', { cmd: 'echo hello', apiKey: 'sk-super-secret-12345' });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.call.args).toEqual({ redacted: true, toolName: 'shell_exec' });
+    // The sensitive value never reaches the recorded event in any form.
+    expect(JSON.stringify(events[0])).not.toContain('sk-super-secret-12345');
+  });
+
+  it('receives the real (unredacted) call and the matching taint context, so a redactor can make a taint-aware decision', async () => {
+    const seen: Array<{ toolName: string; args: unknown; sinkClass: string }> = [];
+    const broker = createBroker({
+      auditSink: { record: () => {} },
+      redactAuditArgs: (call, taint) => {
+        seen.push({ toolName: call.toolName, args: call.args, sinkClass: taint.sinkClass });
+        return call.args;
+      },
+    });
+    broker.register(shellExec());
+
+    await broker.call('shell_exec', { cmd: 'echo hi' });
+
+    expect(seen).toEqual([{ toolName: 'shell_exec', args: { cmd: 'echo hi' }, sinkClass: 'EXEC' }]);
+  });
+
+  it('touches call.args only — verdict/executed and the rest of call on the recorded event are unaffected', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      auditSink: { record: (e) => events.push(e) },
+      redactAuditArgs: () => '[redacted]',
+    });
+    broker.register(shellExec());
+
+    await broker.call('shell_exec', { cmd: 'echo hi' });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.verdict).toEqual({ action: 'ALLOW' });
+    expect(events[0]?.executed).toBe(true);
+    expect(events[0]?.call.args).toBe('[redacted]');
+    expect(events[0]?.call.toolName).toBe('shell_exec');
+  });
+
+  it('applies uniformly to administrative/advisory events too, not only gated sink calls — a single choke point, not a per-call-site opt-in', () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      auditSink: { record: (e) => events.push(e) },
+      redactAuditArgs: () => '[redacted]',
+    });
+
+    broker.markContextExposure({
+      note: 'poisoned tool description',
+      text: 'super secret leaked text',
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.call.args).toBe('[redacted]');
+    expect(JSON.stringify(events[0])).not.toContain('super secret leaked text');
+  });
+
+  it('left unset, call.args reaches the raw sink completely unchanged — identical to behavior before this option existed', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.register(shellExec());
+    const args = { cmd: 'echo hi', apiKey: 'sk-super-secret-12345' };
+
+    await broker.call('shell_exec', args);
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.call.args).toEqual(args);
   });
 });
 

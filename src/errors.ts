@@ -1,4 +1,4 @@
-import type { PolicyDecision, ToolCall } from './types.js';
+import type { PolicyDecision, TaintContext, ToolCall } from './types.js';
 import { RESERVED_TOOL_NAME_PREFIX } from './internal-audit.js';
 
 export class TaintBrokerError extends Error {}
@@ -31,16 +31,47 @@ export class UnknownToolError extends TaintBrokerError {
   }
 }
 
-/** Thrown by ToolCallBroker.call() whenever the policy verdict was not ALLOW/ALLOW_WITH_WARNING or an approved REQUIRE_APPROVAL. */
+/**
+ * Thrown by ToolCallBroker.call() whenever the policy verdict was not
+ * ALLOW/ALLOW_WITH_WARNING or an approved REQUIRE_APPROVAL.
+ *
+ * `taint` carries the exact `TaintContext` `finalizeGated()` (`broker.ts`)
+ * had in hand at the moment this was thrown — the same object recorded on
+ * the corresponding `AuditEvent.taint` for this call, not a fresh
+ * re-derivation. Without it, a `catch` block here could see only
+ * `decision` (the verdict and why the POLICY made it) and had no way to
+ * see the taint evidence the policy actually decided FROM — which
+ * `TaintRecord`s in `matchedRecords` this call's arguments matched, at
+ * what `argPath`, and the scope's `scopeLevel`/`privateDataSeen` at
+ * decision time — without separately wiring an `AuditSink` and
+ * correlating its events back to this call by `call.id`. That correlation
+ * step is exactly the information a self-explanatory catch block
+ * shouldn't need: the `TaintContext` was already computed for this
+ * decision and sitting in scope right where this error is constructed: it
+ * costs nothing to attach it here, and every `ToolCallBlockedError` this
+ * library constructs sets it. See DESIGN.md §7.3 for what a
+ * `TaintContext` represents and `AuditEvent` (types.ts) for its sibling
+ * on the audit-log side.
+ *
+ * Unlike a field added to a public *interface* (`TaintContext`,
+ * `AuditEvent`, `PolicyDecision`, ... — see CHANGELOG.md's versioning
+ * policy note), `taint` is NOT optional here: `ToolCallBlockedError` is a
+ * concrete class only ever constructed by this library, never a shape an
+ * external `PolicyFn`/fixture/mock structurally implements, so there is
+ * no pre-existing external construction site this field could break by
+ * being required.
+ */
 export class ToolCallBlockedError extends TaintBrokerError {
   readonly call: ToolCall;
   readonly decision: PolicyDecision;
+  readonly taint: TaintContext;
 
-  constructor(call: ToolCall, decision: PolicyDecision, message: string) {
+  constructor(call: ToolCall, decision: PolicyDecision, taint: TaintContext, message: string) {
     super(message);
     this.name = 'ToolCallBlockedError';
     this.call = call;
     this.decision = decision;
+    this.taint = taint;
   }
 }
 

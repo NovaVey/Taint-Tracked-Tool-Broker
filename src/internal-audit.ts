@@ -53,8 +53,17 @@ export function isUntrustedSource(tool: Pick<ToolExecutor, 'isSource' | 'trusted
  * unknown-source-record rejection. None of these involve a sink or a
  * fingerprint match driving the decision — only the scope level and
  * privateDataSeen flag at the time.
+ *
+ * `scope.id` populates `TaintContext.scopeId` (see that field's own doc
+ * comment, types.ts) — every one of this function's callers already has a
+ * `TaintScope`'s id in hand (either `this.currentScope.id` directly, a
+ * captured `dispatchScope`/prior-scope id for the two call sites that need
+ * one other than the live current scope, or `getScope().id` from
+ * quarantine.ts's own scope accessor), so there is no call site that would
+ * have to fabricate one.
  */
 export function trivialTaintContext(scope: {
+  id: string;
   level: TaintLevel;
   privateDataSeen: boolean;
 }): TaintContext {
@@ -65,6 +74,7 @@ export function trivialTaintContext(scope: {
     privateDataSeen: scope.privateDataSeen,
     sinkClass: 'NONE',
     hasUnattributedSubstantialContent: false,
+    scopeId: scope.id,
   };
 }
 
@@ -73,7 +83,7 @@ export function recordTrivialAudit(
   auditSink: AuditSink,
   verdict: PolicyDecision,
   call: ToolCall,
-  scope: { level: TaintLevel; privateDataSeen: boolean },
+  scope: { id: string; level: TaintLevel; privateDataSeen: boolean },
   executed: boolean,
 ): void {
   auditSink.record({ verdict, call, taint: trivialTaintContext(scope), at: Date.now(), executed });

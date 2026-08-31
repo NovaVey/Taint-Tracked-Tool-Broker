@@ -380,8 +380,9 @@ export interface SerializedTaintMatch extends Omit<TaintMatch, 'record'> {
  * at all — every gated call produces one. Every other `AuditEvent` field
  * (`verdict`, `call.id`/`toolName`/`sessionId`, `taint.scopeLevel`/
  * `argFingerprintFloor`/`privateDataSeen`/`sinkClass`/
- * `hasUnattributedSubstantialContent`, `at`, `executed`) is already a plain
- * string/number/boolean/plain-object value with no conversion need — see
+ * `hasUnattributedSubstantialContent`/`scopeId`, `at`, `executed`,
+ * `requestedAt`) is already a plain string/number/boolean/plain-object
+ * value with no conversion need — see
  * `types.ts`'s `AuditEvent`/`TaintContext`/`ToolCall`/`PolicyDecision` for
  * the full shape. `call.args` is deliberately left untouched: it is
  * `unknown`, under the calling integrator's own tool's control, not this

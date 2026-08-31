@@ -19,6 +19,7 @@ Provenance labeling for agent inputs, enforced at the tool-call boundary. Blocks
 - [Injection corpus](#injection-corpus)
 - [Known gaps](#known-gaps)
 - [Versioning](#versioning)
+- [Language-neutral specification](#language-neutral-specification)
 - [Development](#development)
 - [License](#license)
 
@@ -86,6 +87,77 @@ await shellExec.execute({ cmd: 'anything the model writes, paraphrased or not' }
 // command text says
 ```
 
+**Note the `createBroker()` above passes no `auditSink`.** That's a supported, fully-working configuration — every gate above is still enforced correctly — but it also means this exact snippet produces *zero* audit trail: the default `auditSink` is a silent no-op. Pass a real one (`createBroker({ auditSink: { record(e) { ... } } })`) for anything beyond a quick local check — see Core model below and GAPS.md #25.
+
+**A more realistic session.** `shell_exec` above is an `EXEC` sink, unconditionally `BLOCK`ed once anything untrusted is live in scope — the clearest case to demonstrate first, but also the rare one: most real tools are `MUTATE`/`EXFIL` (`write_file`, `send_email`, an API call), which land on `REQUIRE_APPROVAL` instead of a flat `BLOCK`, and actually consulting that verdict means configuring `approvalChannel`, catching the resulting `ToolCallBlockedError`, and reading `auditSink`. This second example shows that full, common path:
+
+```ts
+import {
+  createBroker,
+  createDeferredApprovalChannel,
+  formatAuditTrail,
+  ToolCallBlockedError,
+  type AuditEvent,
+} from 'taint-tracked-tool-broker';
+
+const events: AuditEvent[] = [];
+
+// A real integration notifies a human here (Slack, an approval-queue UI, a
+// webhook) and calls approvalChannel.resolve(token, granted) from whatever
+// handler receives their decision — createDeferredApprovalChannel() just
+// gives you the token-keyed pending-request bookkeeping for that. This
+// simulates an approval arriving shortly after the request is made.
+const approvalChannel = createDeferredApprovalChannel({
+  onPending: (token) => {
+    setTimeout(() => approvalChannel.resolve(token, true), 50);
+  },
+});
+
+const broker = createBroker({
+  approvalChannel,
+  auditSink: { record(e) { events.push(e); } },
+});
+
+const fetchUrl = broker.wrap({
+  name: 'fetch_url',
+  capabilities: { capabilities: [] },
+  isSource: true,
+  async execute({ url }) {
+    return realFetch(url);
+  },
+});
+
+const writeFile = broker.wrap({
+  name: 'write_file',
+  capabilities: { capabilities: ['write:fs'] }, // a MUTATE-class sink
+  async execute({ path, contents }) {
+    return realWriteFile(path, contents);
+  },
+});
+
+await fetchUrl.execute({ url: 'https://example.com' });
+// watermark is now RAW_UNTRUSTED for this scope, same as the EXEC example.
+
+try {
+  await writeFile.execute({ path: '/tmp/notes.txt', contents: 'from the model' });
+  // REQUIRE_APPROVAL, granted by the simulated approval above -> proceeds.
+} catch (err) {
+  if (err instanceof ToolCallBlockedError) {
+    // err.taint is the exact TaintContext this decision was computed from —
+    // which upstream content actually triggered it (err.taint.matchedRecords),
+    // and the scope level at decision time (err.taint.scopeLevel) — without
+    // separately wiring auditSink and correlating it back by call id.
+    console.log(`blocked: ${err.message} (scope was ${err.taint.scopeLevel})`);
+  } else {
+    throw err;
+  }
+}
+
+console.log(formatAuditTrail(events));
+// one readable line per AuditEvent: timestamp, tool, args, verdict, scope
+// level, executed?, and the policy's reason — see Core model below.
+```
+
 ## Core model
 
 - **A single trust lattice** — `CLEAN < DERIVED_UNTRUSTED < RAW_UNTRUSTED` — used for both the scope watermark and individual fingerprint records.
@@ -99,6 +171,8 @@ await shellExec.execute({ cmd: 'anything the model writes, paraphrased or not' }
 - **`QUARANTINE_AND_RETRY`** is a decision `defaultPolicy` can hand back alongside `ALLOW`/`ALLOW_WITH_WARNING`/`REQUIRE_APPROVAL`/`BLOCK`: when an otherwise-`BLOCK`/`REQUIRE_APPROVAL` verdict traces to a specifically identifiable untrusted source (a confident Layer 2 fingerprint match, not just a bare watermark taint), it replaces that verdict with a named suggestion to re-run the source through `broker.summarize()` and retry — never auto-executed, purely informational.
 - **State can cross a process boundary.** `createBroker({ initialWatermark, registry })` plus `serializeBrokerState()`/`restoreBrokerState()` let one broker's watermark, registry, and any declared plan-freeze plan (resuming at the exact cursor it was at when exported) be exported (JSON-safe) and used to seed another — for a sub-agent, a worker, or a resumed session. Not automatic; an integrator still has to call these and pass the result along.
 - **Every gated decision reaches `BrokerOptions.auditSink` as an `AuditEvent` — but don't hand it to `JSON.stringify()` directly.** When a call's arguments fuzzy- or exact-match a previously-registered record (the ordinary case for a real attack, not an edge case), `event.taint.matchedRecords[].record.fingerprint` carries a `bigint` and a `Uint32Array`, which `JSON.stringify` throws on and silently mangles, respectively — so the single most obvious `AuditSink`, `record(e) { console.log(JSON.stringify(e)) }`, crashes on the first such event. Use `serializeAuditEvent()` (`src/persistence.ts`) first: `JSON.stringify(serializeAuditEvent(event))`. See `AuditSink`'s own doc comment (`src/types.ts`) for the full explanation.
+- **`event.call.args` is the tool call's real, unredacted arguments, exactly as sent — a credential, an API key, a chunk of a private document can reach your `auditSink` verbatim.** `createBroker({ redactAuditArgs })` is an opt-in hook applied to `call.args` only, on every `AuditEvent`, before it reaches your sink — this library ships no default redaction logic (it can't know what counts as sensitive in your own tool arguments), just the seam. See [`docs/audit-redaction.md`](./docs/audit-redaction.md) for worked patterns and GAPS.md #24 for the gap this closes.
+- **The default `auditSink` — what you get by configuring nothing, including by following Quick start above verbatim — is a silent no-op.** Every gate is still enforced correctly either way, but a broker built that way produces zero audit trail. `formatAuditTrail(events)`, `explainWatermark(scope)`, and `AggregatingAuditSink` (`src/debug.ts`, also exported from the package root) turn a configured sink's raw `AuditEvent`s into readable prose, a plain-language explanation of why the watermark is what it is, and a `snapshot(): Record<string, number>` of verdict/approval/latency counters, respectively — none of it new tracking, all of it rendering data this library already collects. See GAPS.md #25.
 
 Read [`DESIGN.md`](./DESIGN.md) for why each of these choices was made, including the soundness gap the design's own judge-panel process found and closed before this was implemented.
 
@@ -141,6 +215,10 @@ Found a way past the gating logic that isn't already in that list? See [`SECURIT
 This project follows [SemVer](https://semver.org/). As of `1.0.0`, the exported API surface (everything reachable from [`src/index.ts`](./src/index.ts)) is stable — no more silent renames or shape changes without a major version bump. Before `1.0.0`, a minor release could still include a breaking change while the API stabilized (see [`CHANGELOG.md`](./CHANGELOG.md) for that history); that caveat no longer applies going forward. Check the changelog for what actually changed between any two versions before upgrading regardless.
 
 That covenant is about API shape only. Behavioral limitations — what the broker does and doesn't catch — are tracked in [`GAPS.md`](./GAPS.md) and [`DESIGN.md`](./DESIGN.md) regardless of version number, and reaching 1.0 doesn't imply those gaps are closed.
+
+## Language-neutral specification
+
+This is a TypeScript/Node-only library, but the underlying model — the taint lattice, the watermark semantics, the sink-class taxonomy, the default policy decision table, the sanctioned quarantine path, and the audit-event shape — is published separately as [`PROTOCOL.md`](./PROTOCOL.md), in pseudocode/tables/prose rather than TypeScript. It exists for anyone wanting to implement or evaluate this model in a different language or runtime (a Python port, for instance) without requiring this repository to become a second security-critical codebase in a second language: this project is small and solo-maintained (see [`SECURITY.md`](./SECURITY.md)), and a full cross-language port of a security-critical library was deliberately rejected in favor of a shared specification an independent implementation can build against. This TypeScript implementation is the reference implementation of that specification — see `PROTOCOL.md`'s own Conformance section.
 
 ## Development
 
