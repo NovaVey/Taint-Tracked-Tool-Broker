@@ -136,9 +136,9 @@ Found a way past the gating logic that isn't already in that list? See [`SECURIT
 
 ## Versioning
 
-This project follows [SemVer](https://semver.org/), with the pre-1.0 caveat already stated in [`CHANGELOG.md`](./CHANGELOG.md): a minor release may still include a breaking change while the public API stabilizes. Check the changelog for what actually changed between any two versions before upgrading.
+This project follows [SemVer](https://semver.org/). As of `1.0.0`, the exported API surface (everything reachable from [`src/index.ts`](./src/index.ts)) is stable — no more silent renames or shape changes without a major version bump. Before `1.0.0`, a minor release could still include a breaking change while the API stabilized (see [`CHANGELOG.md`](./CHANGELOG.md) for that history); that caveat no longer applies going forward. Check the changelog for what actually changed between any two versions before upgrading regardless.
 
-What 1.0 will mean here: once this is tagged `1.0.0`, the exported API surface (everything reachable from [`src/index.ts`](./src/index.ts)) is stable per SemVer — no more silent renames or shape changes without a major bump. That covenant is about API shape only. Behavioral limitations — what the broker does and doesn't catch — are tracked in [`GAPS.md`](./GAPS.md) and [`DESIGN.md`](./DESIGN.md) regardless of version number, and reaching 1.0 doesn't imply those gaps are closed.
+That covenant is about API shape only. Behavioral limitations — what the broker does and doesn't catch — are tracked in [`GAPS.md`](./GAPS.md) and [`DESIGN.md`](./DESIGN.md) regardless of version number, and reaching 1.0 doesn't imply those gaps are closed.
 
 ## Development
 
