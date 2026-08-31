@@ -22,4 +22,4 @@ Include, where you can:
 
 ## Response
 
-This is presently a small/solo-maintained project — there's no formal SLA, but security reports get priority over other work. Once a fix lands, it'll ship as a patch release with the report credited (unless you'd rather stay anonymous), and — if it was a real gap — reflected honestly in `GAPS.md` or the corpus, not quietly dropped.
+This is presently a small/solo-maintained project — there's no formal SLA, but security reports get priority over other work. In practice that means the private vulnerability reporting inbox is checked personally and reports get triaged as they come in, with anything that looks like a genuine Layer 0 watermark/gating bypass (as opposed to a Layer 2 attribution false-negative, already an accepted category in `GAPS.md`) jumping to the front of the queue. Once a fix lands, it'll ship as a patch release with the report credited (unless you'd rather stay anonymous), and — if it was a real gap — reflected honestly in `GAPS.md` or the corpus, not quietly dropped.

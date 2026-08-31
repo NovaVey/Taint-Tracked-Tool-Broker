@@ -89,13 +89,14 @@ function sendEmail(): ToolExecutor {
   };
 }
 
-function netPost(): ToolExecutor {
+function netPost(opts: Partial<ToolExecutor> = {}): ToolExecutor {
   return {
     name: 'net_post',
     capabilities: { capabilities: ['net:outbound'] },
     async execute(args) {
       return `posted:${JSON.stringify(args)}`;
     },
+    ...opts,
   };
 }
 
@@ -2057,6 +2058,53 @@ describe('allowedOutboundHosts (opt-in egress allowlist, DESIGN.md §7.4)', () =
     expect(events).toHaveLength(1);
     expect(events[0]?.verdict.action).toBe('BLOCK');
     expect(events[0]?.executed).toBe(false);
+  });
+
+  // ToolExecutor.destinationKeys (types.ts, GAPS.md #18, DESIGN.md §7.4):
+  // findOutboundHosts()'s own destinationKeys narrowing, now threaded
+  // through this gating call site via the registering tool's own
+  // declaration rather than only reachable by calling findOutboundHosts()
+  // directly.
+  describe('ToolExecutor.destinationKeys narrowing (GAPS.md #18)', () => {
+    it('a tool WITHOUT destinationKeys still gets the original whole-tree scan — no behavior change from before this field existed', async () => {
+      const broker = createBroker({ allowedOutboundHosts: ['approved.example'] });
+      broker.register(netPost()); // no destinationKeys declared
+      // `text` isn't net_post's real destination — it's a benign field that
+      // merely happens to be, in its entirety, a URL. Whole-tree scanning
+      // means it still trips the allowlist, exactly as it always has.
+      await expect(
+        broker.call('net_post', {
+          url: 'https://approved.example/x',
+          text: 'https://not-approved.example/y',
+        }),
+      ).rejects.toBeInstanceOf(DisallowedOutboundHostError);
+    });
+
+    it('a tool WITH destinationKeys declared only has its named key scanned — a benign field elsewhere that looks like a disallowed URL no longer false-positives', async () => {
+      const broker = createBroker({ allowedOutboundHosts: ['approved.example'] });
+      broker.register(netPost({ destinationKeys: ['url'] }));
+      // Identical args to the previous test — the ONLY difference is the
+      // registered tool now declares destinationKeys: ['url']. `text`'s
+      // URL-shaped value is no longer inspected, so this call goes through:
+      // the real destination (`url`) is allowlisted, and the tool never
+      // actually contacts whatever host `text` happens to look like.
+      const result = await broker.call('net_post', {
+        url: 'https://approved.example/x',
+        text: 'https://not-approved.example/y',
+      });
+      expect(result).toContain('posted:');
+    });
+
+    it('destinationKeys narrows the scan, but a genuinely disallowed destination under the named key is still caught', async () => {
+      const broker = createBroker({ allowedOutboundHosts: ['approved.example'] });
+      broker.register(netPost({ destinationKeys: ['url'] }));
+      await expect(
+        broker.call('net_post', {
+          url: 'https://not-approved.example/x',
+          text: 'ordinary benign text, not a url',
+        }),
+      ).rejects.toBeInstanceOf(DisallowedOutboundHostError);
+    });
   });
 });
 

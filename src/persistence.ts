@@ -26,13 +26,19 @@
  * content — that still requires the receiving side to actually restore and
  * use this state (or to call `markContextExposure()` itself).
  *
- * Also NOT included: a declared plan (`broker.declarePlan()`, DESIGN.md
- * §11). `SerializedBrokerState` carries only the watermark and the
- * registry — a broker restored from another one's exported state starts
- * with plan-freeze disengaged even if the original had a live plan, and
- * `declarePlan()` can't re-establish one afterward if the restored
- * watermark is already non-CLEAN (it requires CLEAN). See DESIGN.md §11's
- * own note on this for the concrete consequence.
+ * A declared plan (`broker.declarePlan()`, DESIGN.md §11) DOES survive
+ * `serializeBrokerState()`/`restoreBrokerState()`, including the exact
+ * cursor position it was at when exported — see
+ * `SerializedBrokerState.plan`/`.planCursor` and `restoreBrokerState()`'s
+ * own doc comment for the full mechanism and the safety-property argument
+ * (restoring a plan, even a tampered one, can only ever make future
+ * privileged calls MORE restrictive, never less). This closes the
+ * plan-persistence sub-gap GAPS.md #12 and DESIGN.md §11 used to describe
+ * here as unimplemented — a broker restored from another's exported state
+ * now resumes any live plan-freeze protection exactly where the original
+ * left off, instead of silently starting with plan-freeze disengaged and
+ * no way to re-establish it (the old behavior `test/persistence.spec.ts`
+ * used to pin down as a known gap now pins down the fix instead).
  *
  * One more piece of private in-memory state falls into the same
  * "not part of SerializedBrokerState" category as the declared plan above:
@@ -51,7 +57,14 @@
  * decay clock silently restarts across a restore, with no warning.
  */
 
-import type { TaintRecord, TaintRegistry, TaintWatermark, ToolCallBroker } from './types.js';
+import type {
+  PlanState,
+  PlanStep,
+  TaintRecord,
+  TaintRegistry,
+  TaintWatermark,
+  ToolCallBroker,
+} from './types.js';
 import { LEVEL_ORDER } from './types.js';
 import { InMemoryTaintRegistry } from './taint/registry.js';
 import { TaintBrokerError } from './errors.js';
@@ -68,10 +81,89 @@ export interface SerializedTaintRecord extends Omit<TaintRecord, 'fingerprint'> 
   };
 }
 
-/** Everything `serializeBrokerState()` exports: a broker's scope watermark plus its registry's records, as one JSON-safe object. */
+/**
+ * The current `SerializedBrokerState` wire-format version —
+ * `serializeBrokerState()` always stamps its output with this. A plain,
+ * monotonically-incrementing integer, not a semver string: this versions
+ * ONE specific interchange shape (`SerializedBrokerState`), not this
+ * package's own semver (`package.json`'s `version`), which tracks the
+ * whole library's public API surface and would change for reasons having
+ * nothing to do with this wire format. Bump this — and give
+ * `restoreBrokerState()` a real value to branch on — the next time
+ * `SerializedBrokerState`'s shape changes in a way that isn't safely
+ * backward-compatible on its own; see `schemaVersion`'s own doc comment
+ * below for why version 1 itself didn't need a hard compatibility check.
+ */
+export const SERIALIZED_BROKER_STATE_SCHEMA_VERSION = 1;
+
+/** Everything `serializeBrokerState()` exports: a broker's scope watermark, registry, and (if any) declared plan, as one JSON-safe object. */
 export interface SerializedBrokerState {
+  /**
+   * Wire-format version marker — see `SERIALIZED_BROKER_STATE_SCHEMA_VERSION`.
+   * Optional on the TYPE, but not because a state THIS library produces
+   * ever omits it: `serializeBrokerState()` always sets it. It's optional
+   * because every `SerializedBrokerState` this library exported *before*
+   * this field (and the `plan`/`planCursor` fields below) existed — any
+   * 0.x-series blob, from before plan-freeze persistence shipped — has no
+   * such field at all, and `restoreBrokerState()` must keep accepting
+   * those unchanged.
+   *
+   * A missing `schemaVersion` is therefore not an error — it's the one
+   * signal `restoreBrokerState()` has that `state` predates this field
+   * altogether, and it is treated exactly as `schemaVersion: 0` would be:
+   * "no plan was ever exported" (on a genuinely old blob, `plan`/
+   * `planCursor` are — and always were — absent too), which is precisely
+   * the safe no-op `restoreBrokerState()` already performed before this
+   * feature existed: watermark/registry restore as before, plan-freeze
+   * simply starts disengaged. This is why `plan`/`planCursor` are
+   * themselves optional too, rather than this field being required to opt
+   * out of them: an old blob restoring "no plan" needs no explicit marker
+   * for that, it's simply the shape it already had.
+   *
+   * Exists so THIS extension — and any future one — has something to
+   * actually version against, rather than repeating the "add an optional
+   * field and hope every consumer copes" pattern with no anchor at all. A
+   * future breaking wire-format change can bump
+   * `SERIALIZED_BROKER_STATE_SCHEMA_VERSION` and give `restoreBrokerState()`
+   * a real value to branch its handling on, instead of trying to infer
+   * intent purely from which optional fields happen to be present.
+   * Version 1 (this one) doesn't itself need a hard version check —
+   * `plan`/`planCursor` are purely additive and every consumer old enough
+   * to predate them simply doesn't look for them — but the marker is laid
+   * down now specifically so the NEXT change doesn't have to invent it
+   * under time pressure.
+   */
+  schemaVersion?: number;
   watermark: TaintWatermark;
   registry: SerializedTaintRecord[];
+  /**
+   * The declared plan (`broker.declarePlan()`, DESIGN.md §11) captured at
+   * export time, or absent if the exporting broker had none in effect —
+   * mirroring `Broker`'s own private `plan` field, `undefined` in exactly
+   * the same circumstances (never declared, or discarded by a turn reset
+   * or `declassify()` — see broker.ts's `clearScopeForTurnReset()`/
+   * `declassify()`, both of which drop a plan alongside the watermark it
+   * was committed against). Restoring `plan` resumes it on the receiving
+   * broker at the SAME cursor position captured in `planCursor` below —
+   * not from step 0 — matching what "resuming a session" should mean; see
+   * `restoreBrokerState()`'s own doc comment for the full mechanism and
+   * the safety-property argument for why this is sound even for a
+   * tampered `plan`.
+   */
+  plan?: PlanStep[];
+  /**
+   * The plan's cursor position at export time: the index into `plan` of
+   * the next step a privileged call must match (`plan.length` once the
+   * plan had already been fully consumed). Meaningless without `plan` —
+   * `validateSerializedBrokerState()` rejects a `planCursor` present
+   * without a `plan` as malformed rather than silently ignoring it, and
+   * bounds it to a non-negative integer no greater than `plan.length`
+   * when `plan` IS present. `restoreBrokerState()` defaults this to `0`
+   * only for the (non-`serializeBrokerState()`-produced) case of a `plan`
+   * present with this field itself absent, matching "nothing consumed
+   * yet" — `serializeBrokerState()` itself always writes both together.
+   */
+  planCursor?: number;
 }
 
 /**
@@ -162,6 +254,64 @@ function validateSerializedBrokerState(state: SerializedBrokerState): void {
       `"registry" must be an array, got ${typeof (state as { registry?: unknown }).registry}`,
     );
   }
+  const schemaVersion: unknown = (state as { schemaVersion?: unknown }).schemaVersion;
+  if (
+    schemaVersion !== undefined &&
+    (!Number.isInteger(schemaVersion) || (schemaVersion as number) < 0)
+  ) {
+    throw new InvalidBrokerStateError(
+      `"schemaVersion" must be a non-negative integer if present, got ${JSON.stringify(schemaVersion)}`,
+    );
+  }
+  // `plan`/`planCursor` (§11, GAPS.md #12's plan-persistence sub-gap): both
+  // optional — absent on any pre-plan-persistence 0.x blob, or on a broker
+  // that simply never declared a plan — but validated together, since a
+  // cursor is meaningless without the plan it indexes into. See
+  // SerializedBrokerState's own doc comments for the full field semantics.
+  const plan: unknown = (state as { plan?: unknown }).plan;
+  if (plan !== undefined) {
+    if (!Array.isArray(plan)) {
+      throw new InvalidBrokerStateError(
+        `"plan" must be an array of plan steps, got ${typeof plan}`,
+      );
+    }
+    plan.forEach((step: unknown, index: number) => {
+      if (step === null || typeof step !== 'object' || Array.isArray(step)) {
+        throw new InvalidBrokerStateError(
+          `"plan[${index}]" must be an object with a "toolName" string, got ${JSON.stringify(step)}`,
+        );
+      }
+      const { toolName, note } = step as Record<string, unknown>;
+      if (typeof toolName !== 'string') {
+        throw new InvalidBrokerStateError(
+          `"plan[${index}].toolName" must be a string, got ${typeof toolName}`,
+        );
+      }
+      if (note !== undefined && typeof note !== 'string') {
+        throw new InvalidBrokerStateError(
+          `"plan[${index}].note" must be a string if present, got ${typeof note}`,
+        );
+      }
+    });
+  }
+  const planCursor: unknown = (state as { planCursor?: unknown }).planCursor;
+  if (planCursor !== undefined) {
+    if (plan === undefined) {
+      throw new InvalidBrokerStateError(
+        '"planCursor" is present without "plan" — a cursor position is meaningless without the plan it indexes into',
+      );
+    }
+    if (!Number.isInteger(planCursor) || (planCursor as number) < 0) {
+      throw new InvalidBrokerStateError(
+        `"planCursor" must be a non-negative integer, got ${JSON.stringify(planCursor)}`,
+      );
+    }
+    if ((planCursor as number) > (plan as unknown[]).length) {
+      throw new InvalidBrokerStateError(
+        `"planCursor" (${planCursor as number}) must not exceed "plan"'s length (${(plan as unknown[]).length})`,
+      );
+    }
+  }
 }
 
 /** Exports every record in `registry` to a JSON-safe array. Counterpart: restoreRegistry(). */
@@ -203,23 +353,38 @@ export function restoreRegistry(
 }
 
 /**
- * Exports both halves of a broker's persistable state — its scope watermark
- * and its registry's records — as one JSON-safe object. Pair with
- * `restoreBrokerState()` on the receiving side. Typical use:
+ * Exports every persistable piece of a broker's state — its scope
+ * watermark, its registry's records, and (if any) its declared plan
+ * (`declarePlan()`, §11, via `broker.planState`) — as one JSON-safe
+ * object, stamped with the current `SERIALIZED_BROKER_STATE_SCHEMA_VERSION`.
+ * Pair with `restoreBrokerState()` on the receiving side. Typical use:
  *
  *   const state = serializeBrokerState(broker);
  *   await fs.writeFile('session.json', JSON.stringify(state));
+ *
+ * `plan`/`planCursor` are only present in the output when
+ * `broker.planState` is defined (a plan is actually in effect) —
+ * `serializeBrokerState()` never writes an empty/placeholder plan, exactly
+ * mirroring `Broker`'s own `plan === undefined` "no plan declared" state.
  */
 export function serializeBrokerState(
-  broker: Pick<ToolCallBroker, 'scope' | 'registry'>,
+  broker: Pick<ToolCallBroker, 'scope' | 'registry' | 'planState'>,
 ): SerializedBrokerState {
+  const planState = broker.planState;
   return {
+    schemaVersion: SERIALIZED_BROKER_STATE_SCHEMA_VERSION,
     watermark: {
       level: broker.scope.watermark.level,
       privateDataSeen: broker.scope.watermark.privateDataSeen,
       sources: [...broker.scope.watermark.sources],
     },
     registry: serializeRegistry(broker.registry),
+    ...(planState !== undefined
+      ? {
+          plan: planState.steps.map((step) => ({ ...step })),
+          planCursor: planState.cursor,
+        }
+      : {}),
   };
 }
 
@@ -245,13 +410,88 @@ export function serializeBrokerState(
  * here instead means restoring a bad state fails loud, immediately, with a
  * descriptive and catchable error — not a delayed crash on an unrelated
  * later call.
+ *
+ * **Plan-freeze restore (§11, GAPS.md #12's plan-persistence sub-gap).**
+ * When `state.plan` is present, the returned object also carries
+ * `initialPlan: { steps, cursor }`, meant to be spread straight into
+ * `createBroker()` exactly like `initialWatermark`/`registry` above (the
+ * example above already does this via the object spread) —
+ * `BrokerOptions.initialPlan` (broker.ts) seeds `this.plan`/
+ * `this.planCursor` on the freshly-constructed broker at the SAME cursor
+ * position captured at export time, so the restored broker resumes
+ * exactly where the exporting one left off, not from step 0. `cursor`
+ * defaults to `0` only if `state.plan` is present but `state.planCursor`
+ * itself is absent (a hand-authored state that only set `plan`) —
+ * `serializeBrokerState()` itself always writes both together.
+ *
+ * This is a genuinely different operation from calling `declarePlan()` on
+ * the restored broker directly. `declarePlan()` itself is completely
+ * untouched by this feature and still throws `PlanNotDeclarableError` once
+ * the scope has left `CLEAN` (see its own doc comment) — which is exactly
+ * the state a restored non-`CLEAN` watermark usually is in, so
+ * `declarePlan()` remains just as unable to (re-)establish a plan on a
+ * restored broker as it always was. `BrokerOptions.initialPlan` is a
+ * separate, construction-time-only path specifically because restoring an
+ * already-legitimately-declared plan is not the same trust question
+ * `declarePlan()`'s guard protects against: that guard exists to stop
+ * untrusted content that is ALREADY LIVE IN THIS SCOPE, RIGHT NOW, from
+ * shaping a plan being declared now. Restoring here carries forward a
+ * commitment that was made validly, on the ORIGINAL broker, while ITS
+ * scope was still `CLEAN` — before that broker's own exposure ever
+ * happened; nothing about this path lets any NEW untrusted content shape
+ * anything.
+ *
+ * **Safety property** (this reasoning should be re-verified against
+ * `broker.ts`'s `gateDecision()` if either side of this ever changes):
+ * restoring a plan — even a fully adversarially-tampered `state.plan` from
+ * a corrupted or hand-edited `session.json`, since `SerializedBrokerState`
+ * is externally-sourced input exactly like the rest of this validation
+ * boundary — can only ever make FUTURE privileged calls MORE restrictive,
+ * never less. Plan-freeze itself is strictly additive (DESIGN.md §11:
+ * "this check is strictly additive: it runs in addition to, never instead
+ * of, the normal policy decision") and this restore path changes nothing
+ * about how that check is enforced, only what it starts pre-loaded with:
+ * a call whose tool matches the (possibly bogus) next plan step still has
+ * to clear the ordinary policy/outbound-allowlist checks exactly as if no
+ * plan had been restored at all, and a call that does NOT match is
+ * rejected as unplanned regardless of what a tampered plan "intended".
+ * There is no shape of `state.plan` content that grants a call any
+ * permission it would not otherwise have had — the worst a tampered plan
+ * can do is cause spurious `UnplannedPrivilegedActionError` blocking of a
+ * call the ordinary policy would have allowed, which is an availability
+ * cost, never a soundness one. `test/persistence.spec.ts` exercises this
+ * directly with a deliberately tampered `state.plan`, rather than leaving
+ * it as an unverified claim.
+ *
+ * `validateSerializedBrokerState()` still checks `state.plan`'s shape (an
+ * array of plan-step-shaped objects) and `state.planCursor`'s bounds (a
+ * non-negative integer no greater than `state.plan.length`) before any of
+ * this runs — but that validation is only about SHAPE, not content: a
+ * well-shaped but semantically-nonsensical plan (tool names that don't
+ * exist, or that don't match what the receiving broker will actually see)
+ * is accepted and simply behaves as described above, since — per the
+ * safety property — no plan CONTENT can turn into a policy bypass, only
+ * malformed SHAPE needs rejecting up front (the same "fail loud at the
+ * trust boundary, not with a delayed opaque crash" reasoning
+ * `InvalidBrokerStateError` already applies to `watermark.level`).
  */
 export function restoreBrokerState(
   state: SerializedBrokerState,
   makeRegistry: () => TaintRegistry = () => new InMemoryTaintRegistry(),
-): { initialWatermark: TaintWatermark; registry: TaintRegistry } {
+): { initialWatermark: TaintWatermark; registry: TaintRegistry; initialPlan?: PlanState } {
   validateSerializedBrokerState(state);
   const registry = makeRegistry();
   restoreRegistry(state.registry, registry);
-  return { initialWatermark: state.watermark, registry };
+  const restored: {
+    initialWatermark: TaintWatermark;
+    registry: TaintRegistry;
+    initialPlan?: PlanState;
+  } = { initialWatermark: state.watermark, registry };
+  if (state.plan !== undefined) {
+    restored.initialPlan = {
+      steps: state.plan.map((step) => ({ ...step })),
+      cursor: state.planCursor ?? 0,
+    };
+  }
+  return restored;
 }

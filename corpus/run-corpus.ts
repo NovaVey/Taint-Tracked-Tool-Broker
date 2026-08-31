@@ -17,8 +17,19 @@
 import { CORPUS, TRUE_GAP_IDS } from './cases.js';
 import { runCorpusCase, runUnprotectedCase } from './schema.js';
 
-/** Decisions that, in this harness (no human present — see schema.ts's approvalChannel), functionally stop the call. Real deployments' REQUIRE_APPROVAL depends on a human; corpus always denies, so within THIS report it counts as prevented. */
-const PREVENTING_DECISIONS = new Set(['BLOCK', 'REQUIRE_APPROVAL']);
+/**
+ * Decisions that, in this harness (no human present — see schema.ts's
+ * approvalChannel), functionally stop the call. Real deployments'
+ * REQUIRE_APPROVAL depends on a human; corpus always denies, so within THIS
+ * report it counts as prevented. QUARANTINE_AND_RETRY belongs here too:
+ * DESIGN.md §7.2 and broker.ts's finalizeGated() treat it identically to
+ * BLOCK — never auto-executed, always throws ToolCallBlockedError — it is
+ * only a more actionable verdict (it names a specific source to
+ * re-summarize), never a weaker one. Omitting it here would misreport a
+ * "quarantine-and-retry-offered" case as having "gone through" in the
+ * sanctionedAllowed bucket below, which is not what happened.
+ */
+const PREVENTING_DECISIONS = new Set(['BLOCK', 'REQUIRE_APPROVAL', 'QUARANTINE_AND_RETRY']);
 
 /** CorpusOutcome.error is `unknown` (whatever a case's try/catch caught) — almost always one of this library's Error subclasses, but String() on a non-Error object would silently print '[object Object]' and hide the real diagnostic. */
 function formatError(error: unknown): string {
@@ -99,7 +110,7 @@ async function main(): Promise<void> {
   ).length;
   console.log(
     `Counterfactual baseline: of ${attackPairs.length} non-benign case(s), ${wouldHaveRun} sink call(s) would have executed unprotected (no broker mediating the call at all). ` +
-      `Protected, the broker prevented ${prevented} (BLOCK, or REQUIRE_APPROVAL with no human present — see schema.ts); ` +
+      `Protected, the broker prevented ${prevented} (BLOCK, REQUIRE_APPROVAL with no human present, or QUARANTINE_AND_RETRY — see schema.ts); ` +
       `${sanctionedAllowed} went through as the sanctioned quarantine path's expected ALLOW_WITH_WARNING (not an attack payload by the time it reached the sink — see "summarize-then-act-write-file"); ` +
       `${trueGapsAllowed} are the documented true known gaps (GAPS.md #1/#2) where protection provides none.`,
   );

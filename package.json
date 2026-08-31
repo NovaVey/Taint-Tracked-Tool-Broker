@@ -4,6 +4,7 @@
   "description": "Provenance labeling for agent inputs, enforced at the tool-call boundary. Blocks untrusted data from reaching shell, filesystem, and network sinks. Ships with an injection corpus and a published list of known gaps.",
   "type": "module",
   "license": "Apache-2.0",
+  "author": "NovaVey",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {

@@ -18,6 +18,7 @@ Provenance labeling for agent inputs, enforced at the tool-call boundary. Blocks
 - [Examples](#examples)
 - [Injection corpus](#injection-corpus)
 - [Known gaps](#known-gaps)
+- [Versioning](#versioning)
 - [Development](#development)
 - [License](#license)
 
@@ -45,7 +46,7 @@ npm install && npm run build
 
 `dist/` is then importable directly (`import { createBroker } from './Taint-Tracked-Tool-Broker/dist/index.js'`), or link it into another project with `npm link`.
 
-**ESM only** — this package ships as native ESM (`"type": "module"`, no CommonJS build). `import` it from an ESM project as normal. A CommonJS project on a Node version without [`require(esm)`](https://nodejs.org/api/modules.html#loading-ecmascript-modules-using-require) support can't `require()` it directly (`ERR_REQUIRE_ESM`) — use a dynamic `await import('taint-tracked-tool-broker')` instead.
+**ESM only** — this package ships as native ESM (`"type": "module"`, no CommonJS build). `import` it from an ESM project as normal. A CommonJS project on a Node version without [`require(esm)`](https://nodejs.org/api/modules.html#loading-ecmascript-modules-using-require) support can't `require()` it directly (`ERR_REQUIRE_ESM`) — use a dynamic `await import('taint-tracked-tool-broker')` instead. This is a deliberate, permanent design choice, not a gap to be filled later: ESM-only keeps the codebase simpler and matches the target audience of modern Node agent frameworks, which are themselves ESM-first.
 
 **Requires Node.js >= 20** (see `engines` in `package.json`).
 
@@ -132,6 +133,12 @@ This library does not achieve information-flow-control soundness — it achieves
 Every gate rests on how you declare your own tools (`isSource`, `trusted`, `capabilities`, `readsPrivateData`) — get one wrong and that tool isn't gated incorrectly, it isn't gated at all, silently. See [`docs/classifying-tools.md`](./docs/classifying-tools.md) for a checklist and worked examples for the less-obvious cases.
 
 Found a way past the gating logic that isn't already in that list? See [`SECURITY.md`](./SECURITY.md).
+
+## Versioning
+
+This project follows [SemVer](https://semver.org/), with the pre-1.0 caveat already stated in [`CHANGELOG.md`](./CHANGELOG.md): a minor release may still include a breaking change while the public API stabilizes. Check the changelog for what actually changed between any two versions before upgrading.
+
+What 1.0 will mean here: once this is tagged `1.0.0`, the exported API surface (everything reachable from [`src/index.ts`](./src/index.ts)) is stable per SemVer — no more silent renames or shape changes without a major bump. That covenant is about API shape only. Behavioral limitations — what the broker does and doesn't catch — are tracked in [`GAPS.md`](./GAPS.md) and [`DESIGN.md`](./DESIGN.md) regardless of version number, and reaching 1.0 doesn't imply those gaps are closed.
 
 ## Development
 

@@ -12,13 +12,13 @@ export default defineConfig({
       include: ['src/**/*.ts'],
       exclude: ['src/types.ts'],
       // A real floor, not a moving target: set a few points below the
-      // actual measured coverage as of the commit that added this config
-      // (statements 96.32% / branches 91.82% / functions 99.21% / lines
-      // 98.03%) so CI catches a genuine regression without tripping on
+      // actual measured coverage as of the commit that last ratcheted this
+      // config (statements 97.91% / branches 93.95% / functions 99.42% /
+      // lines 98.91%) so CI catches a genuine regression without tripping on
       // ordinary refactors. Ratchet these up over time rather than down.
       thresholds: {
-        statements: 90,
-        branches: 85,
+        statements: 91,
+        branches: 87,
         functions: 95,
         lines: 95,
       },

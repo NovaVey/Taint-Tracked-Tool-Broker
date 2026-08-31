@@ -55,6 +55,7 @@ export type {
   QuarantineFn,
   QuarantineImpl,
   PlanStep,
+  PlanState,
   ToolCallBroker,
   CallResult,
   RawQuarantineSourceTool,
@@ -84,6 +85,7 @@ export {
   serializeBrokerState,
   restoreBrokerState,
   InvalidBrokerStateError,
+  SERIALIZED_BROKER_STATE_SCHEMA_VERSION,
 } from './persistence.js';
 export type { SerializedTaintRecord, SerializedBrokerState } from './persistence.js';
 export {

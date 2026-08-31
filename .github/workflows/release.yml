@@ -47,6 +47,21 @@ jobs:
       # rather than trusting that whatever CI run happened to pass earlier
       # on this commit is still what's about to be published.
       - run: npm run typecheck
+
+      # CI enforces lint/format/coverage as separate dedicated jobs
+      # (.github/workflows/ci.yml), not as steps in the same job that runs
+      # typecheck/build/smoke-test/test/corpus — so a tag pointing at a
+      # commit whose CI run doesn't actually reflect the current code (or a
+      # manual tag pushed without waiting for CI) could otherwise reach
+      # publish without ever having been lint/format/coverage-checked. Rerun
+      # all three here too, for the same reason the steps below re-run
+      # typecheck/build/test/corpus: gate-parity with CI, not trust that an
+      # earlier run still applies. See CONTRIBUTING.md's "all seven checks
+      # must pass" list.
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run coverage
+
       - run: npm run build
       # Same rationale as ci.yml's identical step: typecheck/test/corpus
       # above and below all exercise src/ TypeScript, never the actual

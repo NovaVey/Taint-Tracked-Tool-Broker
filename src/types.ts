@@ -327,6 +327,42 @@ export interface ToolExecutor<A = unknown, R = unknown> {
    * default so existing tools are unaffected.
    */
   mayCallSummarize?: boolean;
+  /**
+   * Names the argument key(s) that carry this tool's actual network
+   * destination, for the opt-in `BrokerOptions.allowedOutboundHosts` egress
+   * allowlist (DESIGN.md §7.4). Threaded straight through, unchanged, as
+   * `findOutboundHosts(argsSnapshot, { destinationKeys })`'s own
+   * `destinationKeys` option at the EXFIL gating call site in `broker.ts`'s
+   * `gateDecision()` — see `FindOutboundHostsOptions.destinationKeys`
+   * (`taint/egress.ts`) for exactly how a named key's subtree is scanned.
+   *
+   * `findOutboundHosts()` over-detects by default: with no
+   * `destinationKeys`, it treats every string leaf anywhere in a call's
+   * argument tree as a candidate destination, so a benign field whose value
+   * merely happens to be, in its entirety, a valid URL or email address
+   * (e.g. a chat tool's `text` body that is exactly
+   * `"https://internal-wiki.example/kb/42"`) is indistinguishable from a
+   * genuine destination and trips the same unconditional hard `BLOCK` as a
+   * real disallowed egress target — GAPS.md #18's own "over-detection"
+   * sub-bullet and `taint/egress.ts`'s header comment work through this in
+   * full. Declaring `destinationKeys` here narrows the scan to just the
+   * named key(s)' subtrees, eliminating that false positive.
+   *
+   * Declared on the tool itself, at registration time, the same way
+   * `isSource`/`trusted`/`readsPrivateData` above are, rather than accepted
+   * as per-call configuration: which argument key(s) actually name a given
+   * tool's destination (a webhook tool's `url`, as opposed to its unrelated
+   * `text`/`channel`/`notes` fields) is a fixed property of that tool's own
+   * schema, not something that varies call to call. Purely additive and
+   * opt-in — a tool that leaves this unset gets `broker.ts`'s original,
+   * unscoped whole-tree scan exactly as it behaved before this field
+   * existed; no previously-registered tool's behavior changes. Only ever
+   * consulted for an `EXFIL`-class tool, and only when
+   * `BrokerOptions.allowedOutboundHosts` is configured — inert otherwise,
+   * including for a tool that declares it but has no sink capabilities at
+   * all.
+   */
+  destinationKeys?: readonly string[];
   execute(args: A): Promise<R>;
 }
 
@@ -356,7 +392,42 @@ export type PolicyDecision =
   | { action: 'ALLOW_WITH_WARNING'; reason: string }
   | { action: 'REQUIRE_APPROVAL'; reason: string; approvalToken: string }
   | { action: 'BLOCK'; reason: string }
-  | { action: 'QUARANTINE_AND_RETRY'; reason: string; suggestedSchemaId?: string };
+  /**
+   * Offered IN PLACE OF (never alongside) a BLOCK/REQUIRE_APPROVAL verdict
+   * when the call's arguments trace to a specifically identifiable
+   * untrusted source that a `summarize()`-then-retry could plausibly
+   * neutralize (DESIGN.md §7.2). The shipped `defaultPolicy`
+   * (`src/policy/default-policy.ts`) constructs this itself under that
+   * condition — see `bestQuarantineCandidate()` there for the exact
+   * eligibility bar — and any custom `PolicyFn` may construct one directly
+   * too. Purely informational, exactly like BLOCK/REQUIRE_APPROVAL: the
+   * broker never re-runs anything on its own on receiving this verdict
+   * (`src/broker.ts` treats it identically to BLOCK — never auto-executed,
+   * always audited, always surfaced to the caller via
+   * `ToolCallBlockedError`) — actually retrying through `summarize()` is a
+   * decision for whatever handles the verdict (a human, or a supervising
+   * process), never something this library does for you.
+   */
+  | {
+      action: 'QUARANTINE_AND_RETRY';
+      reason: string;
+      /**
+       * Reserved for a future named-schema-registry feature this library
+       * does not currently have — nothing anywhere in this codebase lets a
+       * schema be registered under an id a `PolicyFn` could name here.
+       * `defaultPolicy` never sets this field; it always leaves it
+       * `undefined` and puts the entire actionable suggestion (which
+       * source to re-run through `summarize()`, and how) into `reason`
+       * instead, naming the specific matched source where possible. A
+       * custom `PolicyFn` integrated with its own, externally-maintained
+       * schema registry is free to populate this if it wants to — it is
+       * plumbed through end-to-end (the type is part of the public
+       * `PolicyDecision` union and reaches every consumer of a
+       * QUARANTINE_AND_RETRY verdict unchanged), just never written by
+       * anything this library ships.
+       */
+      suggestedSchemaId?: string;
+    };
 
 export type RequireApprovalDecision = Extract<PolicyDecision, { action: 'REQUIRE_APPROVAL' }>;
 
@@ -444,6 +515,29 @@ export interface PlanStep {
   toolName: string;
   /** Free-form note for audit/debugging — not enforced. */
   note?: string;
+}
+
+/**
+ * A declared plan's live state: the full committed step list plus the
+ * cursor position marking which step the NEXT privileged call must match
+ * (`steps.length` once the plan has been fully consumed). This is the
+ * shape `ToolCallBroker.planState` reads out of a live broker and
+ * `BrokerOptions.initialPlan` (broker.ts) seeds a fresh one with — see
+ * both for the persistence mechanism this exists to support
+ * (`serializeBrokerState()`/`restoreBrokerState()`, GAPS.md #12,
+ * DESIGN.md §11's persistence note). Kept as a small named type, rather
+ * than two loose fields threaded separately everywhere, precisely because
+ * `steps` and `cursor` are only ever meaningful together — a cursor
+ * without the plan it indexes into is meaningless, and
+ * `persistence.ts`'s `validateSerializedBrokerState()` enforces exactly
+ * that pairing on the wire-format side (`SerializedBrokerState.plan`/
+ * `.planCursor`).
+ */
+export interface PlanState {
+  /** The full committed step list, in original declared order — never mutated in place; `declarePlan()`/restore both copy in. */
+  steps: PlanStep[];
+  /** Index into `steps` of the next step a privileged call must match. */
+  cursor: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -554,6 +648,25 @@ export interface ToolCallBroker {
    * to run freely between (and interleaved with) planned privileged steps.
    */
   declarePlan(steps: PlanStep[]): void;
+
+  /**
+   * Read-only snapshot of the currently-declared plan and its cursor
+   * position (§11), or `undefined` if no plan is in effect — never
+   * declared in the first place, or discarded by a turn-boundary reset
+   * (`startNewTurn()` under `'turn'`/`'turn-decay'`) or `declassify()`,
+   * both of which clear a declared plan alongside the watermark it was
+   * committed against (see broker.ts's `clearScopeForTurnReset()`/
+   * `declassify()`). Each read returns a fresh copy — mutating the
+   * returned `steps` array has no effect on the broker's own plan state.
+   *
+   * Exists primarily so `persistence.ts`'s `serializeBrokerState()` has a
+   * supported way to read a live broker's plan state out for export
+   * (GAPS.md #12, DESIGN.md §11's persistence note) — the counterpart to
+   * `BrokerOptions.initialPlan` (broker.ts) on the restore side. Otherwise
+   * inert: reading it never changes anything, and nothing about exposing
+   * it changes `declarePlan()`'s own guard or plan-freeze's enforcement.
+   */
+  readonly planState: Readonly<PlanState> | undefined;
 
   readonly scope: Readonly<TaintScope>;
   readonly registry: TaintRegistry;
