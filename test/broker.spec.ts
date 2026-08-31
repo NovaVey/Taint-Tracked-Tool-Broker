@@ -1499,6 +1499,96 @@ describe('broker.summarize() (quarantine path)', () => {
     });
   });
 
+  it('accepts input text at exactly the MAX_LENGTH_EXPANSION (2x) length boundary, and rejects text one character past it -- isolating the length-ratio guard from the separate coverage check', async () => {
+    // Regression for a Stryker mutation audit: quarantine.ts's length-ratio
+    // comparison (`text.length > sourceRecord.fingerprint.length *
+    // MAX_LENGTH_EXPANSION`) had no test placing `text.length` anywhere near
+    // the 2x multiple of the source's own length, so neither the boundary
+    // operator (`>` vs `>=`) nor the arithmetic operator (`*` vs `/`) was
+    // ever pinned. `atBoundary` below is built from source, once verbatim
+    // plus a second near-verbatim copy, engineered to land at EXACTLY
+    // `2 * source.length` -- with coverage deliberately kept very high (it's
+    // still overwhelmingly the same content, twice), so a failure here can
+    // only come from the length-ratio guard's own boundary semantics, not
+    // the separate coverage check.
+    const broker = createBroker({ quarantineImpl: stubQuarantineImpl });
+    const source =
+      'the quarterly compliance report was reviewed and approved by the finance team without any issue at all found anywhere in the entire filing';
+    broker.register(fetchUrl(source));
+    await broker.call('fetch_url', {});
+    const record = broker.registry.lookupExact(source);
+    if (!record) throw new Error('setup failed: source not registered');
+
+    const atBoundary = source + ' ' + source.slice(0, -1); // length === 2 * source.length, exactly
+    expect(atBoundary.length).toBe(2 * source.length);
+    await expect(
+      broker.summarize(atBoundary, { sessionId: 's', sourceTaintRecordId: record.id }),
+    ).resolves.toMatchObject({ level: 'DERIVED_UNTRUSTED' });
+
+    const overBoundary = source + ' ' + source; // length === 2 * source.length + 1
+    expect(overBoundary.length).toBe(2 * source.length + 1);
+    await expect(
+      broker.summarize(overBoundary, { sessionId: 's', sourceTaintRecordId: record.id }),
+    ).rejects.toBeInstanceOf(QuarantineInputMismatchError);
+  });
+
+  it('rejects input text with a small, nonzero shingle overlap that falls short of MIN_SOURCE_COVERAGE, and accepts input landing at exactly the 0.3 coverage boundary -- both well under the length-ratio threshold, isolating the coverage check', async () => {
+    // Regression for a Stryker mutation audit: the coverage computation
+    // (`shingleIntersectionSize(...) / inputFingerprint.shingleHashes.length`,
+    // a `/` vs `*` arithmetic-operator mutant) and its threshold comparison
+    // (`coverage < MIN_SOURCE_COVERAGE`, a `<` vs `<=` boundary-operator
+    // mutant) both survived: every existing test used either zero overlap
+    // (unrelated text) or near-total overlap (a genuine excerpt), never the
+    // regime this test targets -- text that genuinely, verifiably shares
+    // SOME content with the source, but not enough of it.
+    //
+    // `sharedPhrase` is a verbatim 7-word run copied from `source`, so it
+    // contributes exactly 3 shared 5-word shingles (7 - SHINGLE_WIDTH + 1)
+    // wherever it's embedded (fingerprint.ts's SHINGLE_WIDTH is 5).
+    const broker = createBroker({ quarantineImpl: stubQuarantineImpl });
+    const sharedPhrase = 'vendor invoice number ninety two was cleared';
+    const source = `Some introductory filler sentence establishing context for the quarterly report review process overall. ${sharedPhrase} by finance after a routine three step audit found nothing unusual worth flagging to anyone involved.`;
+    broker.register(fetchUrl(source));
+    await broker.call('fetch_url', {});
+    const record = broker.registry.lookupExact(source);
+    if (!record) throw new Error('setup failed: source not registered');
+
+    // 14 words total (10 five-word shingles), 3 of which are the shared
+    // phrase's own shingles -- coverage === 3 / 10 === exactly 0.3, the
+    // MIN_SOURCE_COVERAGE threshold itself. `<` (not `<=`) means this must
+    // still be ACCEPTED.
+    const atThreshold = `zeta yankee whiskey tango foxtrot ${sharedPhrase} quebec romeo`;
+    await expect(
+      broker.summarize(atThreshold, { sessionId: 's', sourceTaintRecordId: record.id }),
+    ).resolves.toMatchObject({ level: 'DERIVED_UNTRUSTED' });
+
+    // 22 words total (18 five-word shingles), same 3 shared shingles --
+    // coverage === 3 / 18 ≈ 0.167, genuinely nonzero but well under 0.3.
+    const belowThreshold = `alpha bravo charlie delta echo golf hotel india juliet kilo lima ${sharedPhrase} mike november oscar papa`;
+    await expect(
+      broker.summarize(belowThreshold, { sessionId: 's', sourceTaintRecordId: record.id }),
+    ).rejects.toBeInstanceOf(QuarantineInputMismatchError);
+  });
+
+  it('rejects an empty-string quarantine input rather than let a NaN coverage computation (0/0) silently bypass the mismatch check', async () => {
+    // Regression for a Stryker mutant forcing the
+    // `inputFingerprint.shingleHashes.length === 0` guard to always be
+    // false: without it, an empty `text` computes `coverage` as
+    // `shingleIntersectionSize(...) / 0` === NaN, and `NaN < MIN_SOURCE_COVERAGE`
+    // is `false` in JS -- silently skipping the rejection an empty,
+    // completely unrelated input should get.
+    const broker = createBroker({ quarantineImpl: stubQuarantineImpl });
+    const source = 'a perfectly ordinary registered source document with real content in it';
+    broker.register(fetchUrl(source));
+    await broker.call('fetch_url', {});
+    const record = broker.registry.lookupExact(source);
+    if (!record) throw new Error('setup failed: source not registered');
+
+    await expect(
+      broker.summarize('', { sessionId: 's', sourceTaintRecordId: record.id }),
+    ).rejects.toBeInstanceOf(QuarantineInputMismatchError);
+  });
+
   it('a bounded registry (maxEntries) can legitimately evict a source record before summarize() needs it — documented behavior, not a crash', async () => {
     // GAPS.md #13: eviction only ever costs Layer 2 attribution/tightening
     // opportunities, never Layer 0 soundness — but summarize()'s own input-
@@ -1603,6 +1693,144 @@ describe('broker.summarize() (quarantine path)', () => {
     expect(events[0]?.taint.matchedRecords[0]?.matchType).toBe('quarantine-derived');
     expect(events[0]?.taint.scopeLevel).toBe('RAW_UNTRUSTED');
     expect(result.taintRecordId).toBeDefined();
+  });
+
+  it('a rejected (mismatch) summarize() audit event carries the full attribution and Layer-2 metadata a reviewer would need, not just the verdict', async () => {
+    // Regression for a Stryker mutation audit: several fields of the
+    // mismatch-path AuditEvent.taint (matchedRecords' contents, argPath,
+    // argFingerprintFloor, sinkClass, hasUnattributedSubstantialContent)
+    // were never individually asserted, only the top-level verdict/executed
+    // fields -- so mutating any of them (e.g. matchedRecords -> [],
+    // hasUnattributedSubstantialContent's literal flipped) went unnoticed
+    // even though these are exactly the provenance/attribution fields a
+    // human reviewing the audit trail for "why was this blocked, and what
+    // did it almost match" would rely on.
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      quarantineImpl: stubQuarantineImpl,
+      auditSink: { record: (e) => events.push(e) },
+    });
+    const sharedPhrase = 'vendor invoice number ninety two was cleared';
+    const source = `Some introductory filler sentence establishing context for the quarterly report review process overall. ${sharedPhrase} by finance after a routine three step audit found nothing unusual worth flagging to anyone involved.`;
+    broker.register(fetchUrl(source));
+    await broker.call('fetch_url', {});
+    const record = broker.registry.lookupExact(source);
+    if (!record) throw new Error('setup failed: source not registered');
+    events.length = 0;
+
+    // Same below-threshold construction as the coverage-boundary test above
+    // -- coverage === 3 / 18 ≈ 0.167, a real (nonzero) score worth pinning.
+    const belowThreshold = `alpha bravo charlie delta echo golf hotel india juliet kilo lima ${sharedPhrase} mike november oscar papa`;
+    await expect(
+      broker.summarize(belowThreshold, { sessionId: 's', sourceTaintRecordId: record.id }),
+    ).rejects.toBeInstanceOf(QuarantineInputMismatchError);
+
+    expect(events).toHaveLength(1);
+    const { taint } = events[0]!;
+    expect(taint.matchedRecords).toHaveLength(1);
+    expect(taint.matchedRecords[0]?.record.id).toBe(record.id);
+    expect(taint.matchedRecords[0]?.matchType).toBe('quarantine-derived');
+    expect(taint.matchedRecords[0]?.argPath).toBe('');
+    expect(taint.matchedRecords[0]?.score).toBeCloseTo(3 / 18);
+    expect(taint.argFingerprintFloor).toBe('CLEAN');
+    expect(taint.sinkClass).toBe('NONE');
+    expect(taint.hasUnattributedSubstantialContent).toBe(false);
+  });
+
+  it('the DERIVED_UNTRUSTED record a successful summarize() registers carries the correct level, lineage back to its source, and a fully-populated provenance tag', async () => {
+    // Regression for a Stryker mutation audit: `result.level` in
+    // QuarantineResult is a fixed literal `createQuarantine()`'s own return
+    // statement always reports regardless of what was actually registered
+    // (quarantine.ts's final `return { ..., level: 'DERIVED_UNTRUSTED' }`),
+    // so it can't catch a mutation to the *registered* record's own level,
+    // lineage (derivedFrom), or provenance fields (sourceCallId/toolName/
+    // note) -- nothing previously fetched the registered record back out of
+    // the registry to check those directly.
+    const broker = createBroker({ quarantineImpl: stubQuarantineImpl });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    const source = broker.registry.lookupExact(MALICIOUS_PAGE);
+    if (!source) throw new Error('setup failed: source not registered');
+
+    const result = await broker.summarize(MALICIOUS_PAGE, {
+      sessionId: 's',
+      sourceTaintRecordId: source.id,
+    });
+    const derived = broker.registry.getById(result.taintRecordId);
+    if (!derived) throw new Error('the registered derived record was not found by its own id');
+
+    expect(derived.level).toBe('DERIVED_UNTRUSTED');
+    expect(derived.derivedFrom).toContain(source.id);
+    expect(derived.provenance.toolName).toBe('__tttb_summarize');
+    expect(derived.provenance.sessionId).toBe('s');
+    expect(derived.provenance.sourceCallId).toMatch(/^quarantine:/);
+    expect(derived.provenance.note).toBe(`derived from ${source.id}`);
+    expect(derived.provenance.id).toBe(derived.id);
+  });
+
+  it('audits a successful summarize() call with a NONE sinkClass -- summarize() has no sinkClass of its own to gate', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      quarantineImpl: stubQuarantineImpl,
+      auditSink: { record: (e) => events.push(e) },
+    });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    const record = broker.registry.lookupExact(MALICIOUS_PAGE);
+    if (!record) throw new Error('setup failed: source not registered');
+    events.length = 0;
+
+    await broker.summarize(MALICIOUS_PAGE, { sessionId: 's', sourceTaintRecordId: record.id });
+    expect(events).toHaveLength(1);
+    expect(events[0]?.taint.sinkClass).toBe('NONE');
+  });
+
+  it('forwards instructions/schema to quarantineImpl -- and the audited call.args.hasSchema flag -- only when the caller actually provided them, omitting the implOpts key entirely (not merely as undefined) otherwise', async () => {
+    // Regression for a Stryker mutation audit: `if (opts.instructions !==
+    // undefined) implOpts.instructions = opts.instructions;` (and the
+    // identical pattern for `schema`) survived every ConditionalExpression/
+    // EqualityOperator mutant, since `stubQuarantineImpl` (used by every
+    // other test in this file) ignores its own `opts` entirely -- nothing
+    // ever inspected what summarize() actually handed the Q-LLM impl. The
+    // audited `call.args.hasSchema` flag (derived independently, from
+    // `opts.schema !== undefined`) had the identical gap.
+    const events: AuditEvent[] = [];
+    const received: Array<{ instructions?: string; schema?: unknown }> = [];
+    const recordingImpl: QuarantineImpl = async function recording<S = string>(
+      _text: string,
+      opts: { instructions?: string; schema?: { parse(x: unknown): S } },
+    ): Promise<S> {
+      received.push(opts);
+      return 'summary' as S;
+    };
+    const broker = createBroker({
+      quarantineImpl: recordingImpl,
+      auditSink: { record: (e) => events.push(e) },
+    });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    const record = broker.registry.lookupExact(MALICIOUS_PAGE);
+    if (!record) throw new Error('setup failed: source not registered');
+    events.length = 0;
+
+    // Call 1: no instructions, no schema -- both keys must be ABSENT from
+    // what the Q-LLM impl receives (not merely present-with-value-undefined).
+    await broker.summarize(MALICIOUS_PAGE, { sessionId: 's', sourceTaintRecordId: record.id });
+    expect('instructions' in received[0]!).toBe(false);
+    expect('schema' in received[0]!).toBe(false);
+    expect(events[0]?.call.args).toMatchObject({ hasSchema: false });
+
+    // Call 2: both provided -- the Q-LLM impl must receive the exact values.
+    const schema = { parse: (x: unknown) => x as string };
+    await broker.summarize(MALICIOUS_PAGE, {
+      sessionId: 's',
+      sourceTaintRecordId: record.id,
+      instructions: 'extract only the amount',
+      schema,
+    });
+    expect(received[1]!.instructions).toBe('extract only the amount');
+    expect(received[1]!.schema).toBe(schema);
+    expect(events[1]?.call.args).toMatchObject({ hasSchema: true });
   });
 
   // DESIGN.md §6.2's dual-model-split note names "the quarantined model has

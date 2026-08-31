@@ -3,6 +3,7 @@ import {
   createBroker,
   createTaintEnvelope,
   ToolCallBlockedError,
+  type AuditEvent,
   type TaintContext,
   type TaintEnvelope,
   type ToolExecutor,
@@ -46,6 +47,16 @@ function shellExec(): ToolExecutor {
     capabilities: { capabilities: ['exec:shell'] },
     async execute(args) {
       return `ran:${JSON.stringify(args)}`;
+    },
+  };
+}
+
+function readPrivateData(): ToolExecutor {
+  return {
+    name: 'read_private_data',
+    capabilities: { capabilities: [], readsPrivateData: { categories: ['credentials'] } },
+    async execute() {
+      return 'secret-value';
     },
   };
 }
@@ -123,13 +134,69 @@ describe('createTaintEnvelope() (src/envelope.ts)', () => {
     );
   });
 
-  it('renders a one-line summary naming the scope level and the matched source tool', async () => {
+  it('renders a one-line summary naming the scope level and the matched source tool, singular ("match", not "matches") for exactly one matchedRecord', async () => {
     const { args, taint } = await blockedCallWithMatchedTaint();
     const envelope = createTaintEnvelope(args, taint);
 
     expect(envelope.summary).toContain('RAW_UNTRUSTED');
     expect(envelope.summary).toContain('fetch_url');
-    expect(envelope.summary).toMatch(/1 fingerprint match/);
+    // A regression-hardened version of the loose `toMatch(/1 fingerprint
+    // match/)` this test used to have: that regex is also a PREFIX of "1
+    // fingerprint matches:", so it can't actually tell the singular and
+    // plural forms apart. Requiring the literal "match: " (colon
+    // immediately after, no "es") pins the singular-count ternary's TRUE
+    // branch precisely.
+    expect(envelope.summary).toContain('1 fingerprint match: ');
+  });
+
+  it('includes the "; private data seen" note in the summary when the TaintContext carries privateDataSeen: true', async () => {
+    // Regression for a Stryker mutation audit: `summarizeTaintContext()`'s
+    // `taint.privateDataSeen ? '; private data seen' : ''` TRUE branch was
+    // never covered by ANY test in this file -- every fixture above
+    // (blockedCallWithMatchedTaint, the bare-watermark BLOCK test) reads no
+    // private data, so privateDataSeen is always false in every envelope
+    // built here otherwise.
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.register(readPrivateData());
+    broker.register(shellExec());
+    await broker.call('read_private_data', {});
+    events.length = 0;
+
+    await broker.call('shell_exec', { cmd: 'anything harmless' });
+    const event = events.find((e) => e.call.toolName === 'shell_exec');
+    if (!event) throw new Error('test setup failure: no shell_exec audit event recorded');
+    expect(event.taint.privateDataSeen).toBe(true);
+
+    const envelope = createTaintEnvelope(event.call.args, event.taint);
+    expect(envelope.summary).toContain('; private data seen');
+  });
+
+  it('pluralizes to "matches" and comma-joins multiple entries when a TaintContext carries more than one matchedRecord', async () => {
+    // Regression for a Stryker mutation audit: every other test in this
+    // file exercises exactly ONE matchedRecord, so summarizeTaintContext()'s
+    // `taint.matchedRecords.length === 1 ? '' : 'es'` pluralization ternary
+    // and its `.join(', ')` separator both had their "more than one" /
+    // multi-entry behavior completely unexercised. Combining the
+    // matchedRecords from two independent real blocked calls -- rather than
+    // hand-building fake TaintMatch objects -- keeps every field genuine
+    // while giving control over the count.
+    const first = await blockedCallWithMatchedTaint();
+    const second = await blockedCallWithMatchedTaint();
+    const taint: TaintContext = {
+      ...first.taint,
+      matchedRecords: [...first.taint.matchedRecords, ...second.taint.matchedRecords],
+    };
+    const envelope = createTaintEnvelope(first.args, taint);
+
+    expect(envelope.matchedRecords).toHaveLength(2);
+    expect(envelope.summary).toContain('2 fingerprint matches: ');
+
+    const entry = first.taint.matchedRecords[0]!;
+    const entryDesc = `${entry.matchType} match on "${entry.record.provenance.toolName}" @ ${entry.argPath}`;
+    // Both entries present, joined with ", " -- not concatenated with no
+    // separator and not dropped.
+    expect(envelope.summary).toContain(`${entryDesc}, ${entryDesc}`);
   });
 
   it(
@@ -204,5 +271,38 @@ describe('createTaintEnvelope() (src/envelope.ts)', () => {
     createTaintEnvelope(args, taint);
     expect(taint.matchedRecords[0]!.record.fingerprint.simhash).toBe(originalSimhash);
     expect(typeof taint.matchedRecords[0]!.record.fingerprint.simhash).toBe('bigint');
+  });
+
+  it('omits the scopeId key entirely (not merely as an undefined value) when the source TaintContext carries none', () => {
+    // Regression for a Stryker mutation audit: the `...(taint.scopeId !==
+    // undefined ? { scopeId: taint.scopeId } : {})` spread survived a
+    // mutant that forces the condition to always `true` -- which, given a
+    // TaintContext without scopeId, would still add an own `scopeId` key
+    // to the envelope with value `undefined`, observably different from
+    // genuinely OMITTING the key (`'scopeId' in envelope`,
+    // `Object.keys(envelope)`), even though both happen to serialize
+    // identically through JSON.stringify (which already drops
+    // undefined-valued keys on its own).
+    //
+    // This is the ONE test in this file that deliberately deviates from
+    // "never a hand-built TaintContext fixture" (see this file's own
+    // header comment): a real broker.call() always populates scopeId
+    // (broker.ts always supplies it), so there is no real gating decision
+    // that produces a TaintContext without one. types.ts's own scopeId doc
+    // comment names exactly this scenario -- "a hand-built TaintContext
+    // fixture predating scopeId" -- as the reason the field is optional at
+    // all, so a hand-built fixture is the only way to exercise it.
+    const taint: TaintContext = {
+      matchedRecords: [],
+      scopeLevel: 'CLEAN',
+      argFingerprintFloor: 'CLEAN',
+      privateDataSeen: false,
+      sinkClass: 'NONE',
+      hasUnattributedSubstantialContent: false,
+      // scopeId deliberately omitted.
+    };
+    const envelope = createTaintEnvelope({ some: 'value' }, taint);
+    expect('scopeId' in envelope).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(envelope, 'scopeId')).toBe(false);
   });
 });

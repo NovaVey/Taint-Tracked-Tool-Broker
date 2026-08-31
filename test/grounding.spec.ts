@@ -144,6 +144,94 @@ describe('checkFieldGrounding', () => {
     expect(loose!.grounded).toBe(true);
   });
 
+  it('threshold boundary is inclusive: a score exactly equal to the threshold is reported grounded (>=, not >)', () => {
+    // Regression for a Stryker mutation audit: `bestScore >= threshold`
+    // (checkOneField's grounded verdict) survived a `>` mutant because no
+    // existing test placed a computed score exactly ON a chosen threshold.
+    // `field`'s overlapCoefficient score against `source` is
+    // deterministically exactly `3 / 7` (3 shared shingles out of the
+    // field's own 7 -- the smaller side, per overlapCoefficient's own
+    // min()-based denominator, documented in fingerprint.ts). Setting
+    // `threshold` to that identical `3 / 7` expression guarantees floating-
+    // point-exact equality with the score the library itself computes, not
+    // an approximation that could accidentally land on either side.
+    const sharedPhrase = 'vendor invoice number ninety two was cleared';
+    const source = `Some introductory filler sentence establishing context for the quarterly report review process overall. ${sharedPhrase} by finance after a routine three step audit found nothing unusual worth flagging to anyone involved.`;
+    const field = `zulu yankee whiskey ${sharedPhrase} tango`;
+
+    const [result] = checkFieldGrounding({ note: field }, source, { threshold: 3 / 7 });
+    expect(result!.score).toBe(3 / 7);
+    expect(result!.grounded).toBe(true);
+  });
+
+  describe('snippet anchoring and windowing (locateSnippet, exercised only through its public bestSourceIndex/snippet output)', () => {
+    // Every snippet assertion elsewhere in this file uses either
+    // `toBeDefined()` or a loose `toContain()` against a SHORT source that
+    // fits entirely inside the default 160-char window regardless of where
+    // the anchor lands -- so neither the anchor-matching loop nor the
+    // window's lead/trail arithmetic was ever actually pinned. These three
+    // scenarios use a LONG source with distinct, unique markers before and
+    // after the matched content, so an incorrect anchor or window produces
+    // a snippet with visibly wrong (or missing) content, not just a
+    // slightly-different-but-still-plausible-looking one.
+    const leadIn =
+      'PREFACEUNIQUETOKENONE two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty. ';
+    const matchedMiddle = 'the vendor invoice number ninety two was formally cleared for payment';
+    const trailing =
+      ' AFTERWORDUNIQUETOKENTWO twentytwo twentythree twentyfour twentyfive twentysix twentyseven twentyeight twentynine thirty thirtyone thirtytwo thirtythree thirtyfour thirtyfive.';
+    const longSource = leadIn + matchedMiddle + trailing;
+
+    it('anchors on the actually-shared shingle and windows exactly maxChars/3 characters of leading context -- not the start of the source', () => {
+      // Regression for Stryker mutants on locateSnippet's window math:
+      // `Math.floor(maxChars / 3)` (-> `maxChars * 3`), `index - lead` (->
+      // `index + lead`), and `Math.min(source.length, start + maxChars)`
+      // (-> `Math.max(...)`), plus the `!fieldShingles.has(shingle)`
+      // anchor-selection negation. Any of these wrong would either include
+      // the unrelated PREFACEUNIQUETOKENONE lead-in, run past the intended
+      // 160-char window into AFTERWORDUNIQUETOKENTWO's own trailing filler,
+      // or anchor on a non-matching shingle entirely.
+      const [result] = checkFieldGrounding({ note: matchedMiddle }, longSource);
+      expect(result!.grounded).toBe(true);
+      expect(result!.snippet).toBe(
+        '…fifteen sixteen seventeen eighteen nineteen twenty. the vendor invoice number ninety two was formally cleared for payment AFTERWORDUNIQUETOKENTWO twentytwo twe…',
+      );
+      expect(result!.snippet).not.toContain('PREFACEUNIQUETOKENONE');
+    });
+
+    it('omits the leading ellipsis when the matched content starts at (or clamps to) the very beginning of the source', () => {
+      // Regression for the `start > 0` boundary (`>=`/`<=` EqualityOperator
+      // mutants) and its ConditionalExpression variants: every other
+      // snippet test in this file has `start > 0` (comfortably true), so
+      // the exact `=== 0` boundary -- where NO leading ellipsis should
+      // appear -- was never exercised. Same `longSource` as above; this
+      // field matches PREFACEUNIQUETOKENONE's own five-word run at index 0.
+      const startField = 'PREFACEUNIQUETOKENONE two three four five';
+      const [result] = checkFieldGrounding({ note: startField }, longSource);
+      expect(result!.grounded).toBe(true);
+      expect(result!.snippet?.startsWith('…')).toBe(false);
+      expect(result!.snippet?.startsWith('PREFACEUNIQUETOKENONE')).toBe(true);
+      // Still truncated with a TRAILING ellipsis -- longSource is far
+      // longer than the 160-char window even from index 0.
+      expect(result!.snippet?.endsWith('…')).toBe(true);
+    });
+
+    it('omits the trailing ellipsis (and returns the source untruncated) when the whole source already fits within maxChars', () => {
+      // Regression for the `end < source.length` boundary (`<=`/`>=`
+      // EqualityOperator mutants) and its ConditionalExpression variants:
+      // every other snippet test in this file leaves genuine trailing
+      // content beyond the window, so the exact `end === source.length`
+      // boundary -- where NO trailing ellipsis should appear -- was never
+      // exercised.
+      const shortSource =
+        'Building maintenance completed a full inspection of the north elevator shaft on Tuesday and found no safety issues requiring immediate repair.';
+      const field =
+        'a full inspection of the north elevator shaft found no safety issues requiring immediate repair';
+      const [result] = checkFieldGrounding({ note: field }, shortSource);
+      expect(result!.grounded).toBe(true);
+      expect(result!.snippet).toBe(shortSource);
+    });
+  });
+
   it('accepts a single source string as shorthand for a one-element sources array', () => {
     const exactQuote = 'vendor invoice number 88213 was formally approved by the finance director';
     const asString = checkFieldGrounding({ note: exactQuote }, SOURCE);
