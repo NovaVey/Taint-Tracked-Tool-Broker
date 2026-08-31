@@ -108,7 +108,7 @@ Runnable, offline (no API key, no real network calls — everything is mocked ex
 | Script | What it shows |
 |---|---|
 | `npm run example` | The core model end to end: verbatim injection, paraphrase bypass, the sanctioned `summarize()` path. |
-| `npm run example:mcp` | MCP protocol surfaces (`tools/call`, `tools/list`) and a tool-description rug-pull guard (GAPS.md #1). |
+| `npm run example:mcp` | All three MCP protocol surfaces (`tools/call`, `resources/read`, `tools/list`) and a tool-description rug-pull guard (GAPS.md #1). |
 | `npm run example:mcp-sdk` | The same MCP pattern against a real `@modelcontextprotocol/sdk` client/server pair (`InMemoryTransport.createLinkedPair()`, real JSON-RPC) instead of a mock. |
 | `npm run example:tool-loop` | A full Anthropic Messages API-style tool loop — a blocked call recovering gracefully, `REQUIRE_APPROVAL` suspending the loop, and `startNewTurn()`'s one correct call site under `resetScope:'turn'`. |
 | `npm run example:langchain` | Wiring `broker.wrap()` behind LangChain.js's `tool()`/`Runnable.invoke()` shape. |
