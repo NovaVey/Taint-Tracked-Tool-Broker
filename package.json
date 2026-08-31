@@ -1,6 +1,6 @@
 {
   "name": "taint-tracked-tool-broker",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Provenance labeling for agent inputs, enforced at the tool-call boundary. Blocks untrusted data from reaching shell, filesystem, and network sinks. Ships with an injection corpus and a published list of known gaps.",
   "type": "module",
   "license": "Apache-2.0",
