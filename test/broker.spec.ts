@@ -107,6 +107,18 @@ describe('ToolCallBroker.call()', () => {
     await expect(broker.call('nope', {})).rejects.toBeInstanceOf(UnknownToolError);
   });
 
+  it('uses the exact sessionId passed in BrokerOptions, not a fresh random one, when provided', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      sessionId: 'my-explicit-session-id',
+      auditSink: { record: (e) => events.push(e) },
+    });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    expect(events).toHaveLength(1);
+    expect(events[0]?.call.sessionId).toBe('my-explicit-session-id');
+  });
+
   it('executes NONE-class sinks without gating and without an audit record', async () => {
     const events: AuditEvent[] = [];
     const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
@@ -128,6 +140,21 @@ describe('ToolCallBroker.call()', () => {
     expect(broker.scope.watermark.level).toBe('CLEAN');
     await broker.call('fetch_url', {});
     expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+  });
+
+  it('registers a source result at RAW_UNTRUSTED level in the fingerprint registry (Layer 2), not just raising the scope watermark (Layer 0)', async () => {
+    // Layer 0 (the scope watermark) and Layer 2 (the fingerprint registry)
+    // are independent mechanisms — defaultPolicy's argFingerprintFloor
+    // tightening (§4.2/§7.2) depends on registered records actually
+    // carrying the RIGHT level, not just SOME level, since it's compared
+    // via LEVEL_ORDER against scopeLevel. This is the direct broker-level
+    // counterpart to "raises the watermark on a successful isSource call"
+    // above — same call, checking the OTHER effect it must have.
+    const broker = createBroker();
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    const record = broker.registry.lookupExact(MALICIOUS_PAGE);
+    expect(record?.level).toBe('RAW_UNTRUSTED');
   });
 
   it('a trusted source tool does not raise the watermark', async () => {
@@ -244,6 +271,26 @@ describe('ToolCallBroker.call()', () => {
     await expect(
       denyingBroker.call('send_email', { to: 'ops@example.com', body: 'summary' }),
     ).rejects.toBeInstanceOf(ToolCallBlockedError);
+  });
+
+  it('the "no approvalChannel configured" note is appended ONLY to a denied REQUIRE_APPROVAL, never to an ordinary BLOCK verdict', async () => {
+    // finalizeGated()'s note-append condition requires decision.action ===
+    // 'REQUIRE_APPROVAL' specifically — a plain BLOCK (which never even
+    // reads approvalChannel) must never pick up a note that implies an
+    // approval channel was even relevant to this call's outcome.
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register(shellExec());
+    await broker.call('fetch_url', {});
+    events.length = 0;
+    await expect(broker.call('shell_exec', { cmd: 'anything' })).rejects.toBeInstanceOf(
+      ToolCallBlockedError,
+    );
+    expect(events).toHaveLength(1);
+    expect(events[0]?.verdict.action).toBe('BLOCK');
+    const reason = (events[0]?.verdict.action === 'BLOCK' && events[0].verdict.reason) || '';
+    expect(reason).not.toContain('no approvalChannel configured');
   });
 
   it('a REQUIRE_APPROVAL call with no approval channel configured fails safe (denied)', async () => {
@@ -412,6 +459,69 @@ describe('ToolCallBroker.call()', () => {
     expect(events[0]?.taint.privateDataSeen).toBe(true);
   });
 
+  it('the private-data-only advisory reason does not also wrongly claim an untrusted-source escalation', async () => {
+    // Mirrors the "BOTH" test above's own stated concern (an if/if pair
+    // regressing into something that lets one trigger's sentence leak onto
+    // a call that only tripped the OTHER trigger) — this pins the
+    // readsPrivateData-only direction specifically: lookup_profile is NOT
+    // isSource, so isUntrustedSource(tool) must stay false and its sentence
+    // must never appear.
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.register({
+      name: 'lookup_profile',
+      capabilities: { capabilities: [], readsPrivateData: { categories: ['pii'] } },
+      async execute() {
+        return 'Jane Doe, 123 Main St';
+      },
+    });
+    await broker.call('lookup_profile', {});
+    expect(events).toHaveLength(1);
+    const reason =
+      (events[0]?.verdict.action === 'ALLOW_WITH_WARNING' && events[0].verdict.reason) || '';
+    expect(reason).toContain('private data was read this scope');
+    expect(reason).not.toContain('untrusted source call raised');
+  });
+
+  it('the untrusted-source-only advisory reason does not also wrongly claim a private-data escalation', async () => {
+    // The mirror image of the test above: fetch_url here declares no
+    // readsPrivateData at all, so that sentence must never appear either.
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    expect(events).toHaveLength(1);
+    const reason =
+      (events[0]?.verdict.action === 'ALLOW_WITH_WARNING' && events[0].verdict.reason) || '';
+    expect(reason).toContain('untrusted source call raised');
+    expect(reason).not.toContain('private data was read this scope');
+  });
+
+  it('a GATED tool that also happens to declare readsPrivateData does not get the NONE-sinkClass advisory event on top of its own ordinary gated-call audit event', async () => {
+    // finishDispatch()'s escalator-advisory block is gated on
+    // `sinkClass === 'NONE'` specifically — a privileged (non-NONE) tool
+    // gets its OWN unconditional audit event from finalizeGated() already;
+    // this advisory exists only for the NONE-sinkClass case, where nothing
+    // else would otherwise get audited at all (GAPS.md #1/#10's own
+    // motivation). register() does not reject a gated tool that also
+    // declares readsPrivateData, so this combination is real and reachable.
+    const events: AuditEvent[] = [];
+    const broker = createBroker({ auditSink: { record: (e) => events.push(e) } });
+    broker.register({
+      name: 'read_and_run',
+      capabilities: {
+        capabilities: ['exec:shell'], // GATED -- sinkClass !== 'NONE'
+        readsPrivateData: { categories: ['credentials'] },
+      },
+      async execute() {
+        return 'done';
+      },
+    });
+    await broker.call('read_and_run', {}); // CLEAN scope -> ordinary ALLOW
+    expect(events).toHaveLength(1);
+    expect(events[0]?.verdict.action).toBe('ALLOW');
+  });
+
   it('wrap() returns a drop-in executor whose execute() is interposed through the broker', async () => {
     const broker = createBroker();
     const wrapped = broker.wrap(fetchUrl(MALICIOUS_PAGE));
@@ -524,6 +634,27 @@ describe('AuditEvent.requestedAt (REQUIRE_APPROVAL wait latency)', () => {
   });
 });
 
+describe('initialWatermark (BrokerOptions, GAPS.md #12 restore path)', () => {
+  it('restores watermark.sources (the ProvenanceTag[] provenance trail), not just level/privateDataSeen', () => {
+    // debug.ts's formatAuditTrail()-adjacent tooling and any integrator
+    // inspecting broker.scope.watermark.sources directly both depend on
+    // this array actually being copied across the restore boundary, not
+    // silently dropped while level/privateDataSeen come through fine.
+    const restoredTag: ProvenanceTag = {
+      id: 'restored-1',
+      sourceCallId: 'call-restored',
+      toolName: 'fetch_url',
+      sessionId: 'prior-session',
+      capturedAt: 0,
+    };
+    const broker = createBroker({
+      initialWatermark: { level: 'RAW_UNTRUSTED', privateDataSeen: false, sources: [restoredTag] },
+    });
+    expect(broker.scope.watermark.level).toBe('RAW_UNTRUSTED');
+    expect(broker.scope.watermark.sources).toEqual([restoredTag]);
+  });
+});
+
 describe('markContextExposure', () => {
   it('raises the watermark for a channel with no tracked tool call', async () => {
     const broker = createBroker();
@@ -545,6 +676,16 @@ describe('markContextExposure', () => {
     expect(events[0]?.verdict.action).toBe('ALLOW_WITH_WARNING');
     expect(events[0]?.call.toolName).toBe('__tttb_context_exposure');
     expect(events[0]?.taint.scopeLevel).toBe('RAW_UNTRUSTED');
+    // The PROVIDED source.toolName ('some_mcp_tool') must actually reach the
+    // provenance record (and, through it, the audit reason) — not the
+    // '__untracked_context__' fallback that's only meant for an omitted
+    // toolName. `call.toolName` above is always the fixed
+    // '__tttb_context_exposure' administrative tag, a different field, so it
+    // can't stand in for this check.
+    const reason =
+      (events[0]?.verdict.action === 'ALLOW_WITH_WARNING' && events[0].verdict.reason) || '';
+    expect(reason).toContain('some_mcp_tool');
+    expect(reason).not.toContain('__untracked_context__');
   });
 
   it('given text, registers it into the fingerprint registry — a later argument matching it gets real Layer 2 attribution', async () => {
@@ -654,6 +795,52 @@ describe('warnOnLikelyUnmarkedSource (opt-in advisory heuristic, GAPS.md #1)', (
     await broker.call('wiki_reader', {});
     expect(events).toHaveLength(1);
   });
+
+  it('does not fire for a GATED tool with a long text result — this advisory is specific to the NONE-sinkClass case', async () => {
+    // Mirrors the analogous readsPrivateData/isUntrustedSource advisory
+    // block's own "GATED tool" test above — finishDispatch()'s
+    // warnOnLikelyUnmarkedSource block is ALSO gated on sinkClass ===
+    // 'NONE' specifically: a privileged tool is already policy-gated by
+    // its declared capabilities, so it has no business also being flagged
+    // as a possibly-forgotten isSource:true source.
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      warnOnLikelyUnmarkedSource: true,
+      auditSink: { record: (e) => events.push(e) },
+    });
+    broker.register({
+      name: 'shell_exec',
+      capabilities: { capabilities: ['exec:shell'] }, // GATED -- sinkClass !== 'NONE'
+      async execute() {
+        return 'x'.repeat(500); // well past the default 200-char threshold
+      },
+    });
+    await broker.call('shell_exec', { cmd: 'echo hi' }); // CLEAN scope -> ordinary ALLOW
+    expect(events).toHaveLength(1);
+    expect(events[0]?.verdict.action).toBe('ALLOW');
+  });
+
+  it('an explicit false also disables it (not just omitting the option)', async () => {
+    // Distinct from "is off by default" above (which omits the option
+    // entirely): opts.warnOnLikelyUnmarkedSource === false must resolve
+    // this.warnOnLikelyUnmarkedSource to undefined exactly like the omitted
+    // case does, not fall through to treating the literal `false` itself as
+    // a (numerically coerced, always-truthy-threshold) enabled state.
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      warnOnLikelyUnmarkedSource: false,
+      auditSink: { record: (e) => events.push(e) },
+    });
+    broker.register({
+      name: 'wiki_reader',
+      capabilities: { capabilities: [] },
+      async execute() {
+        return 'x'.repeat(500);
+      },
+    });
+    await broker.call('wiki_reader', {});
+    expect(events).toEqual([]);
+  });
 });
 
 describe('warnOnLikelyUnclassifiedSink (opt-in advisory heuristic, GAPS.md #10)', () => {
@@ -760,6 +947,31 @@ describe('warnOnLikelyUnclassifiedSink (opt-in advisory heuristic, GAPS.md #10)'
       },
     });
     expect(events).toHaveLength(1);
+  });
+
+  it('an explicit false also disables it (not just omitting the option) — and registering a NONE-sink tool does not throw', () => {
+    // Mirrors warnOnLikelyUnmarkedSource's own "explicit false" test above.
+    // Here the failure mode of the bug this guards against is worse than a
+    // silent no-op: this.warnOnLikelyUnclassifiedSink ending up as the
+    // literal boolean `false` (instead of undefined) would make register()
+    // call likelyUnclassifiedSinkKeyword(name, false) — `false.find` is not
+    // a function, so a misconfigured `false` would THROW on every
+    // subsequently-registered NONE-sink tool, not just fail to warn.
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      warnOnLikelyUnclassifiedSink: false,
+      auditSink: { record: (e) => events.push(e) },
+    });
+    expect(() =>
+      broker.register({
+        name: 'write_file',
+        capabilities: { capabilities: [] },
+        async execute() {
+          return 'ok';
+        },
+      }),
+    ).not.toThrow();
+    expect(events).toEqual([]);
   });
 
   it('wrap() (which calls register() internally) is flagged the same way', () => {
@@ -1959,6 +2171,64 @@ describe('broker.summarize() / broker.call() serialization (GAPS.md #17)', () =>
     expect(outcomeB.status).toBe('fulfilled');
     expect(broker.scope.watermark.level).toBe('DERIVED_UNTRUSTED');
   });
+
+  // Every composite-tool-calls-summarize() test above uses a NONE-sinkClass
+  // tool (capabilities: []) — it goes through call()'s NONE-sinkClass
+  // dispatch branch, never dispatchGated(). A GATED (privileged) tool can
+  // legitimately use the identical §6.2 pattern too (e.g. re-quarantining
+  // content immediately before finally acting on it) — dispatchGated() sets
+  // its own lockHeld:true context at each of its three phases specifically
+  // so a nested summarize() from within THAT execute() knows the lock is
+  // already held and must not try to re-acquire it (which would deadlock
+  // against dispatchGated()'s own still-open withLock()). These two pin
+  // that down for a genuinely gated tool, one per dispatchGated() phase a
+  // composite call can reach it through.
+  it('a GATED composite tool whose own execute() calls broker.summarize() does not deadlock via the immediate (non-REQUIRE_APPROVAL) dispatchGated path', async () => {
+    const broker = createBroker({ quarantineImpl: stubQuarantineImpl });
+    broker.register({
+      name: 'send_after_requarantine',
+      capabilities: { capabilities: ['net:email'] }, // GATED (EXFIL) -- goes through dispatchGated()
+      mayCallSummarize: true,
+      async execute() {
+        const record = registerDirect(broker, MALICIOUS_PAGE, 'send_after_requarantine');
+        const result = await broker.summarize(MALICIOUS_PAGE, {
+          sessionId: 's',
+          sourceTaintRecordId: record.id,
+        });
+        return `sent:${result.text}`;
+      },
+    });
+    // CLEAN scope + EXFIL sink -> base-decides ALLOW, so this reaches
+    // dispatchGated()'s IMMEDIATE finalizeGated() call (decision.action !==
+    // 'REQUIRE_APPROVAL'), not the approval-wait phase.
+    await expect(broker.call('send_after_requarantine', {})).resolves.toBe('sent:summary');
+  }, 3000);
+
+  it('a GATED composite tool whose own execute() calls broker.summarize() does not deadlock after a granted REQUIRE_APPROVAL wait either', async () => {
+    const broker = createBroker({
+      quarantineImpl: stubQuarantineImpl,
+      approvalChannel: { requestApproval: async () => true },
+    });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    broker.register({
+      name: 'send_after_requarantine',
+      capabilities: { capabilities: ['net:email'] },
+      mayCallSummarize: true,
+      async execute() {
+        const record = registerDirect(broker, MALICIOUS_PAGE, 'send_after_requarantine');
+        const result = await broker.summarize(MALICIOUS_PAGE, {
+          sessionId: 's',
+          sourceTaintRecordId: record.id,
+        });
+        return `sent:${result.text}`;
+      },
+    });
+    await broker.call('fetch_url', {}); // raises the watermark so send_after_requarantine needs approval
+    // RAW_UNTRUSTED + EXFIL -> REQUIRE_APPROVAL; the channel grants it, so
+    // this reaches dispatchGated()'s phase-3 finalizeGated() call (after the
+    // unlocked approval wait, lock re-acquired).
+    await expect(broker.call('send_after_requarantine', {})).resolves.toBe('sent:summary');
+  }, 3000);
 });
 
 describe('args snapshotting', () => {
@@ -2174,6 +2444,84 @@ describe('revalidation before execute (async-gap watermark escalation)', () => {
     const result = await broker.call('send_email', { to: 'ops@example.com', body: 'hi' });
     expect(result).toContain('sent:');
   });
+
+  // The two tests above only ever exercise revalidateBeforeExecute()'s
+  // `proceed` computation landing on FALSE (the fresh, re-decided verdict
+  // came back BLOCK). `proceed` is `freshDecision.action === 'ALLOW' ||
+  // freshDecision.action === 'ALLOW_WITH_WARNING'` — its POSITIVE outcome
+  // (an escalation whose fresh re-decision still permits execution) was
+  // never exercised by anything in this file: a mutant that broke either
+  // disjunct of that OR (or flipped it to always-false) would still make
+  // every existing test here pass, since they only ever need `proceed` to
+  // end up false. These two pin the positive direction, one per disjunct.
+  it('an escalation whose FRESH re-decision resolves to ALLOW_WITH_WARNING still proceeds, using the fresh decision/reason (not the stale one)', async () => {
+    let broker: ReturnType<typeof createBroker>;
+    let policyCallCount = 0;
+    // eslint-disable-next-line prefer-const -- see the declaration's comment on the analogous test above
+    broker = createBroker({
+      policy: async (_call, taint) => {
+        policyCallCount++;
+        if (taint.scopeLevel === 'CLEAN') {
+          // A mild, quarantine-style exposure lands mid-await — enough to
+          // move the watermark, not enough to make the fresh re-decision a
+          // BLOCK.
+          broker.markContextExposure(
+            { note: 'mild escalation mid-policy-await' },
+            'DERIVED_UNTRUSTED',
+          );
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return { action: 'ALLOW' };
+        }
+        return { action: 'ALLOW_WITH_WARNING', reason: 'still fine after re-check' };
+      },
+    });
+    let wroteFile = false;
+    broker.register({
+      name: 'write_file',
+      capabilities: { capabilities: ['write:fs'] },
+      async execute() {
+        wroteFile = true;
+        return 'written';
+      },
+    });
+
+    await expect(broker.call('write_file', { path: '/tmp/x' })).resolves.toBe('written');
+    expect(wroteFile).toBe(true);
+    expect(policyCallCount).toBe(2); // the stale decision, then revalidateBeforeExecute()'s fresh one
+  });
+
+  it('an escalation whose FRESH re-decision resolves to a plain ALLOW also still proceeds', async () => {
+    let broker: ReturnType<typeof createBroker>;
+    let policyCallCount = 0;
+    // eslint-disable-next-line prefer-const -- see the declaration's comment on the analogous test above
+    broker = createBroker({
+      policy: async (_call, taint) => {
+        policyCallCount++;
+        if (taint.scopeLevel === 'CLEAN') {
+          broker.markContextExposure(
+            { note: 'mild escalation mid-policy-await' },
+            'DERIVED_UNTRUSTED',
+          );
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          return { action: 'ALLOW' };
+        }
+        return { action: 'ALLOW' };
+      },
+    });
+    let wroteFile = false;
+    broker.register({
+      name: 'write_file',
+      capabilities: { capabilities: ['write:fs'] },
+      async execute() {
+        wroteFile = true;
+        return 'written';
+      },
+    });
+
+    await expect(broker.call('write_file', { path: '/tmp/x' })).resolves.toBe('written');
+    expect(wroteFile).toBe(true);
+    expect(policyCallCount).toBe(2);
+  });
 });
 
 // Regression coverage for a liveness bug: REQUIRE_APPROVAL used to hold the
@@ -2263,6 +2611,27 @@ describe('plan-freeze strict mode (declarePlan)', () => {
     broker.declarePlan([{ toolName: 'send_email' }]); // never actually invoked
     // fetch_url is never called, so the scope never leaves CLEAN — the plan
     // is inert and unplanned (or, as here, un-called) calls are still fine.
+    const result = await broker.call('send_email', { to: 'x@example.com', body: 'hi' });
+    expect(result).toContain('sent:');
+  });
+
+  it('does not constrain a call that does NOT match the plan while the scope is still CLEAN (truly inert pre-exposure, not just coincidentally satisfied)', async () => {
+    // The test above calls the SAME tool the plan names, so it can't tell
+    // "plan-freeze is genuinely inert while CLEAN" apart from "plan-freeze
+    // engaged but the call happened to match anyway." This uses a call that
+    // does NOT match the (never-yet-relevant) plan, while scope stays
+    // CLEAN — it must still succeed via the ordinary CLEAN-scope ALLOW
+    // policy, not be rejected as unplanned.
+    const broker = createBroker();
+    broker.register(sendEmail());
+    broker.register({
+      name: 'save_draft',
+      capabilities: { capabilities: [] },
+      async execute() {
+        return 'saved';
+      },
+    });
+    broker.declarePlan([{ toolName: 'save_draft' }]); // send_email is not in this plan at all
     const result = await broker.call('send_email', { to: 'x@example.com', body: 'hi' });
     expect(result).toContain('sent:');
   });
@@ -2690,6 +3059,11 @@ describe('audit trail when an allowed/approved execute() throws', () => {
     expect(events).toHaveLength(1);
     expect(events[0]?.executed).toBe(true);
     expect(events[0]?.verdict.action).toBe('REQUIRE_APPROVAL');
+    // requestedAt must still be threaded through this catch-and-rethrow
+    // audit path, exactly like the success path's own record does — an
+    // operator computing approval latency from this event must not lose
+    // that field just because execute() happened to throw.
+    expect(events[0]?.requestedAt).toBeTypeOf('number');
   });
 });
 
