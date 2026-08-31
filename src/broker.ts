@@ -11,6 +11,7 @@ import type {
   ApprovalChannel,
   AuditSink,
   CallResult,
+  PlanState,
   PlanStep,
   PolicyDecision,
   PolicyFn,
@@ -110,6 +111,43 @@ export interface BrokerOptions {
    */
   initialWatermark?: TaintWatermark;
   /**
+   * Seeds a declared plan (`declarePlan()`, §11) directly at construction
+   * time, restoring both the committed step list AND the exact cursor
+   * position it was at when captured — the counterpart to
+   * `initialWatermark` above, for plan-freeze's half of a broker's state.
+   * Intended to be spread straight from `restoreBrokerState()`'s own
+   * `initialPlan` output (`persistence.ts`, GAPS.md #12), the same way
+   * `initialWatermark`/`registry` already are:
+   *
+   *   const broker = createBroker({ ...restoreBrokerState(state) });
+   *
+   * This deliberately bypasses `declarePlan()`'s own CLEAN-only guard —
+   * `declarePlan()` itself is untouched and still throws
+   * `PlanNotDeclarableError` once the scope has left `CLEAN` (see its own
+   * doc comment), which is exactly the state a restored non-CLEAN
+   * watermark usually is in. That guard exists to stop untrusted content
+   * ALREADY LIVE IN THIS SCOPE, RIGHT NOW, from shaping a plan being
+   * declared now; seeding a plan here at construction time is a different
+   * operation with a different trust question — the plan was validly
+   * declared on the ORIGINAL broker while ITS scope was still CLEAN,
+   * before that broker's own exposure ever happened, and this option
+   * simply carries that already-legitimate commitment across a process
+   * boundary alongside the watermark it was made under. See
+   * `persistence.ts`'s `restoreBrokerState()` doc comment for the full
+   * safety-property argument: restoring a plan — even a fully
+   * adversarially-tampered one — can only ever make future privileged
+   * calls MORE restrictive, never less, because plan-freeze itself is
+   * strictly additive (§11) and this option changes nothing about how
+   * `gateDecision()` enforces it, only what it starts pre-loaded with.
+   *
+   * `cursor` must be between 0 and `steps.length` inclusive — the same
+   * bound `persistence.ts`'s `validateSerializedBrokerState()` enforces
+   * before `restoreBrokerState()` ever produces this shape. Not intended
+   * for hand-authored use outside `restoreBrokerState()`'s output; use
+   * `declarePlan()` for the ordinary, guarded, CLEAN-only path.
+   */
+  initialPlan?: PlanState;
+  /**
    * Custom args cloner, used in place of `structuredClone` for snapshotting
    * (see NonCloneableArgsError). Only needed if a tool's arguments include
    * values `structuredClone` can't handle (functions, most class
@@ -148,6 +186,18 @@ export interface BrokerOptions {
    * for exactly what this does and doesn't cover (a call with no http(s)
    * URL argument at all, e.g. a bare email address, is invisible to this
    * check; it is not a general egress-classification mechanism).
+   *
+   * By default the scan covers EVERY string leaf in a call's argument tree
+   * — a benign field whose value merely happens to be, in its entirety, a
+   * valid URL or email address is indistinguishable from a genuine
+   * destination and trips this same hard `BLOCK` (GAPS.md #18's own
+   * "over-detection" sub-bullet). A registered tool can narrow this per
+   * tool by declaring `ToolExecutor.destinationKeys` — naming the argument
+   * key(s) that actually carry its destination — which this option
+   * consumes automatically via `findOutboundHosts(argsSnapshot, {
+   * destinationKeys: tool.destinationKeys })` at the gating call site; a
+   * tool that leaves it unset gets the whole-tree scan described above,
+   * unchanged.
    */
   allowedOutboundHosts?: readonly string[] | ((hostname: string) => boolean);
   /**
@@ -290,6 +340,19 @@ class Broker implements ToolCallBroker {
         sources: [...opts.initialWatermark.sources],
       };
     }
+    // Plan-freeze restore path (§11, GAPS.md #12) — see `initialPlan`'s own
+    // doc comment above for the full safety-property argument. Deliberately
+    // bypasses declarePlan()'s CLEAN-only guard: this seeds `this.plan`/
+    // `this.planCursor` the exact same way declarePlan() itself does (a
+    // defensive copy of the step array, cursor set explicitly rather than
+    // always reset to 0), just at construction time instead of through the
+    // guarded public method, and only when the caller explicitly opts in
+    // via `initialPlan` — a broker constructed without it behaves exactly
+    // as before this option existed.
+    if (opts.initialPlan) {
+      this.plan = [...opts.initialPlan.steps];
+      this.planCursor = opts.initialPlan.cursor;
+    }
     this.rawSummarize = createQuarantine({
       impl: opts.quarantineImpl ?? unconfiguredQuarantineImpl,
       registry: this.registry,
@@ -326,6 +389,12 @@ class Broker implements ToolCallBroker {
 
   get scope(): Readonly<TaintScope> {
     return this.currentScope;
+  }
+
+  /** See ToolCallBroker.planState's own doc comment (types.ts). */
+  get planState(): Readonly<PlanState> | undefined {
+    if (this.plan === undefined) return undefined;
+    return { steps: [...this.plan], cursor: this.planCursor };
   }
 
   /**
@@ -754,6 +823,17 @@ class Broker implements ToolCallBroker {
     if (allowlist !== undefined && sinkClass === 'EXFIL') {
       let hosts: string[];
       try {
+        // `tool.destinationKeys` (types.ts) is threaded straight through as
+        // findOutboundHosts()'s own destinationKeys option (GAPS.md #18,
+        // egress.ts's FindOutboundHostsOptions): when a registered tool
+        // declares it, only its named key(s)' subtrees are scanned for a
+        // destination, eliminating a false-positive hard BLOCK from an
+        // unrelated benign field that merely happens to look like a URL or
+        // email address. A tool that leaves it undefined gets the original
+        // whole-tree scan exactly as before this field existed — findOut-
+        // boundHosts() itself treats an omitted option identically to no
+        // second argument at all.
+        //
         // Defensive, not currently reachable via this call path: this
         // walks the SAME argsSnapshot buildTaintContext() already walked
         // above (scanArgsForTaint()), at the same depth bound (500, defined
@@ -764,7 +844,20 @@ class Broker implements ToolCallBroker {
         // it's the only thing standing between an integrator who changes
         // one file's depth bound (or gateDecision()'s check order) without
         // the other and reopening an unaudited RangeError right here.
-        hosts = findOutboundHosts(argsSnapshot);
+        hosts = findOutboundHosts(
+          argsSnapshot,
+          // Built conditionally, not `{ destinationKeys: tool.destinationKeys }`
+          // unconditionally: tsconfig's `exactOptionalPropertyTypes` treats an
+          // explicit `destinationKeys: undefined` as distinct from the key
+          // being absent, and FindOutboundHostsOptions.destinationKeys is typed
+          // `readonly string[]` (no `| undefined`) precisely so a caller can't
+          // accidentally do that. Semantically identical either way — egress.ts
+          // reads options via `options?.destinationKeys` — this is purely to
+          // satisfy that stricter optionality contract without loosening it.
+          tool.destinationKeys !== undefined
+            ? { destinationKeys: tool.destinationKeys }
+            : undefined,
+        );
       } catch (error) {
         if (error instanceof ArgsTooDeepError) this.auditArgsTooDeep(call, sinkClass, error);
         throw error;

@@ -45,11 +45,14 @@ describe('examples/mcp-integration.ts', () => {
 
     // It must exercise the SAME source/sink gating tools/call does above —
     // a resources/read result feeding a declared write:fs sink is gated
-    // (default policy resolves this to REQUIRE_APPROVAL, same as the
-    // tools/call case just above it), proving the resource was actually
-    // wrapped with isSource: true and not just fetched and discarded.
+    // (default policy resolves this to QUARANTINE_AND_RETRY — previously a
+    // bare REQUIRE_APPROVAL, before defaultPolicy started recognizing the
+    // exact/high-confidence Layer 2 match this scenario's verbatim-copied
+    // content produces, DESIGN.md §7.2 — same as the tools/call case just
+    // above it), proving the resource was actually wrapped with isSource:
+    // true and not just fetched and discarded.
     expect(stdout).toContain(
-      'resources/read content gates a sink exactly like tools/call content did above: REQUIRE_APPROVAL',
+      'resources/read content gates a sink exactly like tools/call content did above: QUARANTINE_AND_RETRY',
     );
     expect(stdout).not.toContain('UNEXPECTED: call was allowed');
   }, 30_000);

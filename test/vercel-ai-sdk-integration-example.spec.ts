@@ -38,9 +38,15 @@ describe('examples/vercel-ai-sdk-integration.ts', () => {
       cwd: fileURLToPath(new URL('..', import.meta.url)),
     });
 
-    // The genuinely-blocked shell_exec call still reports as blocked, same
-    // as before this fix.
-    expect(stdout).toContain('blocked, same as any other integration: BLOCK');
+    // The genuinely-gated shell_exec call still reports as gated, same as
+    // before this fix — though the exact verdict has since changed from a
+    // bare BLOCK to QUARANTINE_AND_RETRY: fetch_page's own mock result is
+    // copied verbatim into the shell_exec call, a high-confidence Layer 2
+    // match, and defaultPolicy now offers QUARANTINE_AND_RETRY instead of
+    // BLOCK for exactly that shape (DESIGN.md §7.2) — still never executed
+    // either way (ToolCallBlockedError), so this remains the same
+    // regression coverage for the finding this test targets.
+    expect(stdout).toContain('blocked, same as any other integration: QUARANTINE_AND_RETRY');
 
     // The dispatch to an unregistered tool name must be reported as the
     // real error it is...
