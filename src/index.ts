@@ -71,7 +71,7 @@ export {
   TAINT_BRAND,
 } from './types.js';
 
-export { createBroker } from './broker.js';
+export { createBroker, likelyUnclassifiedSinkKeyword } from './broker.js';
 export type { BrokerOptions } from './broker.js';
 
 export { defaultPolicy } from './policy/default-policy.js';
@@ -140,6 +140,8 @@ export { jsonSafeClone } from './json-safe-clone.js';
 
 export { defineSource, defineSink } from './define.js';
 export type { DefineSourceOpts, DefineSinkOpts } from './define.js';
+
+export { formatAuditTrail, explainWatermark, AggregatingAuditSink } from './debug.js';
 
 export {
   TaintBrokerError,

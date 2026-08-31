@@ -102,6 +102,22 @@ export interface BrokerOptions {
    */
   turnDecayWindow?: number;
   policy?: PolicyFn;
+  /**
+   * Consulted only for a `REQUIRE_APPROVAL` verdict (§7.2/§7.3); every
+   * other verdict never reads this option. Omitting it entirely is
+   * supported and fails SAFE — a `REQUIRE_APPROVAL` call with no channel
+   * configured is treated as denied, exactly like one a real channel
+   * actively evaluated and said no to (`finalizeGated()`'s
+   * `approvedByHuman` is `false` in both cases) — never as `ALLOW`. That
+   * said, the two ARE distinguishable in the thrown `ToolCallBlockedError`'s
+   * message and the recorded `AuditEvent.verdict.reason`: the no-channel
+   * case appends "(no approvalChannel configured -- see
+   * BrokerOptions.approvalChannel)" to the policy's own reason text, since
+   * the two used to be byte-for-byte indistinguishable — a real production
+   * debugging trap (an operator staring at a "denied" audit log had no way
+   * to tell "a human said no" from "nobody was ever asked, because this
+   * broker was constructed without one") — see GAPS.md #20.
+   */
   approvalChannel?: ApprovalChannel;
   auditSink?: AuditSink;
   /** The capability-less LLM call used by broker.summarize(). No default — see quarantine.ts. */
@@ -269,6 +285,56 @@ export interface BrokerOptions {
    * (`types.ts`'s own doc comment on that field).
    */
   warnOnLikelyDestinationKeysMismatch?: boolean;
+  /**
+   * Applied to `call.args` ONLY, on every `AuditEvent` this library
+   * constructs, immediately before it reaches `auditSink.record()` — an
+   * opt-in seam for keeping sensitive argument content (a credential, an
+   * API key, a large excerpt of a private document) out of whatever
+   * `AuditSink` you've wired up (GAPS.md #24). `AuditEvent.call.args` is
+   * the tool call's real, cloned argument object for every gated call,
+   * `BLOCK`ed or not, with no redaction of its own — a real, previously-
+   * undocumented gap: `TaintRegistry` deliberately never stores raw
+   * plaintext, only content-addressed `Fingerprint`s (`exactHash`/
+   * `simhash`/`shingleHashes` — see that interface's own doc comment,
+   * `types.ts`), but `call.args` bypasses that protection entirely, going
+   * straight from the live tool call into your sink unchanged.
+   *
+   * Receives the same `call`/`taint` pair the resulting `AuditEvent`
+   * carries (at the point this runs, `call.args` is still the unredacted
+   * original) and returns the replacement value for `call.args`; nothing
+   * else on the event is touched. Applied at a single choke point — every
+   * `auditSink.record()` call this library makes (a gated call's decision,
+   * the `NONE`-sinkClass escalator/advisory events, and every
+   * administrative event `internal-audit.ts`/`quarantine.ts` build) is
+   * routed through one wrapped `AuditSink` built once here at construction
+   * time (`withRedactedAuditArgs()`, below), rather than this function
+   * being threaded individually through each of the roughly dozen
+   * `auditSink.record()`/`recordTrivialAudit()` call sites across this
+   * file/`internal-audit.ts`/`quarantine.ts` — so a call site added later
+   * inherits redaction automatically, without anyone having to remember to
+   * wire it in there specifically.
+   *
+   * **Deliberately NOT a built-in PII/secret detector.** This library ships
+   * no default redaction logic and enables none by default — the same
+   * "integrator declares, library enforces" trust boundary `isSource`/
+   * `trusted`/`readsPrivateData`/`destinationKeys` already rest on
+   * (GAPS.md #10): this library has no way to know what counts as
+   * sensitive in YOUR tool arguments, and a built-in heuristic redactor
+   * would risk both false negatives (a secret shaped unlike anything it
+   * was built to recognize) and false positives (redacting content a human
+   * approver or a later `AuditSink` consumer genuinely needed to see to
+   * make sense of a decision). See `docs/audit-redaction.md` for worked
+   * patterns this seam is meant to support — redacting by `taint.sinkClass`,
+   * redacting by cross-referencing `TaintContext.privateDataSeen`, and a
+   * simple key-denylist — none of which this library could safely guess on
+   * your behalf.
+   *
+   * Defaults to identity when unset: `call.args` reaches
+   * `auditSink.record()` completely unchanged, exactly today's behavior —
+   * adding this option changes nothing for an integrator who doesn't opt
+   * in.
+   */
+  redactAuditArgs?: (call: ToolCall, taint: TaintContext) => unknown;
 }
 
 const DEFAULT_UNMARKED_SOURCE_WARN_THRESHOLD = 200;
@@ -291,7 +357,84 @@ const DEFAULT_UNCLASSIFIED_SINK_KEYWORDS: readonly string[] = [
   'upload',
 ];
 
+/**
+ * The pure keyword-match check behind `register()`/`wrap()`'s
+ * `warnOnLikelyUnclassifiedSink` registration-time advisory (GAPS.md #10,
+ * `BrokerOptions.warnOnLikelyUnclassifiedSink`'s own doc comment above) —
+ * extracted as its own exported function (also re-exported from
+ * `src/index.ts`) so the identical check can run over a WHOLE tool catalog
+ * without constructing a broker, an `AuditSink`, or calling
+ * `register()`/`wrap()` at all: `likelyUnclassifiedSinkKeyword(tool.name)`
+ * for every tool whose `capabilities` array is empty is a manifest-style
+ * pre-publish lint step, not just a live-broker-only advisory. See
+ * `docs/classifying-tools.md`'s "Automating what this checklist can
+ * automate" section for the worked pattern this enables, and the
+ * `sinkClass === 'NONE'` branch of `register()` below, which is now a thin
+ * call-site wrapper around this same function rather than a second,
+ * independent copy of the match logic — so the live-broker path and this
+ * standalone lint path cannot silently drift apart the way the "is this an
+ * untrusted source" check once did before `internal-audit.ts`'s
+ * `isUntrustedSource()` consolidated it (see this file's own reserved-
+ * synthetic-tool-names implementation note, DESIGN.md).
+ *
+ * Returns the FIRST matching keyword (case-insensitive substring match
+ * against `name`), or `undefined` if none matched — deliberately not a
+ * boolean: the matched keyword itself is exactly the information a lint
+ * report needs to explain WHY a tool was flagged ("its name contains
+ * 'delete'"), not merely THAT it was. `keywords` defaults to the same
+ * `DEFAULT_UNCLASSIFIED_SINK_KEYWORDS` list `warnOnLikelyUnclassifiedSink:
+ * true` uses, so a caller who wants "the library's own default opinion"
+ * over a catalog can omit it entirely; passing an explicit list is the
+ * identical tuning knob `warnOnLikelyUnclassifiedSink: readonly string[]`
+ * already offers a live broker.
+ *
+ * A pure function, on purpose: it only ever looks at `name` and `keywords`,
+ * never a `ToolExecutor`'s `capabilities`/`isSource`/anything else — the
+ * caller decides which tools are even worth checking (ordinarily, only
+ * ones with an empty `capabilities` array; a tool with a real,
+ * correctly-declared capability has nothing to flag). This mirrors
+ * `warnOnLikelyUnclassifiedSink`'s own registration-time check, which is
+ * name-only and static precisely because "does this tool declare a sink
+ * capability" needs no live call to answer — contrast
+ * `warnOnLikelyUnmarkedSource`, whose equivalent standalone extraction
+ * is NOT offered here: that heuristic needs an actual returned-text
+ * LENGTH from a real `execute()` call, a runtime property no amount of
+ * registration-time-only tooling can substitute for. See
+ * `docs/classifying-tools.md`'s new section for this asymmetry stated
+ * explicitly, so a manifest-style lint built on this function doesn't
+ * accidentally imply it covers GAPS.md #1 too.
+ */
+export function likelyUnclassifiedSinkKeyword(
+  name: string,
+  keywords: readonly string[] = DEFAULT_UNCLASSIFIED_SINK_KEYWORDS,
+): string | undefined {
+  const nameLower = name.toLowerCase();
+  return keywords.find((kw) => nameLower.includes(kw.toLowerCase()));
+}
+
 const NOOP_AUDIT: AuditSink = { record() {} };
+
+/**
+ * Wraps `sink` so every `AuditEvent.call.args` passes through
+ * `redact(call, taint)` before `sink.record()` ever sees it — the single
+ * choke point `BrokerOptions.redactAuditArgs` (see its own doc comment
+ * above) is applied at, instead of at each individual
+ * `auditSink.record()`/`recordTrivialAudit()` call site across this file/
+ * `internal-audit.ts`/`quarantine.ts`. `event` itself is never mutated: a
+ * fresh event object (wrapping a fresh `call` object) is built around the
+ * redacted `args`, since nothing here can assume the constructed `event`/
+ * `event.call` isn't read again elsewhere by whatever built them.
+ */
+function withRedactedAuditArgs(
+  sink: AuditSink,
+  redact: (call: ToolCall, taint: TaintContext) => unknown,
+): AuditSink {
+  return {
+    record(event) {
+      sink.record({ ...event, call: { ...event.call, args: redact(event.call, event.taint) } });
+    },
+  };
+}
 
 function blockedMessage(toolName: string, decision: { action: string; reason?: string }): string {
   const reason = decision.reason ?? 'no approval channel was configured to grant it';
@@ -365,7 +508,10 @@ class Broker implements ToolCallBroker {
     }
     this.policy = opts.policy ?? defaultPolicy;
     this.approvalChannel = opts.approvalChannel;
-    this.auditSink = opts.auditSink ?? NOOP_AUDIT;
+    const configuredAuditSink = opts.auditSink ?? NOOP_AUDIT;
+    this.auditSink = opts.redactAuditArgs
+      ? withRedactedAuditArgs(configuredAuditSink, opts.redactAuditArgs)
+      : configuredAuditSink;
     this.cloneArgs = opts.cloneArgs ?? structuredClone;
     this.warnOnLikelyUnmarkedSource =
       opts.warnOnLikelyUnmarkedSource === true
@@ -407,7 +553,7 @@ class Broker implements ToolCallBroker {
       impl: opts.quarantineImpl ?? unconfiguredQuarantineImpl,
       registry: this.registry,
       raiseToDerivedUntrusted: (tag) => this.raiseWatermarkAndResetDecay('DERIVED_UNTRUSTED', tag),
-      getScope: () => this.currentScope.watermark,
+      getScope: () => this.scopeSnapshot(this.currentScope),
       auditSink: this.auditSink,
     });
     // GAPS.md #17: summarize() raises the watermark exactly like a source
@@ -460,6 +606,29 @@ class Broker implements ToolCallBroker {
     this.turnsSinceExposure = 0;
   }
 
+  /**
+   * The `{id, level, privateDataSeen}` shape `recordTrivialAudit()`/
+   * `trivialTaintContext()` (`internal-audit.ts`) need for an
+   * administrative `AuditEvent`'s ambient `TaintContext` — including
+   * `id`, which becomes that `TaintContext.scopeId` (see that field's own
+   * doc comment, `types.ts`). A tiny helper purely so every call site below
+   * builds this shape the same way rather than re-deriving
+   * `{ id: scope.id, level: scope.watermark.level, privateDataSeen:
+   * scope.watermark.privateDataSeen }` independently at each of the six
+   * `recordTrivialAudit()` call sites in this class.
+   */
+  private scopeSnapshot(scope: TaintScope): {
+    id: string;
+    level: TaintLevel;
+    privateDataSeen: boolean;
+  } {
+    return {
+      id: scope.id,
+      level: scope.watermark.level,
+      privateDataSeen: scope.watermark.privateDataSeen,
+    };
+  }
+
   /** Best-effort deep clone for args snapshotting; throws NonCloneableArgsError rather than silently degrading — see GAPS.md #16. */
   private cloneArgsOrThrow(toolName: string, value: unknown): unknown {
     try {
@@ -503,9 +672,13 @@ class Broker implements ToolCallBroker {
       // GAPS.md #1. Checked once at registration time (a static property of
       // the declaration), not per-call like warnOnLikelyUnmarkedSource
       // (which needs the actual returned text length, a runtime property).
-      const nameLower = tool.name.toLowerCase();
-      const matchedKeyword = this.warnOnLikelyUnclassifiedSink.find((kw) =>
-        nameLower.includes(kw.toLowerCase()),
+      // Delegates to the standalone exported likelyUnclassifiedSinkKeyword()
+      // (above) rather than re-implementing the same match inline, so this
+      // live-broker path and the standalone manifest-lint path it also
+      // backs (docs/classifying-tools.md) can't drift apart.
+      const matchedKeyword = likelyUnclassifiedSinkKeyword(
+        tool.name,
+        this.warnOnLikelyUnclassifiedSink,
       );
       if (matchedKeyword !== undefined) {
         recordTrivialAudit(
@@ -520,7 +693,7 @@ class Broker implements ToolCallBroker {
             args: { toolName: tool.name, matchedKeyword },
             sessionId: this.sessionId,
           },
-          this.currentScope.watermark,
+          this.scopeSnapshot(this.currentScope),
           true,
         );
       }
@@ -773,6 +946,7 @@ class Broker implements ToolCallBroker {
       privateDataSeen: this.currentScope.watermark.privateDataSeen,
       sinkClass,
       hasUnattributedSubstantialContent,
+      scopeId: this.currentScope.id,
     };
   }
 
@@ -971,7 +1145,7 @@ class Broker implements ToolCallBroker {
               reason: `Advisory: tool "${toolName}" declares destinationKeys ${JSON.stringify(tool.destinationKeys)}, but this call's arguments also contain what looks like a destination (a URL or email address) OUTSIDE every declared key's subtree, at "${first.path}" ("${first.value}"${more}). If this tool's real destination-carrying argument name varies by call shape (GAPS.md #18), BrokerOptions.allowedOutboundHosts may be silently NOT scanning this call's actual destination — this warning never changes the gating decision or destinationKeys itself.`,
             },
             call,
-            this.currentScope.watermark,
+            this.scopeSnapshot(this.currentScope),
             true,
           );
         }
@@ -1001,6 +1175,7 @@ class Broker implements ToolCallBroker {
       privateDataSeen: this.currentScope.watermark.privateDataSeen,
       sinkClass,
       hasUnattributedSubstantialContent: false,
+      scopeId: this.currentScope.id,
     };
     this.auditSink.record({
       verdict: { action: 'BLOCK', reason: error.message },
@@ -1025,6 +1200,17 @@ class Broker implements ToolCallBroker {
     taint: TaintContext,
     decision: PolicyDecision,
     approvedByHuman: boolean,
+    // Only ever passed by dispatchGated() for its REQUIRE_APPROVAL branch —
+    // the moment phase 2 (the approval wait) actually began, captured there
+    // before the wait so this method itself doesn't have to know whether an
+    // approvalChannel was configured or care which sub-case produced it (see
+    // AuditEvent.requestedAt's own doc comment, types.ts). Left undefined by
+    // the ALLOW/BLOCK/QUARANTINE_AND_RETRY call site below (decision.action
+    // !== 'REQUIRE_APPROVAL' there, so no wait ever happened to time) — every
+    // AuditEvent this method records below carries it through unchanged,
+    // which is what makes AuditEvent.requestedAt end up unset for every
+    // non-REQUIRE_APPROVAL verdict, the documented default.
+    requestedAt?: number,
   ): Promise<unknown> {
     const toolName = call.toolName;
     let result: unknown;
@@ -1073,6 +1259,7 @@ class Broker implements ToolCallBroker {
             taint: auditTaint,
             at: Date.now(),
             executed: true,
+            ...(requestedAt !== undefined ? { requestedAt } : {}),
           });
           throw error;
         }
@@ -1082,15 +1269,63 @@ class Broker implements ToolCallBroker {
     // watermark escalation caught by revalidateBeforeExecute(): never
     // auto-executed (§7.2).
 
+    // A REQUIRE_APPROVAL call denied because BrokerOptions.approvalChannel
+    // was never configured at all is, otherwise, byte-for-byte
+    // indistinguishable — in both this thrown error and the recorded
+    // AuditEvent — from one a REAL, correctly-configured approvalChannel
+    // actively evaluated and denied: dispatchGated()'s own ternary forces
+    // `approvedByHuman` to `false` in both cases identically, so
+    // `provisionallyApproved` above is false either way and `auditDecision`
+    // (still exactly gateDecision()'s original REQUIRE_APPROVAL `decision`
+    // — see below) carries the same generic policy reason regardless. That
+    // was a real production debugging trap (GAPS.md #20): an operator
+    // staring at a "denied" audit log entry had no way to tell "a human/
+    // process looked at this and said no" (working as intended) apart from
+    // "nobody was ever asked" (almost always a config omission — a
+    // forgotten `approvalChannel` on `createBroker()`, or a dev/test
+    // harness that never wired one up) — both fail SAFE (deny), but only
+    // one of them is a policy decision worth trusting.
+    //
+    // Reachable ONLY here, and only for the genuine no-channel case: this
+    // branch requires `decision.action === 'REQUIRE_APPROVAL'` with
+    // `approvedByHuman` false, which is exactly the condition that makes
+    // `provisionallyApproved` above false too — so `revalidateBeforeExecute()`
+    // never ran, and `auditDecision`/`auditTaint` are still precisely
+    // `decision`/`taint` as `gateDecision()` computed them, safe to extend
+    // with an appended note rather than needing to reconcile against a
+    // possibly-revalidated verdict. When `this.approvalChannel` IS
+    // configured, a not-executed REQUIRE_APPROVAL here is either a genuine
+    // channel denial or an escalation `revalidateBeforeExecute()` caught
+    // (in which case `auditDecision` is that fresh, non-REQUIRE_APPROVAL
+    // decision, e.g. BLOCK — see that method's own doc comment) — neither
+    // should get this note, since a channel really was configured.
+    if (
+      !executed &&
+      decision.action === 'REQUIRE_APPROVAL' &&
+      !approvedByHuman &&
+      this.approvalChannel === undefined
+    ) {
+      auditDecision = {
+        ...decision,
+        reason: `${decision.reason} (no approvalChannel configured -- see BrokerOptions.approvalChannel)`,
+      };
+    }
+
     this.auditSink.record({
       verdict: auditDecision,
       call,
       taint: auditTaint,
       at: Date.now(),
       executed,
+      ...(requestedAt !== undefined ? { requestedAt } : {}),
     });
     if (!executed) {
-      throw new ToolCallBlockedError(call, auditDecision, blockedMessage(toolName, auditDecision));
+      throw new ToolCallBlockedError(
+        call,
+        auditDecision,
+        auditTaint,
+        blockedMessage(toolName, auditDecision),
+      );
     }
 
     // Gated calls always act on the LIVE scope here, deliberately — unlike
@@ -1153,6 +1388,16 @@ class Broker implements ToolCallBroker {
     }
     const { taint, decision } = phase1;
 
+    // AuditEvent.requestedAt (types.ts) — captured here, at the exact
+    // moment phase 2 (the approval wait) begins, whether or not
+    // `this.approvalChannel` is actually configured: the no-channel branch
+    // below still resolves through this same phase, it just settles
+    // synchronously to `false` rather than genuinely consulting a channel
+    // (see AuditEvent.requestedAt's own doc comment for why that sub-case
+    // is still worth timing, not left unset). Threaded straight through to
+    // finalizeGated() below, the only place that goes on to build this
+    // call's AuditEvent(s).
+    const requestedAt = Date.now();
     const approvedByHuman = this.approvalChannel
       ? await this.reentrancyGuard.run({ lockHeld: false }, () =>
           this.approvalChannel!.requestApproval(call, taint, decision),
@@ -1161,7 +1406,16 @@ class Broker implements ToolCallBroker {
 
     return this.withLock(() =>
       this.reentrancyGuard.run({ lockHeld: true }, () =>
-        this.finalizeGated(tool, call, argsSnapshot, sinkClass, taint, decision, approvedByHuman),
+        this.finalizeGated(
+          tool,
+          call,
+          argsSnapshot,
+          sinkClass,
+          taint,
+          decision,
+          approvedByHuman,
+          requestedAt,
+        ),
       ),
     );
   }
@@ -1203,7 +1457,7 @@ class Broker implements ToolCallBroker {
         this.auditSink,
         { action: 'ALLOW_WITH_WARNING', reason: reasons.join(' ') },
         call,
-        scope.watermark,
+        this.scopeSnapshot(scope),
         true,
       );
     }
@@ -1230,7 +1484,7 @@ class Broker implements ToolCallBroker {
             reason: `Advisory: tool "${toolName}" is not registered isSource:true but returned ${text.length} chars of text (>= the warnOnLikelyUnmarkedSource threshold of ${this.warnOnLikelyUnmarkedSource}). If this tool can return content the agent didn't originate, it likely should be isSource:true (GAPS.md #1) — this warning never changes the watermark or gates anything on its own.`,
           },
           call,
-          scope.watermark,
+          this.scopeSnapshot(scope),
           true,
         );
       }
@@ -1280,7 +1534,7 @@ class Broker implements ToolCallBroker {
         },
         sessionId: this.sessionId,
       },
-      this.currentScope.watermark,
+      this.scopeSnapshot(this.currentScope),
       true,
     );
   }
@@ -1350,11 +1604,20 @@ class Broker implements ToolCallBroker {
    * audit, and receives the pre-clear level/hadPlan so each caller can
    * phrase its own reason text without duplicating this snapshot/clear
    * sequence.
+   *
+   * The audited event's `TaintContext.scopeId` (types.ts) is, deliberately,
+   * the id of the scope just DISCARDED, not the fresh one this method
+   * creates to replace it — the same "describe what was cleared, not what
+   * replaced it" convention `scopeLevel` already follows here (it reports
+   * the prior, pre-clear level, never the resulting `CLEAN`). Captured
+   * before `this.currentScope` is reassigned below, since afterward
+   * `this.currentScope.id` would already be the NEW scope's id.
    */
   private clearScopeForTurnReset(
     kind: 'turn' | 'turn-decay',
     buildReason: (priorLevel: TaintLevel, hadPlan: boolean) => string,
   ): void {
+    const priorScopeId = this.currentScope.id;
     const priorLevel = this.currentScope.watermark.level;
     const priorPrivateDataSeen = this.currentScope.watermark.privateDataSeen;
     const hadPlan = this.plan !== undefined;
@@ -1367,7 +1630,7 @@ class Broker implements ToolCallBroker {
         this.auditSink,
         { action: 'ALLOW_WITH_WARNING', reason: buildReason(priorLevel, hadPlan) },
         { id: randomUUID(), toolName: '__tttb_turn_reset', args: {}, sessionId: this.sessionId },
-        { level: priorLevel, privateDataSeen: priorPrivateDataSeen },
+        { id: priorScopeId, level: priorLevel, privateDataSeen: priorPrivateDataSeen },
         true,
       );
     }
@@ -1443,7 +1706,13 @@ class Broker implements ToolCallBroker {
         args: { reason, approvedBy },
         sessionId: this.sessionId,
       },
-      { level: priorLevel, privateDataSeen: priorPrivateDataSeen },
+      // Unlike clearScopeForTurnReset() below, declassifyScope() mutates
+      // `this.currentScope.watermark` in place rather than replacing
+      // `this.currentScope` with a fresh scope object — so, unlike a
+      // turn-boundary reset, the scope's `id` itself does not change here;
+      // `this.currentScope.id` at this point is still the same id the
+      // watermark being cleared belonged to.
+      { id: this.currentScope.id, level: priorLevel, privateDataSeen: priorPrivateDataSeen },
       true,
     );
   }
