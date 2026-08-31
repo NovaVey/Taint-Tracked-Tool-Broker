@@ -44,6 +44,9 @@
     "DESIGN.md",
     "GAPS.md",
     "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "CODE_OF_CONDUCT.md",
     "LICENSE"
   ],
   "scripts": {

@@ -4,6 +4,7 @@ import {
   InMemoryTaintRegistry,
   NOT_SENSITIVE,
   scanArgsForTaint,
+  wrapTainted,
   type ProvenanceTag,
   type TaintMatch,
   type TaintRegistry,
@@ -146,5 +147,128 @@ describe('scanArgsForTaint', () => {
     scanArgsForTaint({ body: SOURCE }, withoutCombined);
     expect(exactCalls).toBe(2);
     expect(fuzzyCalls).toBe(2);
+  });
+
+  describe('Layer 1 fast path — a still-wrapped TaintedValue reached mid-scan', () => {
+    // Regression coverage: prior to this suite, nothing in the whole test
+    // corpus ever passed a TaintedValue through scanArgsForTaint(), so a
+    // regression in the `isTaintedValue(node)` branch (scan.ts) — e.g. the
+    // level bump, the per-source `getById()` attribution, or the recursion
+    // into `node.value` — could break silently with no test to catch it.
+
+    it('bumps the floor from the wrapper level directly, produces a wrapper-type match for each resolvable source, and keeps walking into node.value', () => {
+      const registry = new InMemoryTaintRegistry();
+      // A real registered TaintRecord, so getById(tag.id) inside scan.ts's
+      // Layer 1 branch actually resolves to something — a wrapper source
+      // whose id isn't registered is a legitimate no-match case, not what
+      // this test is for.
+      const record = registry.register(SOURCE, tag(), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+      const wrapped = wrapTainted(SOURCE, 'RAW_UNTRUSTED', [
+        {
+          id: record.id,
+          sourceCallId: 'call-1',
+          toolName: 'fetch_url',
+          sessionId: 's',
+          capturedAt: 0,
+        },
+      ]);
+
+      const { floor, matches } = scanArgsForTaint({ body: wrapped }, registry);
+
+      // Floor comes from the wrapper's OWN level (node.level), not from a
+      // registry lookup — this must hold even for a registry that would
+      // never otherwise have flagged this exact node.
+      expect(floor).toBe('RAW_UNTRUSTED');
+
+      const wrapperMatches = matches.filter((m) => m.matchType === 'wrapper');
+      expect(wrapperMatches).toHaveLength(1);
+      expect(wrapperMatches[0]?.record.id).toBe(record.id);
+      expect(wrapperMatches[0]?.argPath).toBe('body');
+
+      // After handling the wrapper itself, the walk must continue into
+      // node.value — here that's the plain SOURCE string, which is also
+      // separately registered, so it should additionally produce its own
+      // ordinary exact match at the same path.
+      const exactMatches = matches.filter((m) => m.matchType === 'exact');
+      expect(exactMatches).toHaveLength(1);
+      expect(exactMatches[0]?.argPath).toBe('body');
+    });
+
+    it('omits a wrapper match for a source id the registry does not know, but still bumps the floor', () => {
+      const registry = new InMemoryTaintRegistry();
+      const wrapped = wrapTainted('some in-memory-only tainted text', 'RAW_UNTRUSTED', [
+        {
+          id: 'unregistered-id',
+          sourceCallId: 'call-1',
+          toolName: 'fetch_url',
+          sessionId: 's',
+          capturedAt: 0,
+        },
+      ]);
+
+      const { floor, matches } = scanArgsForTaint({ body: wrapped }, registry);
+
+      expect(floor).toBe('RAW_UNTRUSTED');
+      expect(matches.some((m) => m.matchType === 'wrapper')).toBe(false);
+    });
+  });
+
+  describe('Map/Set coverage — content nested inside a built-in whose state is not an own-enumerable property', () => {
+    // Regression coverage for the scan-coverage-gap finding: visit()'s
+    // generic-object fallback walks Object.entries(node), which returns
+    // ZERO entries for a Map or Set (their state lives in internal slots,
+    // not own-enumerable properties). Before scan.ts grew explicit Map/Set
+    // branches, each of the three cases below returned
+    // `{ matches: [], floor: 'CLEAN' }` — a complete, silent miss — despite
+    // the broker's default `cloneArgs` (`structuredClone`) preserving
+    // Map/Set intact into the exact snapshot this scan walks.
+
+    it('finds a RAW_UNTRUSTED string reachable as a Map VALUE', () => {
+      const registry = new InMemoryTaintRegistry();
+      registry.register(SOURCE, tag(), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+      const { floor, matches } = scanArgsForTaint({ m: new Map([['a', SOURCE]]) }, registry);
+      expect(floor).toBe('RAW_UNTRUSTED');
+      expect(matches.some((m) => m.matchType === 'exact')).toBe(true);
+    });
+
+    it('finds a RAW_UNTRUSTED string reachable as a Map KEY', () => {
+      const registry = new InMemoryTaintRegistry();
+      registry.register(SOURCE, tag(), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+      const { floor, matches } = scanArgsForTaint(
+        { m: new Map([[SOURCE, 'harmless value']]) },
+        registry,
+      );
+      expect(floor).toBe('RAW_UNTRUSTED');
+      expect(matches.some((m) => m.matchType === 'exact')).toBe(true);
+    });
+
+    it('finds a RAW_UNTRUSTED string reachable as a Set VALUE', () => {
+      const registry = new InMemoryTaintRegistry();
+      registry.register(SOURCE, tag(), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+      const { floor, matches } = scanArgsForTaint({ s: new Set(['harmless', SOURCE]) }, registry);
+      expect(floor).toBe('RAW_UNTRUSTED');
+      expect(matches.some((m) => m.matchType === 'exact')).toBe(true);
+    });
+
+    it('stays CLEAN for a Map/Set containing only unrelated content', () => {
+      const registry = new InMemoryTaintRegistry();
+      registry.register(SOURCE, tag(), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+      const { floor, matches } = scanArgsForTaint(
+        { m: new Map([['a', 'nothing to see here']]), s: new Set(['also nothing']) },
+        registry,
+      );
+      expect(floor).toBe('CLEAN');
+      expect(matches).toEqual([]);
+    });
+
+    it('does not stack-overflow or double-scan a Map/Set participating in a cycle', () => {
+      const registry = new InMemoryTaintRegistry();
+      registry.register(SOURCE, tag(), 'RAW_UNTRUSTED', NOT_SENSITIVE);
+      const m = new Map<string, unknown>([['note', SOURCE]]);
+      m.set('self', m); // circular reference through a Map, mirroring the existing plain-object cycle test
+      const { floor, matches } = scanArgsForTaint({ m }, registry);
+      expect(floor).toBe('RAW_UNTRUSTED');
+      expect(matches.filter((match) => match.matchType === 'exact')).toHaveLength(1);
+    });
   });
 });

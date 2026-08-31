@@ -83,6 +83,7 @@ export {
   restoreRegistry,
   serializeBrokerState,
   restoreBrokerState,
+  InvalidBrokerStateError,
 } from './persistence.js';
 export type { SerializedTaintRecord, SerializedBrokerState } from './persistence.js';
 export {
@@ -119,7 +120,7 @@ export {
 
 export { unconfiguredQuarantineImpl } from './quarantine.js';
 
-export { createDeferredApprovalChannel } from './approval.js';
+export { createDeferredApprovalChannel, DuplicateApprovalTokenError } from './approval.js';
 export type { DeferredApprovalChannel, DeferredApprovalChannelOpts } from './approval.js';
 
 export { jsonSafeClone } from './json-safe-clone.js';

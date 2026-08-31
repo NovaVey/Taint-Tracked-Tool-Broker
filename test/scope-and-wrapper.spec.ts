@@ -111,4 +111,55 @@ describe('taint/wrapper (Layer 1)', () => {
     expect(result.value).toEqual([2, 3]);
     expect(result.level).toBe('CLEAN');
   });
+
+  it('mapTainted aggregates taint from individually-wrapped elements, not just an outer-wrapped array', () => {
+    // The exact reproduction from the confirmed finding: a plain array
+    // (not itself a TaintedValue) whose ELEMENTS are each individually
+    // wrapTainted(). Before the fix, mapTainted only ever checked whether
+    // the outer array was a TaintedValue and silently fell back to
+    // level: 'CLEAN', sources: [] here, even though the mapped output is
+    // plainly derived from RAW_UNTRUSTED content.
+    const evil = wrapTainted('evil', 'RAW_UNTRUSTED', [tag('a')]);
+    const benign = wrapTainted('benign', 'CLEAN', []);
+    const result = mapTainted([evil, benign], (item) => item.value.toUpperCase());
+    expect(result.value).toEqual(['EVIL', 'BENIGN']);
+    expect(result.level).toBe('RAW_UNTRUSTED');
+    expect(result.sources.map((t) => t.id)).toEqual(['a']);
+  });
+
+  it("mapTainted unions an outer-wrapped array's taint with its individually-wrapped elements' taint", () => {
+    const outer = wrapTainted(
+      [wrapTainted('x', 'DERIVED_UNTRUSTED', [tag('outer')])],
+      'RAW_UNTRUSTED',
+      [tag('a')],
+    );
+    const result = mapTainted(outer, (item) => item.value);
+    expect(result.value).toEqual(['x']);
+    expect(result.level).toBe('RAW_UNTRUSTED');
+    expect(result.sources.map((t) => t.id)).toEqual(['a', 'outer']);
+  });
+
+  it('taintAwareJSONStringify preserves a Date the same way plain JSON.stringify does, instead of corrupting it to {}', () => {
+    const when = new Date('2020-01-01T00:00:00.000Z');
+    const result = taintAwareJSONStringify({ when });
+    expect(result.value).toBe(JSON.stringify({ when }));
+    expect(JSON.parse(result.value)).toEqual({ when: '2020-01-01T00:00:00.000Z' });
+  });
+
+  it('taintAwareJSONStringify still unions taint for a tainted leaf alongside a Date sibling', () => {
+    const tainted = wrapTainted('secret', 'RAW_UNTRUSTED', [tag('a')]);
+    const when = new Date('2020-01-01T00:00:00.000Z');
+    const result = taintAwareJSONStringify({ when, secret: tainted });
+    expect(JSON.parse(result.value)).toEqual({
+      when: '2020-01-01T00:00:00.000Z',
+      secret: 'secret',
+    });
+    expect(result.level).toBe('RAW_UNTRUSTED');
+  });
+
+  it('taintAwareJSONStringify throws rather than silently dropping taint hidden inside a Map or Set', () => {
+    const tainted = wrapTainted('secret', 'RAW_UNTRUSTED', [tag('a')]);
+    expect(() => taintAwareJSONStringify({ m: new Map([['k', tainted]]) })).toThrow(TypeError);
+    expect(() => taintAwareJSONStringify({ s: new Set([tainted]) })).toThrow(TypeError);
+  });
 });

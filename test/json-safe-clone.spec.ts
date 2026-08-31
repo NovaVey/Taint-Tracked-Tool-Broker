@@ -55,6 +55,36 @@ describe('jsonSafeClone', () => {
     expect(() => jsonSafeClone([1, 2, () => {}])).toThrow(TypeError);
   });
 
+  it('throws a TypeError (not an uncaught RangeError) on a self-referential plain object, rather than recursing forever', () => {
+    const obj: Record<string, unknown> = { a: 1 };
+    obj.self = obj;
+    expect(() => jsonSafeClone(obj)).toThrow(TypeError);
+    expect(() => jsonSafeClone(obj)).not.toThrow(RangeError);
+  });
+
+  it('throws a TypeError (not an uncaught RangeError) on a self-referential array, rather than recursing forever', () => {
+    const arr: unknown[] = [1, 2];
+    arr.push(arr);
+    expect(() => jsonSafeClone(arr)).toThrow(TypeError);
+    expect(() => jsonSafeClone(arr)).not.toThrow(RangeError);
+  });
+
+  it('throws a TypeError on a cycle reached indirectly through nested objects/arrays, not just a direct self-reference', () => {
+    const inner: Record<string, unknown> = {};
+    const outer = { a: [1, { b: inner }] };
+    inner.backToOuter = outer;
+    expect(() => jsonSafeClone(outer)).toThrow(TypeError);
+  });
+
+  it('does NOT treat the same object reachable via two independent (non-circular) paths as a cycle', () => {
+    const shared = { x: 1 };
+    const value = { a: shared, b: shared };
+    const cloned = jsonSafeClone(value) as { a: { x: number }; b: { x: number } };
+    expect(cloned).toEqual({ a: { x: 1 }, b: { x: 1 } });
+    // Not reference-preserving (jsonSafeClone always makes independent copies) — just not a cycle error either.
+    expect(cloned.a).not.toBe(cloned.b);
+  });
+
   it('accepts an object created with Object.create(null) (no prototype) as a plain object', () => {
     const bare = Object.create(null) as Record<string, unknown>;
     bare.x = 1;

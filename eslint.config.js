@@ -15,11 +15,14 @@ export default tseslint.config(
         // rules for anything outside that project (this file itself,
         // vitest.config.ts) rather than erroring.
         projectService: {
-          // vitest.config.ts and this file itself aren't in tsconfig.json's
-          // include (that's the library's real TS surface, not build
-          // tooling) — lint them without full project type info instead of
-          // erroring.
-          allowDefaultProject: ['eslint.config.js', 'vitest.config.ts'],
+          // vitest.config.ts, this file itself, and scripts/*.mjs aren't in
+          // tsconfig.json's include (that's the library's real TS surface,
+          // not build tooling) — lint them without full project type info
+          // instead of erroring. scripts/smoke-test-dist.mjs deliberately
+          // runs plain JS directly against dist/ output with Node's own ESM
+          // loader (see its own header comment for why it must NOT go
+          // through the same tsc/esbuild project the rest of the repo does).
+          allowDefaultProject: ['eslint.config.js', 'vitest.config.ts', 'scripts/*.mjs'],
         },
         tsconfigRootDir: import.meta.dirname,
       },
@@ -43,6 +46,21 @@ export default tseslint.config(
       // await — that's conformance to the interface, not a mistake this
       // rule should flag.
       '@typescript-eslint/require-await': 'off',
+    },
+  },
+  {
+    files: ['scripts/**/*.mjs'],
+    rules: {
+      // scripts/smoke-test-dist.mjs deliberately dynamic-imports the
+      // COMPILED dist/ output (see its own header) specifically to bypass
+      // the project's own TS type information — that import is `any` by
+      // design, not a real unsafe-use finding these type-aware rules exist
+      // to catch elsewhere. `allowDefaultProject` above still gives it
+      // baseline (non-type-aware) linting.
+      '@typescript-eslint/no-unsafe-argument': 'off',
+      '@typescript-eslint/no-unsafe-assignment': 'off',
+      '@typescript-eslint/no-unsafe-call': 'off',
+      '@typescript-eslint/no-unsafe-member-access': 'off',
     },
   },
   eslintConfigPrettier,

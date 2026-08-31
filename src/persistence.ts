@@ -33,10 +33,28 @@
  * `declarePlan()` can't re-establish one afterward if the restored
  * watermark is already non-CLEAN (it requires CLEAN). See DESIGN.md §11's
  * own note on this for the concrete consequence.
+ *
+ * One more piece of private in-memory state falls into the same
+ * "not part of SerializedBrokerState" category as the declared plan above:
+ * `resetScope: 'turn-decay'` mode's internal `turnsSinceExposure` counter
+ * (broker.ts) — how many turns have elapsed since the watermark was last
+ * raised, counted toward `turnDecayWindow` before the watermark auto-clears.
+ * It is not exported, so a broker restored via `restoreBrokerState()`
+ * always starts that counter at 0, exactly as if the watermark had just
+ * been raised on THIS broker, even if the original was most of the way
+ * through its decay window. Unlike the plan-freeze gap, this is NOT a
+ * security regression: restarting the counter at 0 can only make the
+ * restored broker wait a full fresh `turnDecayWindow` before the watermark
+ * clears — strictly more conservative than the original, never less, so it
+ * cannot reopen a gate early. It is purely a usability surprise for an
+ * integrator combining `resetScope: 'turn-decay'` with persistence — the
+ * decay clock silently restarts across a restore, with no warning.
  */
 
 import type { TaintRecord, TaintRegistry, TaintWatermark, ToolCallBroker } from './types.js';
+import { LEVEL_ORDER } from './types.js';
 import { InMemoryTaintRegistry } from './taint/registry.js';
+import { TaintBrokerError } from './errors.js';
 
 /** JSON-safe encoding of a TaintRecord's fingerprint — see the file header for why bigint/Uint32Array need explicit conversion. */
 export interface SerializedTaintRecord extends Omit<TaintRecord, 'fingerprint'> {
@@ -54,6 +72,96 @@ export interface SerializedTaintRecord extends Omit<TaintRecord, 'fingerprint'> 
 export interface SerializedBrokerState {
   watermark: TaintWatermark;
   registry: SerializedTaintRecord[];
+}
+
+/**
+ * Thrown by `restoreBrokerState()` when `state` does not actually have the
+ * shape of a `SerializedBrokerState`.
+ *
+ * `state` typically arrives via `JSON.parse()` (see this file's header for
+ * the sanctioned `const state: SerializedBrokerState = JSON.parse(...)`
+ * usage) — and `JSON.parse()`'s return type is `any`, so TypeScript trusts
+ * whatever shape comes back with zero runtime check. Without this
+ * validation, a hand-edited, corrupted, or version-skewed `session.json`
+ * (e.g. a `watermark.level` string from a future/renamed `TaintLevel`, or
+ * plain file corruption) would restore "successfully" and produce a broker
+ * that looks fine until some LATER, entirely unrelated gated call reads
+ * that bogus watermark and crashes with a raw, uncorrelated `TypeError`
+ * deep inside `policy/default-policy.ts`'s `MATRIX[scopeLevel][sinkClass]`
+ * lookup (`MATRIX[undefined-key]` is `undefined`). That is exactly the
+ * silent-now/opaque-crash-later failure mode this codebase otherwise
+ * refuses to allow anywhere else — compare `createBroker()`'s own
+ * `turnDecayWindow` `RangeError` (broker.ts), or `QuarantineInputUnknownError`.
+ * Validating here, at restore time, turns that into an immediate,
+ * descriptive, catchable error that points straight at the corrupt input
+ * instead of at whatever tool call happens to run next.
+ */
+export class InvalidBrokerStateError extends TaintBrokerError {
+  constructor(reason: string) {
+    super(
+      `restoreBrokerState() was given a value that is not a valid SerializedBrokerState: ${reason}. This usually ` +
+        "means a hand-edited, corrupted, or version-skewed session.json — see this file's header for the sanctioned " +
+        'JSON.parse() usage. Restoring it anyway would silently produce a broker whose watermark crashes some later, ' +
+        'unrelated gated call with an opaque TypeError instead of failing here, at the point of restore.',
+    );
+    this.name = 'InvalidBrokerStateError';
+  }
+}
+
+const VALID_TAINT_LEVELS = new Set<string>(Object.keys(LEVEL_ORDER));
+
+function isTaintLevel(value: unknown): value is TaintWatermark['level'] {
+  return typeof value === 'string' && VALID_TAINT_LEVELS.has(value);
+}
+
+/**
+ * Cheap, structural runtime check that `state` actually has the shape
+ * `SerializedBrokerState` claims at compile time — see
+ * `InvalidBrokerStateError` for why this exists. This is deliberately NOT a
+ * full schema validator (it does not, for instance, walk every registry
+ * record's fingerprint fields): it checks the top-level shape and, in
+ * particular, that `watermark.level` is one of the three real `TaintLevel`
+ * strings, since that is the field whose corruption produces the delayed,
+ * opaque `TypeError` described above. Throws `InvalidBrokerStateError` on
+ * the first problem found; returns normally (no return value) when `state`
+ * is safe to hand to `restoreRegistry()` / `createBroker({ initialWatermark })`.
+ */
+function validateSerializedBrokerState(state: SerializedBrokerState): void {
+  if (state === null || typeof state !== 'object') {
+    throw new InvalidBrokerStateError(
+      `expected an object, got ${state === null ? 'null' : typeof state}`,
+    );
+  }
+  const watermark: unknown = (state as { watermark?: unknown }).watermark;
+  if (watermark === null || typeof watermark !== 'object') {
+    throw new InvalidBrokerStateError(
+      `"watermark" must be an object, got ${watermark === null ? 'null' : typeof watermark}`,
+    );
+  }
+  const { level, privateDataSeen, sources } = watermark as Record<string, unknown>;
+  if (!isTaintLevel(level)) {
+    const validLevels = Object.keys(LEVEL_ORDER)
+      .map((l) => `"${l}"`)
+      .join(', ');
+    throw new InvalidBrokerStateError(
+      `"watermark.level" must be one of ${validLevels}, got ${JSON.stringify(level)}`,
+    );
+  }
+  if (typeof privateDataSeen !== 'boolean') {
+    throw new InvalidBrokerStateError(
+      `"watermark.privateDataSeen" must be a boolean, got ${typeof privateDataSeen}`,
+    );
+  }
+  if (!Array.isArray(sources)) {
+    throw new InvalidBrokerStateError(
+      `"watermark.sources" must be an array, got ${typeof sources}`,
+    );
+  }
+  if (!Array.isArray((state as { registry?: unknown }).registry)) {
+    throw new InvalidBrokerStateError(
+      `"registry" must be an array, got ${typeof (state as { registry?: unknown }).registry}`,
+    );
+  }
 }
 
 /** Exports every record in `registry` to a JSON-safe array. Counterpart: restoreRegistry(). */
@@ -126,11 +234,23 @@ export function serializeBrokerState(
  * `makeRegistry` lets you restore into something other than a plain
  * `InMemoryTaintRegistry` — e.g. one configured with `maxEntries` (GAPS.md
  * #13) — and defaults to `() => new InMemoryTaintRegistry()`.
+ *
+ * `state` is validated at runtime before anything else happens — see
+ * `InvalidBrokerStateError`. `state` typically arrived via `JSON.parse()`,
+ * which TypeScript trusts at the declared `SerializedBrokerState` type with
+ * no actual check; a malformed `watermark.level` (a corrupted or
+ * version-skewed `session.json`) would otherwise pass through silently and
+ * only surface as an opaque `TypeError` from deep inside
+ * `policy/default-policy.ts` on some later, unrelated gated call. Throwing
+ * here instead means restoring a bad state fails loud, immediately, with a
+ * descriptive and catchable error — not a delayed crash on an unrelated
+ * later call.
  */
 export function restoreBrokerState(
   state: SerializedBrokerState,
   makeRegistry: () => TaintRegistry = () => new InMemoryTaintRegistry(),
 ): { initialWatermark: TaintWatermark; registry: TaintRegistry } {
+  validateSerializedBrokerState(state);
   const registry = makeRegistry();
   restoreRegistry(state.registry, registry);
   return { initialWatermark: state.watermark, registry };

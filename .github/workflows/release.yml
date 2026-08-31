@@ -48,15 +48,54 @@ jobs:
       # on this commit is still what's about to be published.
       - run: npm run typecheck
       - run: npm run build
+      # Same rationale as ci.yml's identical step: typecheck/test/corpus
+      # above and below all exercise src/ TypeScript, never the actual
+      # dist/ JavaScript this workflow is about to publish. This loads
+      # dist/index.js with Node's own ESM loader and runs one real gated
+      # call through it, so a regression confined to tsc's emit can't
+      # reach npm invisibly. See scripts/smoke-test-dist.mjs's header.
+      - run: node scripts/smoke-test-dist.mjs
       - run: npm test
       - run: npm run corpus
 
-      - run: npm publish --provenance --access public
+      # Recovery affordance for the failure mode where `npm publish` below
+      # succeeds but the "Create GitHub Release" step after it fails
+      # (transient GitHub API error, rate limiting, an org policy on
+      # Actions-created releases, etc.). GitHub Actions' only built-in
+      # recovery — "re-run failed jobs" — reruns this whole job from the
+      # top, which would otherwise hit `npm publish` again for a version
+      # that's already live and fail every time with a 403, never reaching
+      # the release step again. Checking the registry first and skipping a
+      # redundant publish makes a re-run land on "Create GitHub Release"
+      # instead, restoring an idempotent path back to a consistent state.
+      # `npm view pkg@version version` exits 0 with output only when that
+      # exact version is already published, and non-zero (E404) otherwise —
+      # no auth needed to query a public package's own metadata.
+      - name: Check whether this version is already on npm
+        id: npm-check
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if npm view "${PKG_NAME}@${PKG_VERSION}" version >/dev/null 2>&1; then
+            echo "Already published — skipping npm publish."
+            echo "already-published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already-published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: npm publish
+        if: steps.npm-check.outputs.already-published != 'true'
+        run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      # Only runs after a successful publish above — a GitHub Release for a
-      # version that didn't actually make it to npm would be misleading.
+      # Runs after a successful publish above (or, on a re-run following the
+      # recovery path above, after publish was skipped because this version
+      # is already on npm) — either way the version is confirmed live on
+      # npm by this point, so a GitHub Release for it is never misleading.
+      # A skipped step does not count as a failure for `success()`, which is
+      # this step's implicit default condition, so no explicit `if` is
+      # needed here to reach it after the publish step above is skipped.
       # `gh` is preinstalled on GitHub-hosted runners, so this needs no
       # third-party Action (see CHANGELOG's earlier decision against adding
       # one just for a coverage badge — same reasoning applies here).

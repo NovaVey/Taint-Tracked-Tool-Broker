@@ -79,11 +79,52 @@ export function fnv1a32(str: string, seed = 0x811c9dc5): number {
  */
 export function wordShingles(text: string, width: number = SHINGLE_WIDTH): string[] {
   const words = normalize(text).split(' ').filter(Boolean);
-  if (words.length === 0) return [];
+  if (words.length === 0) return charShingles(text, width);
   const effectiveWidth = words.length >= width ? width : Math.max(1, words.length - 1);
   const shingles: string[] = [];
   for (let i = 0; i <= words.length - effectiveWidth; i++) {
     shingles.push(words.slice(i, i + effectiveWidth).join(' '));
+  }
+  return shingles;
+}
+
+/**
+ * Character-level (code-point) shingling fallback for text that normalize()
+ * reduces to nothing.
+ *
+ * normalize() (see its doc comment above) strips every character outside
+ * `\p{L}\p{N}\s` — so a text made *entirely* of punctuation/symbols/emoji
+ * (a decorative "=====" or "★•☆•★" separator banner, a message that's
+ * nothing but emoji reactions, ...) normalizes to the empty string even
+ * though it's meaningfully long, real content. Before this fallback existed,
+ * `wordShingles()` returned `[]` for every such text regardless of what
+ * symbols it actually contained, which made `computeSimhash()` return the
+ * fixed sentinel `0n` and `shingleHashesOf()` return an empty set for *any*
+ * symbol-only input — so two completely unrelated symbol-only texts (two
+ * different decorative banners, say) both fingerprinted identically and
+ * `fuzzyMatchesForFingerprint()` (registry.ts) reported them as a
+ * `matchType: 'simhash'`, `score: 1` *perfect* match despite sharing no real
+ * content whatsoever.
+ *
+ * Falling back to shingles over the RAW, un-normalized text's own code
+ * points (not UTF-16 code units — `Array.from` splits on code points, so a
+ * surrogate-pair emoji is one shingle-able unit, not two half-characters)
+ * restores genuine content-sensitivity for exactly this case, using the
+ * same width-narrowing rule the word-based path above uses for short input
+ * (`words.length - 1`, floored at 1) so a short symbol run still yields
+ * >=2 overlapping windows instead of collapsing to one whole-text blob.
+ *
+ * This path is reached ONLY when `normalize(text)` yields zero words — an
+ * ordinary text with any letters/numbers in it takes the word-shingling
+ * path above, completely unaffected by this fallback's existence.
+ */
+function charShingles(text: string, width: number): string[] {
+  const chars = Array.from(text);
+  if (chars.length === 0) return [];
+  const effectiveWidth = chars.length >= width ? width : Math.max(1, chars.length - 1);
+  const shingles: string[] = [];
+  for (let i = 0; i <= chars.length - effectiveWidth; i++) {
+    shingles.push(chars.slice(i, i + effectiveWidth).join(''));
   }
   return shingles;
 }
@@ -175,8 +216,70 @@ export function hammingDistance(a: bigint, b: bigint): number {
   return count;
 }
 
+/**
+ * A "lone" (unpaired) UTF-16 surrogate: a high surrogate (D800-DBFF) not
+ * immediately followed by a low surrogate (DC00-DFFF), or a low surrogate
+ * not immediately preceded by a high surrogate. Well-formed JS strings never
+ * contain one — they only show up from malformed input: truncating a tool
+ * result mid-character, a buggy upstream encoder, or `JSON.parse` on text
+ * that embeds a raw `\uD800`-style escape with no matching partner.
+ *
+ * These two regexes intentionally do NOT use the `u` (unicode) flag: with
+ * `u`, `.` and character classes operate on whole code points and an
+ * unpaired surrogate becomes its own code point, which is a different (and
+ * here unwanted) matching model — we specifically want raw UTF-16 code-unit
+ * matching so "is the following/preceding code unit a surrogate of the
+ * other half" is exactly what the lookaround checks.
+ */
+const LONE_HIGH_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g;
+const LONE_LOW_SURROGATE = /(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/**
+ * Rewrites every lone/unpaired surrogate code unit in `text` into a distinct,
+ * deterministic, all-ASCII marker that encodes exactly which surrogate it
+ * was — used ONLY as exactHash()'s pre-processing step, to close a real hash
+ * collision without changing the hash of any well-formed string.
+ *
+ * Why this is needed: `Buffer`/`TextEncoder`'s UTF-8 encoder (which
+ * `createHash(...).update(text, 'utf8')` goes through below) is lossy for
+ * lone surrogates — by the WHATWG encoding spec it silently substitutes
+ * U+FFFD (the replacement character) for each one. That means two distinct
+ * JS strings differing only in *which* lone surrogate they contain —
+ * `'\uD800X'` vs `'\uD801X'`, for example — encode to byte-identical UTF-8
+ * and therefore hash identically, even though they are different strings.
+ * Since `TaintRecord.id` *is* `exactHash()`'s output (see registry.ts), that
+ * collision is a real registry-key collision between genuinely different
+ * content, not merely a cosmetic hashing quirk.
+ *
+ * Why not just switch encodings (e.g. to UTF-16LE) instead: that would
+ * change the hash — and therefore `TaintRecord.id` — of literally *every*
+ * well-formed string this library has ever hashed, a far larger and
+ * unnecessary breaking change for a bug that only bites the narrow lone-
+ * surrogate case. Escaping only the specific lone code units, and leaving
+ * every other code unit (including both halves of every well-formed
+ * surrogate pair) completely untouched, keeps this a true no-op for
+ * well-formed input: this function returns its argument unchanged, byte for
+ * byte, for any string with no lone surrogates in it — see the "unchanged
+ * for well-formed strings" case in fingerprint.spec.ts, which pins this for
+ * ASCII, emoji (surrogate-pair), and CJK (non-surrogate, non-BMP-adjacent)
+ * text alike.
+ *
+ * The marker text itself doesn't need to be unforgeable against a
+ * deliberately-crafted well-formed string that happens to contain the same
+ * literal substring — this closes a narrow, low-severity correctness gap
+ * (two *accidentally* colliding malformed inputs), not an adversarial-
+ * collision-resistance guarantee, and the exact hash was never meant to
+ * carry that guarantee for arbitrary crafted input in the first place.
+ */
+function escapeLoneSurrogatesForHashing(text: string): string {
+  if (!/[\uD800-\uDFFF]/.test(text)) return text; // fast path: no surrogates at all
+  const mark = (m: string): string =>
+    `\uFFFD<lone-surrogate:${m.charCodeAt(0).toString(16).padStart(4, '0')}>`;
+  return text.replace(LONE_HIGH_SURROGATE, mark).replace(LONE_LOW_SURROGATE, mark);
+}
+
 export function exactHash(text: string): string {
-  return createHash('sha256').update(text, 'utf8').digest('hex');
+  return createHash('sha256').update(escapeLoneSurrogatesForHashing(text), 'utf8').digest('hex');
 }
 
 export function buildFingerprint(text: string): Fingerprint {

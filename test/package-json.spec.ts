@@ -11,7 +11,10 @@ import { describe, expect, it } from 'vitest';
 // missing from this list entirely, so an installed (not cloned) copy of
 // this package silently could not resolve that link.
 const packageJsonPath = fileURLToPath(new URL('../package.json', import.meta.url));
-const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { files: string[] };
+const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as {
+  version: string;
+  files: string[];
+};
 
 describe('package.json files allowlist', () => {
   it('ships docs/ (classifying-tools.md — linked from README.md and ToolExecutor.trusted’s own doc comment)', () => {
@@ -20,5 +23,28 @@ describe('package.json files allowlist', () => {
 
   it('ships examples/ (the worked integration walkthroughs linked from README.md)', () => {
     expect(pkg.files).toContain('examples');
+  });
+
+  // README.md links to all three of these by relative path (./SECURITY.md,
+  // ./CONTRIBUTING.md, ./CODE_OF_CONDUCT.md) — without them in `files`,
+  // those links dead-end for anyone reading an installed (not cloned) copy
+  // of the package offline, even though README.md itself IS shipped.
+  it.each(['CONTRIBUTING.md', 'SECURITY.md', 'CODE_OF_CONDUCT.md'])(
+    'ships %s (linked from the shipped README.md)',
+    (file) => {
+      expect(pkg.files).toContain(file);
+    },
+  );
+});
+
+describe('package-lock.json stays in sync with package.json', () => {
+  it("the lockfile's own recorded version matches package.json's — a stale lockfile version can mislead supply-chain tooling that inspects it", () => {
+    const lockPath = fileURLToPath(new URL('../package-lock.json', import.meta.url));
+    const lock = JSON.parse(readFileSync(lockPath, 'utf8')) as {
+      version: string;
+      packages: Record<string, { version?: string }>;
+    };
+    expect(lock.version).toBe(pkg.version);
+    expect(lock.packages['']?.version).toBe(pkg.version);
   });
 });

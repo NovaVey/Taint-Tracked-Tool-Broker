@@ -99,12 +99,19 @@ export interface TaintMatch {
 export interface FuzzyLookupOpts {
   simhashMaxDistance?: number;
   /**
-   * Implemented as an overlap coefficient (|A∩B| / min(|A|,|B|)), not a plain
-   * Jaccard index — that's what makes a short malicious excerpt embedded in a
-   * much larger blob (or vice versa) still score highly. See DESIGN.md §4.2
-   * and taint/fingerprint.ts.
+   * Named `overlapMin`, not `jaccardMin`, because it is genuinely an overlap
+   * coefficient (|A∩B| / min(|A|,|B|)), not a plain Jaccard index
+   * (|A∩B| / |A∪B|) — that distinction is not cosmetic. Jaccard and the
+   * overlap coefficient diverge sharply exactly when one set is much larger
+   * than the other, which is precisely the "short malicious excerpt embedded
+   * in a much larger blob (or vice versa)" scenario this whole fuzzy-match
+   * layer exists to catch: a plain Jaccard index would score that case low
+   * (dominated by the larger set's size) right when it most needs to score
+   * high. A caller tuning this threshold from the field's name alone, rather
+   * than this comment, would reason about the wrong statistic. See
+   * DESIGN.md §4.2 and taint/fingerprint.ts.
    */
-  jaccardMin?: number;
+  overlapMin?: number;
   /**
    * Caps how many TaintMatch entries lookupFuzzy() returns for a single
    * query, defending against a pathological registry (many attacker-chosen

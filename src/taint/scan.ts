@@ -110,6 +110,49 @@ export function scanArgsForTaint(args: unknown, registry: TaintRegistry): ScanRe
       return;
     }
 
+    // Map/Set hold their entries as internal slots, not own-enumerable
+    // properties, so the generic `Object.entries(node)` fallback below
+    // returns literally nothing for either of them — a Map or Set reaching
+    // this scan was completely invisible to it, a total miss rather than a
+    // partial one. This is not a theoretical gap: the broker's default
+    // cloneArgs is `structuredClone` specifically *because* it preserves
+    // Map/Set/Date/RegExp/typed arrays (see broker.ts), so a tool call whose
+    // args legitimately include a Map or Set survives intact into the exact
+    // snapshot this "mandatory" scan walks — and would sail through
+    // unscanned without this branch. Handled explicitly, before the generic
+    // fallback, rather than by unwrapping into a plain object first, so the
+    // existing `visited` cycle-guard and MAX_ARGS_TREE_DEPTH bound above
+    // continue to apply uniformly (each recursive `visit()` call re-checks
+    // both).
+    if (node instanceof Map) {
+      let i = 0;
+      for (const [key, value] of node.entries()) {
+        // A Map key can itself carry attacker text (mirrors the plain-object
+        // KEY-scanning rationale just below) — e.g. a tool that echoes
+        // untrusted text back as a Map key rather than a value. Keys aren't
+        // necessarily strings, so route them through visit() rather than
+        // checkStringLeaf() directly; a string key still ends up scanned via
+        // visit()'s own `typeof node === 'string'` branch. There's no
+        // "property name" to build a path segment from (a Map key isn't a
+        // JS identifier), so both the key and its value are addressed
+        // positionally.
+        const entryPath = path ? `${path}<Map>[${i}]` : `<Map>[${i}]`;
+        visit(key, `${entryPath}.key`, depth + 1);
+        visit(value, `${entryPath}.value`, depth + 1);
+        i++;
+      }
+      return;
+    }
+
+    if (node instanceof Set) {
+      let i = 0;
+      for (const value of node.values()) {
+        visit(value, path ? `${path}<Set>[${i}]` : `<Set>[${i}]`, depth + 1);
+        i++;
+      }
+      return;
+    }
+
     if (typeof node === 'object') {
       for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
         // Untrusted text can be smuggled as an object KEY, not just a value

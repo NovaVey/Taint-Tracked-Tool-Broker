@@ -119,6 +119,39 @@ function addCandidatesUpTo(
   return into.size >= cap;
 }
 
+/**
+ * Validates a caller-supplied `FuzzyLookupOpts.maxMatches` before it's used
+ * to truncate the sorted match array via `matches.length = maxMatches`
+ * below. `maxMatches` is a per-CALL option, not a constructor option (unlike
+ * `maxEntries`/`maxFuzzyCandidatesPerLookup`, which the constructor already
+ * validates the same way), so it needs its own check at the one place it's
+ * actually consumed rather than once up front.
+ *
+ * Two failure modes matter here, and both are silent/ugly without this
+ * check: assigning a negative or non-integer number directly to
+ * `Array#length` throws a raw, undocumented `RangeError: Invalid array
+ * length` — a type-legal call like `registry.lookupFuzzy(text, {
+ * maxMatches: -1 })` would otherwise crash the call with an error that gives
+ * the caller no hint which option was at fault. And `maxMatches: 0`, while
+ * it doesn't crash (`Array#length = 0` is perfectly legal), would silently
+ * truncate the sorted match array to nothing — discarding the single
+ * highest-severity match along with everything else, undermining exactly
+ * the "the highest-severity match always survives the cap" guarantee
+ * `FuzzyLookupOpts.maxMatches`'s own doc comment promises (matches are
+ * sorted level-first specifically so a cap can only ever drop lower-value
+ * explainability, never a floor-raising match — but that promise is only as
+ * good as the cap being at least 1).
+ */
+function validatedMaxMatches(maxMatches: number | undefined): number {
+  if (maxMatches === undefined) return DEFAULT_MAX_FUZZY_MATCHES;
+  if (!Number.isInteger(maxMatches) || maxMatches < 1) {
+    throw new RangeError(
+      `FuzzyLookupOpts.maxMatches must be a positive integer, got ${maxMatches}.`,
+    );
+  }
+  return maxMatches;
+}
+
 export interface InMemoryTaintRegistryOpts {
   /**
    * Evict the oldest-registered record once a new registration would push
@@ -149,7 +182,7 @@ export interface InMemoryTaintRegistryOpts {
    * not considered for that lookup — a real match sitting outside the
    * bound can be missed. This is the same already-documented "Layer 2 is
    * approximate, never load-bearing for safety" territory as GAPS.md
-   * #8/#14 (a lower `simhashMaxDistance`/higher `jaccardMin` has the same
+   * #8/#14 (a lower `simhashMaxDistance`/higher `overlapMin` has the same
    * tradeoff), not a new soundness concern: a missed fuzzy match can only
    * cost attribution precision or a floor-raising tightening opportunity,
    * never open a hole in the Layer 0 watermark gate. Defaults to 2000 —
@@ -341,8 +374,8 @@ export class InMemoryTaintRegistry implements TaintRegistry {
 
   private fuzzyMatchesForFingerprint(fp: Fingerprint, opts: FuzzyLookupOpts): TaintMatch[] {
     const simhashMaxDistance = opts.simhashMaxDistance ?? DEFAULT_SIMHASH_MAX_DISTANCE;
-    const overlapMin = opts.jaccardMin ?? DEFAULT_OVERLAP_MIN;
-    const maxMatches = opts.maxMatches ?? DEFAULT_MAX_FUZZY_MATCHES;
+    const overlapMin = opts.overlapMin ?? DEFAULT_OVERLAP_MIN;
+    const maxMatches = validatedMaxMatches(opts.maxMatches);
 
     // Candidate generation: union of every record sharing an LSH band with
     // this simhash, plus every record sharing at least one shingle. Exact

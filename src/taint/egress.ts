@@ -15,6 +15,24 @@
  * assembled across multiple argument fields, or any channel that never
  * passes through a broker-mediated tool call at all. See GAPS.md #18 for
  * exactly what this does and doesn't catch.
+ *
+ * OVER-DETECTION, not just under-detection: by default this walks EVERY
+ * string leaf in the args tree with no notion of which argument key is the
+ * call's actual network destination. A field that merely CONTAINS a URL or
+ * email address as its entire value — a Slack `text` body that happens to be
+ * exactly `"https://internal-wiki.example/kb/42"`, a `notes` field that is
+ * exactly someone's email address — is indistinguishable, to this scan, from
+ * the argument that is actually dialed. Because DESIGN.md §7.4 makes an
+ * outbound-host mismatch an unconditional hard BLOCK (never
+ * REQUIRE_APPROVAL), a false positive here is a harder production failure
+ * than this library's usual approval-gated false positives: a completely
+ * benign call whose destination is really just the tool's fixed API can be
+ * rejected outright because an unrelated field's value happened to look like
+ * a URL. The optional `destinationKeys` parameter below exists to let an
+ * integrator who knows which argument key(s) actually carry a tool's
+ * destination narrow the scan and avoid this; without it, the scan stays
+ * whole-tree for the reason explained on `findOutboundHosts` itself. See
+ * GAPS.md #18 for the fuller discussion of this tradeoff.
  */
 
 import { ArgsTooDeepError } from '../errors.js';
@@ -52,6 +70,35 @@ function asEmailDomain(value: string): string | undefined {
 }
 
 /**
+ * Optional narrowing for `findOutboundHosts`. Naming `destinationKeys` lets
+ * an integrator who knows which argument key(s) actually carry a call's
+ * network destination (e.g. a webhook tool's `url` field, as opposed to its
+ * unrelated `text`/`channel`/`notes` fields) scope the scan to just those
+ * keys' subtrees instead of the whole-tree default — see the false-positive
+ * discussion in this module's header comment. Purely additive: omitting this
+ * option (or the whole second argument) reproduces the original, unscoped
+ * whole-tree behavior exactly, so every existing call site — including
+ * broker.ts's own `findOutboundHosts(argsSnapshot)` — is unaffected unless
+ * an integrator opts in.
+ */
+export interface FindOutboundHostsOptions {
+  /**
+   * Object keys (matched exactly, case-sensitively — tool-call argument
+   * schemas are integrator-defined, not a case-insensitive namespace like
+   * DNS names are) that name a call's actual destination argument(s). When
+   * supplied, a string value is only inspected for a URL/email if it is
+   * reached by descending through one of these keys at some point on the
+   * path from the args root — once inside such a key's subtree, everything
+   * under it is scanned as normal (an array of destination URLs, or a
+   * `{ url, headers }`-shaped destination object, are both still fully
+   * covered). A key that never appears in `args` is simply inert, not an
+   * error — tool schemas vary per call and this option is meant to be safe
+   * to over-specify.
+   */
+  readonly destinationKeys?: readonly string[];
+}
+
+/**
  * Recursively walks `args` (the same shape scanArgsForTaint's own walk in
  * scan.ts covers — arrays, plain objects, cyclic-safe) collecting a
  * destination hostname for every genuine http(s) URL or email address found
@@ -60,15 +107,28 @@ function asEmailDomain(value: string): string | undefined {
  * arriving as an object key rather than a value isn't a realistic shape for
  * how tool-call arguments carry one, so skipping it keeps this simpler
  * without giving up real coverage.
+ *
+ * By default every string leaf in the tree is a candidate (see this
+ * module's header comment for why over-detection is an accepted, documented
+ * tradeoff rather than a bug). Passing `options.destinationKeys` narrows
+ * that to only the named key(s)' subtrees, trading recall (a destination
+ * arriving under an unnamed key is missed) for precision (a benign field
+ * that happens to look like a URL can no longer trigger a false BLOCK) —
+ * appropriate only when the integrator actually knows which key(s) a given
+ * tool uses to carry its destination, which is why it's opt-in rather than
+ * the default.
  */
-export function findOutboundHosts(args: unknown): string[] {
+export function findOutboundHosts(args: unknown, options?: FindOutboundHostsOptions): string[] {
   const hosts: string[] = [];
   const visited = new WeakSet<object>();
+  const destinationKeys = options?.destinationKeys;
+  const destinationKeySet = destinationKeys ? new Set(destinationKeys) : undefined;
 
-  function visit(node: unknown, depth: number): void {
+  function visit(node: unknown, depth: number, scanning: boolean): void {
     if (depth > MAX_ARGS_TREE_DEPTH) throw new ArgsTooDeepError(MAX_ARGS_TREE_DEPTH);
     if (node === null || node === undefined) return;
     if (typeof node === 'string') {
+      if (!scanning) return;
       const url = asHttpUrl(node);
       if (url) {
         hosts.push(url.hostname);
@@ -82,14 +142,60 @@ export function findOutboundHosts(args: unknown): string[] {
     if (visited.has(node)) return;
     visited.add(node);
     if (Array.isArray(node)) {
-      for (const child of node) visit(child, depth + 1);
+      // Scanning state is inherited, never re-scoped, by array elements —
+      // there's no key here to test against destinationKeys, so a member of
+      // an already-in-scope array stays in scope and a member of an
+      // out-of-scope array stays out of scope.
+      for (const child of node) visit(child, depth + 1, scanning);
       return;
     }
-    for (const value of Object.values(node)) visit(value, depth + 1);
+    for (const [key, value] of Object.entries(node)) {
+      // Once inside a matched destination key's subtree (scanning === true),
+      // stay scanning regardless of nested key names — a destination value
+      // that is itself structured (e.g. `{ url: { host, path } }`) shouldn't
+      // need every nested key re-listed in destinationKeys too. Outside a
+      // matched subtree (scanning === false), only a key literally present
+      // in destinationKeySet switches scanning on for its own subtree.
+      const childScanning = scanning || !destinationKeySet || destinationKeySet.has(key);
+      visit(value, depth + 1, childScanning);
+    }
   }
 
-  visit(args, 0);
+  // No destinationKeys supplied: preserve the original, unscoped behavior
+  // exactly by starting fully "in scope" at the root, so every string leaf
+  // anywhere in the tree is a candidate, same as before this option existed.
+  visit(args, 0, destinationKeySet === undefined);
   return hosts;
+}
+
+/**
+ * Per-array-reference cache of an allowlist's lowercased entries, keyed by
+ * the array object identity itself (not its contents). `BrokerOptions.
+ * allowedOutboundHosts` is configured once and held for the lifetime of a
+ * Broker instance (broker.ts stores it as `private readonly
+ * allowedOutboundHosts`), so in the overwhelmingly common case the SAME
+ * array reference is passed to `isAllowedOutboundHost` on every EXFIL-class
+ * call for that Broker's entire lifetime — re-lowercasing and linearly
+ * rescanning the whole array on every single call was pure waste. A WeakMap
+ * is the right structure here specifically because it keys on identity: it
+ * lets a still-referenced allowlist array's cache entry live indefinitely
+ * without this module ever needing to know when a Broker (or its allowlist)
+ * is done being used, while still letting the entry be garbage-collected
+ * once nothing else holds that array anymore — no manual cache invalidation
+ * or size cap required. A caller who mutates an allowlist array in place
+ * after first use (rather than passing a new array reference) will see the
+ * stale cached membership; that's the same "reconfigure by passing a new
+ * value, don't mutate the old one in place" contract BrokerOptions already
+ * expects of its other configuration, not a new caveat introduced here.
+ */
+const allowlistCache = new WeakMap<readonly string[], ReadonlySet<string>>();
+
+function normalizedAllowlistSet(allowlist: readonly string[]): ReadonlySet<string> {
+  const cached = allowlistCache.get(allowlist);
+  if (cached) return cached;
+  const normalized = new Set(allowlist.map((h) => h.toLowerCase()));
+  allowlistCache.set(allowlist, normalized);
+  return normalized;
 }
 
 /**
@@ -100,6 +206,15 @@ export function findOutboundHosts(args: unknown): string[] {
  * predicate function instead of an array, and is responsible for that
  * predicate's own correctness (GAPS.md #18 — this library can't verify a
  * custom predicate matches only what the integrator intends).
+ *
+ * The array-allowlist path is backed by `normalizedAllowlistSet`'s
+ * per-array-reference cache (see its own doc comment above): the first
+ * lookup against a given allowlist array normalizes and indexes it once,
+ * and every subsequent lookup against that same array reference is an O(1)
+ * Set membership test rather than an O(n) re-lowercase-and-rescan of the
+ * whole array. A predicate allowlist is never cached — it's an arbitrary
+ * function the caller owns, and this library has no way to know whether two
+ * calls with "the same" function are safe to memoize against.
  */
 export function isAllowedOutboundHost(
   hostname: string,
@@ -107,5 +222,5 @@ export function isAllowedOutboundHost(
 ): boolean {
   const normalized = hostname.toLowerCase();
   if (typeof allowlist === 'function') return allowlist(normalized);
-  return allowlist.some((h) => h.toLowerCase() === normalized);
+  return normalizedAllowlistSet(allowlist).has(normalized);
 }

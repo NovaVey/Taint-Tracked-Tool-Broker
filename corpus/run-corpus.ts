@@ -14,10 +14,9 @@
  * against the same fixtures with no broker mediating it at all.
  */
 
-import { CORPUS } from './cases.js';
+import { CORPUS, TRUE_GAP_IDS } from './cases.js';
 import { runCorpusCase, runUnprotectedCase } from './schema.js';
 
-const TRUE_GAP_IDS = ['untracked-tool-description-injection', 'cross-turn-latent-influence'];
 /** Decisions that, in this harness (no human present — see schema.ts's approvalChannel), functionally stop the call. Real deployments' REQUIRE_APPROVAL depends on a human; corpus always denies, so within THIS report it counts as prevented. */
 const PREVENTING_DECISIONS = new Set(['BLOCK', 'REQUIRE_APPROVAL']);
 
@@ -67,10 +66,17 @@ async function main(): Promise<void> {
   console.log('-'.repeat(6 + 1 + idWidth + 1 + classWidth + 1 + 11 + 1 + 20));
   console.log(`${outcomes.length - failures}/${outcomes.length} passed`);
 
-  const knownGapCount = outcomes.filter(
-    (o) =>
-      o.case.attackClass.endsWith('-known-gap') || o.case.expected.notes?.includes('KNOWN GAP'),
-  ).length;
+  // Substring search over freeform prose notes is the ONLY signal here —
+  // deliberately not also checking attackClass for an "-known-gap" suffix:
+  // no attackClass ever assigned in cases.ts uses that suffix (a stale
+  // naming convention that survives only in a few old comments there), so
+  // that half of the check was always dead code that could never match.
+  // This substring search has no test coverage of its own — a future
+  // case's notes could be reworded without the literal substring "KNOWN
+  // GAP" and silently disappear from this count with no CI failure — unlike
+  // TRUE_GAP_IDS just below, which IS enforced (test/corpus.spec.ts's
+  // "covers every documented true known gap" test).
+  const knownGapCount = outcomes.filter((o) => o.case.expected.notes?.includes('KNOWN GAP')).length;
   const trueGaps = outcomes.filter((o) => TRUE_GAP_IDS.includes(o.case.id));
   console.log(
     `(${trueGaps.length} true known-gap case(s) asserted as documented misses; see GAPS.md. ${knownGapCount} case(s) reference a gap in their notes.)`,

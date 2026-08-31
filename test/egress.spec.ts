@@ -127,4 +127,117 @@ describe('isAllowedOutboundHost', () => {
   it('an empty allowlist array allows nothing', () => {
     expect(isAllowedOutboundHost('example.com', [])).toBe(false);
   });
+
+  // Regression coverage for the per-array-reference normalization cache
+  // (`normalizedAllowlistSet` in taint/egress.ts): repeated lookups against
+  // the SAME allowlist array reference must keep matching/rejecting exactly
+  // as an uncached linear scan would — a caching layer that got its
+  // membership logic wrong on the cached path, or leaked a stale cache
+  // across calls, would silently corrupt broker.ts's hard-BLOCK egress gate.
+  describe('repeated-lookup and cache-isolation regression coverage', () => {
+    it('a stable allowlist array reference matches/rejects identically across many repeated lookups', () => {
+      const allowlist = ['example.com', 'ok.example', 'Mixed-Case.example'];
+      for (let i = 0; i < 25; i++) {
+        expect(isAllowedOutboundHost('example.com', allowlist)).toBe(true);
+        expect(isAllowedOutboundHost('OK.EXAMPLE', allowlist)).toBe(true);
+        expect(isAllowedOutboundHost('mixed-case.example', allowlist)).toBe(true);
+        expect(isAllowedOutboundHost('attacker.example', allowlist)).toBe(false);
+      }
+    });
+
+    it('a different allowlist array reference gets its own independent result, not a stale hit/miss carried over from a prior array', () => {
+      const first = ['a.example'];
+      const second = ['b.example'];
+
+      // Prime a cache entry for `first`, then probe `second` for a host
+      // that is allowed under `second` but NOT under `first` — and vice
+      // versa — to catch a broken cache keying by array contents/hash
+      // instead of by reference identity (or one that simply returns the
+      // previous array's cached Set regardless of which array was passed).
+      expect(isAllowedOutboundHost('a.example', first)).toBe(true);
+      expect(isAllowedOutboundHost('b.example', second)).toBe(true);
+      expect(isAllowedOutboundHost('b.example', first)).toBe(false);
+      expect(isAllowedOutboundHost('a.example', second)).toBe(false);
+
+      // Re-check both again, after both caches are warm, to confirm neither
+      // entry was clobbered by populating the other.
+      expect(isAllowedOutboundHost('a.example', first)).toBe(true);
+      expect(isAllowedOutboundHost('b.example', second)).toBe(true);
+    });
+
+    it('two array instances with identical contents are cached independently — cache key is reference identity, not value equality', () => {
+      const allowlistA = ['shared.example'];
+      const allowlistB = ['shared.example'];
+      expect(isAllowedOutboundHost('shared.example', allowlistA)).toBe(true);
+      expect(isAllowedOutboundHost('shared.example', allowlistB)).toBe(true);
+      expect(isAllowedOutboundHost('other.example', allowlistA)).toBe(false);
+      expect(isAllowedOutboundHost('other.example', allowlistB)).toBe(false);
+    });
+
+    it('mutating an allowlist array in place after first use is not picked up by the cache (same "reconfigure via a new reference" contract as the rest of BrokerOptions)', () => {
+      const allowlist = ['first.example'];
+      expect(isAllowedOutboundHost('first.example', allowlist)).toBe(true);
+      expect(isAllowedOutboundHost('second.example', allowlist)).toBe(false);
+
+      allowlist.push('second.example');
+
+      // Documented, intentional: this reflects the doc comment on
+      // `allowlistCache` in taint/egress.ts, not a bug under test.
+      expect(isAllowedOutboundHost('second.example', allowlist)).toBe(false);
+    });
+  });
+});
+
+describe('findOutboundHosts destinationKeys scoping (additive, opt-in)', () => {
+  it('omitting destinationKeys reproduces the original whole-tree scan exactly', () => {
+    const args = { channel: '#eng', text: 'https://internal-wiki.example/kb/42' };
+    expect(findOutboundHosts(args)).toEqual(['internal-wiki.example']);
+  });
+
+  // This is the finding's own concrete repro: a benign field (e.g. a Slack
+  // `text` body) whose value happens to BE, in full, a bare URL is
+  // indistinguishable from a real destination under the default whole-tree
+  // scan, and would trip broker.ts's unconditional hard BLOCK even though
+  // the tool only ever actually contacts its fixed webhook/API endpoint.
+  it('without destinationKeys, a benign field that is exactly a URL is (mis)detected as an outbound host', () => {
+    const args = { channel: '#eng', text: 'https://internal-wiki.example/kb/42' };
+    expect(findOutboundHosts(args)).toContain('internal-wiki.example');
+  });
+
+  it("with destinationKeys supplied, only the named key's subtree is scanned — a benign field with a URL-shaped value outside it is ignored", () => {
+    const args = { channel: '#eng', text: 'https://internal-wiki.example/kb/42' };
+    expect(findOutboundHosts(args, { destinationKeys: ['url'] })).toEqual([]);
+  });
+
+  it('with destinationKeys supplied, a URL under the named key is still found', () => {
+    const args = {
+      url: 'https://webhook.example/post',
+      text: 'https://internal-wiki.example/kb/42',
+    };
+    expect(findOutboundHosts(args, { destinationKeys: ['url'] })).toEqual(['webhook.example']);
+  });
+
+  it("a destination key's subtree is fully scanned even when nested — an array or object under the matched key does not need every inner key re-listed", () => {
+    const args = {
+      destinations: { primary: 'https://a.example', backups: ['https://b.example', 'not a url'] },
+      text: 'https://internal-wiki.example/kb/42',
+    };
+    expect(findOutboundHosts(args, { destinationKeys: ['destinations'] })).toEqual([
+      'a.example',
+      'b.example',
+    ]);
+  });
+
+  it('a destinationKeys entry that never appears in args is inert, not an error', () => {
+    const args = { text: 'https://internal-wiki.example/kb/42' };
+    expect(findOutboundHosts(args, { destinationKeys: ['url', 'endpoint'] })).toEqual([]);
+  });
+
+  it('still throws ArgsTooDeepError on a pathologically deep tree even when destinationKeys is supplied', () => {
+    let deep: unknown = 'bottom';
+    for (let i = 0; i < 10_000; i++) deep = { nested: deep };
+    expect(() => findOutboundHosts({ payload: deep }, { destinationKeys: ['payload'] })).toThrow(
+      ArgsTooDeepError,
+    );
+  });
 });
