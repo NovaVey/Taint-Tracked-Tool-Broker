@@ -114,6 +114,8 @@ export {
 export type { OutOfScopeDestination } from './taint/egress.js';
 export { diffProposedArgs } from './taint/counterfactual-diff.js';
 export type { ArgDiff } from './taint/counterfactual-diff.js';
+export { checkFieldGrounding } from './grounding.js';
+export type { CheckFieldGroundingOpts, FieldGroundingResult } from './grounding.js';
 export {
   createScope,
   createWatermark,
@@ -137,6 +139,9 @@ export { createDeferredApprovalChannel, DuplicateApprovalTokenError } from './ap
 export type { DeferredApprovalChannel, DeferredApprovalChannelOpts } from './approval.js';
 
 export { jsonSafeClone } from './json-safe-clone.js';
+
+export { createTaintEnvelope } from './envelope.js';
+export type { TaintEnvelope } from './envelope.js';
 
 export { defineSource, defineSink } from './define.js';
 export type { DefineSourceOpts, DefineSinkOpts } from './define.js';
