@@ -179,4 +179,81 @@ describe('wordShingles / shingleHashesOf fallback for symbol-only text', () => {
     expect(b.length).toBeGreaterThan(0);
     expect(overlapCoefficient(a, b)).toBe(0);
   });
+
+  it('a long (>= SHINGLE_WIDTH) symbol-only text uses the full width for its sliding windows, not the short-text-narrowed width', () => {
+    // 20 identical symbol characters: chars.length (20) >= SHINGLE_WIDTH (5),
+    // so charShingles() should take the "full width" branch (effectiveWidth
+    // = width = 5), giving 20-5+1 = 16 overlapping 5-char windows — not the
+    // narrowed width the short-text branch below uses.
+    const banner = '★'.repeat(20);
+    expect(wordShingles(banner)).toHaveLength(16);
+  });
+
+  it('a symbol-only text of EXACTLY SHINGLE_WIDTH chars still takes the full-width branch (>=, not >)', () => {
+    // chars.length === width (5 === 5): the full-width branch's own
+    // condition is `chars.length >= width`, so this boundary case must still
+    // take it (one single 5-char shingle: the whole text). Off-by-one here
+    // (`>` instead of `>=`) would instead fall through to the short-text
+    // narrowing branch, splitting this into two 4-char shingles.
+    expect(wordShingles('!@#$%')).toEqual(['!@#$%']);
+  });
+
+  it('a short (< SHINGLE_WIDTH) symbol-only text narrows to chars.length - 1, not chars.length or less', () => {
+    // 3 symbol chars, width 5: narrowed effectiveWidth = max(1, 3-1) = 2,
+    // giving two overlapping 2-char windows. A narrower (or degenerate,
+    // zero-width) fallback would instead produce three single-char windows
+    // (or empty-string windows), which this pins against.
+    expect(wordShingles('!@#')).toEqual(['!@', '@#']);
+  });
+
+  it('charShingles fallback shingles are genuine sliding-window substrings, not the whole text repeated', () => {
+    // 10 distinct symbol characters, well over SHINGLE_WIDTH (5): the
+    // correct sliding window over ['!','@','#','$','%','^','&','*','(',')']
+    // yields DIFFERENT overlapping 5-char shingles, the first of which is
+    // exactly the first 5 characters. A join()-without-slice() bug would
+    // instead push the ENTIRE joined text as every "shingle", collapsing
+    // the whole fingerprint down to a single repeated value and silently
+    // defeating the fuzzy-match/containment property this fallback exists
+    // for (see charShingles()'s own doc comment).
+    const banner = '!@#$%^&*()';
+    const shingles = wordShingles(banner);
+    expect(shingles[0]).toBe('!@#$%');
+    expect(shingles[1]).toBe('@#$%^');
+    // Genuinely different windows, not N copies of the same 10-char string.
+    expect(new Set(shingles).size).toBeGreaterThan(1);
+  });
+});
+
+describe('computeSimhash weighted majority vote', () => {
+  it('accumulates votes across ALL shingles, not just whichever shingle is processed last', () => {
+    // A text dominated by one 5-word phrase repeated many times, with a
+    // single, deliberately disjoint-vocabulary trailing phrase appended
+    // last. A correct weighted-majority-vote simhash must stay dominated by
+    // the heavily-repeated phrase's own bit pattern — since it repeats far
+    // more times than any other shingle, no other shingle (or handful of
+    // transition shingles) can out-vote it on any single bit. A "last write
+    // wins" bug (accumulator reset via `x && 0` instead of `x ?? 0`) would
+    // instead collapse the whole-text hash down to just the LAST shingle's
+    // own hash, discarding every vote that came before it.
+    const dominantPhrase = 'alpha bravo charlie delta echo'; // 5 words == SHINGLE_WIDTH
+    const dominantBlock = Array(30).fill(dominantPhrase).join(' ');
+    const trailingPhrase = 'zulu yankee xray whiskey victor'; // disjoint vocabulary, also 5 words
+    const text = `${dominantBlock} ${trailingPhrase}`;
+
+    const combined = computeSimhash(text);
+    const dominantBlockAlone = computeSimhash(dominantBlock);
+    const trailingAlone = computeSimhash(trailingPhrase);
+
+    // Every bit's vote margin contributed by the ~150 dominant-block votes
+    // (five periodic rotations of the repeated phrase, each appearing ~30
+    // times) is far larger than the few transition/trailing votes could
+    // ever contribute (+/-1 each) or flip, so appending the trailing phrase
+    // must not move the hash at all relative to the dominant block alone.
+    expect(hammingDistance(combined, dominantBlockAlone)).toBe(0);
+    // Pre-fix ("last shingle wins", via `weights[bit] ?? 0` mutated to
+    // `weights[bit] && 0`), `combined` would instead exactly equal
+    // `trailingAlone` (hammingDistance 0 there) — assert it's clearly NOT
+    // dominated by whichever shingle happens to be processed last.
+    expect(hammingDistance(combined, trailingAlone)).toBeGreaterThan(20);
+  });
 });

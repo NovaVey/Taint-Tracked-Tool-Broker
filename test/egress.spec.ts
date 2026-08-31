@@ -105,6 +105,84 @@ describe('findOutboundHosts', () => {
       ).toEqual(['a.example', 'b.example']);
     });
   });
+
+  // Per-branch isolation of the recursion-depth guard (MAX_ARGS_TREE_DEPTH,
+  // GAPS.md HIGH #4's unbounded-recursion DoS). The existing "pathologically
+  // deep"/"ordinary nesting" tests above only nest through the generic
+  // plain-object branch, which only proves depth is tracked correctly on
+  // THAT one branch — array, Map key, Map value, and Set each increment
+  // `depth` at their OWN independent `depth + 1` call site. A regression
+  // that silently swapped one of those to `depth - 1` would turn the guard
+  // into a no-op for exactly that branch. Each case below nests exclusively
+  // through ONE branch: under the real guard this throws a clean
+  // `ArgsTooDeepError`; under a `depth - 1` regression on that branch the
+  // depth counter never grows, so the walk instead runs until a raw,
+  // undocumented `RangeError: Maximum call stack size exceeded` — which
+  // fails `.toThrow(ArgsTooDeepError)`.
+  describe('findOutboundHosts recursion-depth guard — isolated per node-shape branch', () => {
+    it('a tree nested exclusively through ARRAYS still trips the depth guard', () => {
+      let deep: unknown = 'https://a.example';
+      for (let i = 0; i < 2000; i++) deep = [deep];
+      expect(() => findOutboundHosts(deep)).toThrow(ArgsTooDeepError);
+    });
+
+    it('a tree nested exclusively through Map KEYS still trips the depth guard', () => {
+      let deep: unknown = 'https://a.example';
+      for (let i = 0; i < 2000; i++) deep = new Map([[deep, 'v']]);
+      expect(() => findOutboundHosts(deep)).toThrow(ArgsTooDeepError);
+    });
+
+    it('a tree nested exclusively through Map VALUES still trips the depth guard', () => {
+      let deep: unknown = 'https://a.example';
+      for (let i = 0; i < 2000; i++) deep = new Map([['k', deep]]);
+      expect(() => findOutboundHosts(deep)).toThrow(ArgsTooDeepError);
+    });
+
+    it('a tree nested exclusively through Sets still trips the depth guard', () => {
+      let deep: unknown = 'https://a.example';
+      for (let i = 0; i < 2000; i++) deep = new Set([deep]);
+      expect(() => findOutboundHosts(deep)).toThrow(ArgsTooDeepError);
+    });
+
+    // Boundary check on the guard's own threshold, not just its direction —
+    // see scan.spec.ts's identical test for the full rationale (same
+    // MAX_ARGS_TREE_DEPTH=500 constant, same `depth > ...` guard shape).
+    it('a tree nested exactly to MAX_ARGS_TREE_DEPTH (500) does not throw — only one level deeper does', () => {
+      let deep: unknown = 'https://a.example';
+      for (let i = 0; i < 500; i++) deep = { nested: deep };
+      expect(() => findOutboundHosts(deep)).not.toThrow();
+    });
+  });
+
+  describe('findOutboundHosts — additional dispatch/edge-case coverage', () => {
+    // Array elements inherit `scanning` purely POSITIONALLY (see the array
+    // branch's own comment in egress.ts) — they are never individually
+    // matched against `destinationKeys` by "key name" the way object
+    // properties are, because an array has no key names, only positions. If
+    // an array were instead walked via the generic plain-object fallback
+    // (Object.entries() also enumerates array indices as string keys "0",
+    // "1", ...), a `destinationKeys` entry that happens to collide with an
+    // index string would wrongly bring that one element into scope.
+    it('array elements are exempt from destinationKeys key-name matching even when an entry looks like an index (e.g. "0")', () => {
+      const args = { arr: ['https://evil.example/exfil'] };
+      expect(findOutboundHosts(args, { destinationKeys: ['0'] })).toEqual([]);
+    });
+
+    // The root call seeds `scanning` from `destinationKeySet === undefined`
+    // — i.e. "no destinationKeys option at all" starts the walk already
+    // in-scope, reproducing the original whole-tree default. This is only
+    // observable at the very root itself: a bare string passed directly as
+    // `args` (rather than nested inside an object/array) hits the
+    // string-leaf `if (!scanning) return;` check before any nested
+    // dispatch logic gets a chance to recompute `scanning` on its own.
+    it('a bare string as the WHOLE args value is still scanned by default (no destinationKeys option at all)', () => {
+      expect(findOutboundHosts('https://a.example')).toEqual(['a.example']);
+    });
+
+    it('a bare string as the WHOLE args value is NOT scanned once destinationKeys narrowing is active, since nothing names it in scope', () => {
+      expect(findOutboundHosts('https://a.example', { destinationKeys: ['url'] })).toEqual([]);
+    });
+  });
 });
 
 describe('isAllowedOutboundHost', () => {
@@ -443,5 +521,123 @@ describe('findOutboundDestinationsOutsideKeys (advisory-only, GAPS.md #18)', () 
     expect(() => findOutboundDestinationsOutsideKeys({ payload: deep }, ['other'])).toThrow(
       ArgsTooDeepError,
     );
+  });
+
+  // Regression coverage for a complete, previously-untested blind spot: this
+  // walk's Set branch (mirroring findOutboundHosts' own Set branch above)
+  // had ZERO test coverage before this describe block — no test anywhere in
+  // the suite ever passed a Set through findOutboundDestinationsOutsideKeys
+  // at all. That is exactly the historical failure shape GAPS.md #18/the
+  // CHANGELOG's [1.1.0] Security section describes for findOutboundHosts
+  // itself (a destination hidden inside a Map/Set was silently invisible,
+  // Object.entries() returning nothing for either) — here it was the same
+  // gap, just in the advisory-only sibling function instead of the
+  // hard-blocking one.
+  it('finds a destination hidden inside a Set VALUE outside the declared keys', () => {
+    const args = { headers: new Set(['harmless', 'https://evil.example/exfil']) };
+    expect(findOutboundDestinationsOutsideKeys(args, ['url'])).toEqual([
+      { value: 'https://evil.example/exfil', path: 'headers<Set>[1]' },
+    ]);
+  });
+
+  it('does not flag a Set nested under a declared destinationKeys path', () => {
+    const args = { url: new Set(['https://a.example']) };
+    expect(findOutboundDestinationsOutsideKeys(args, ['url'])).toEqual([]);
+  });
+
+  it('multiple Set entries get correctly incrementing indices in their paths, not stuck at the same index', () => {
+    const args = { s: new Set(['https://a.example', 'https://b.example']) };
+    expect(findOutboundDestinationsOutsideKeys(args, [])).toEqual([
+      { value: 'https://a.example', path: 's<Set>[0]' },
+      { value: 'https://b.example', path: 's<Set>[1]' },
+    ]);
+  });
+
+  it('a Map at the ARGS ROOT (no outer property) still gets a correctly-formatted path', () => {
+    const args = new Map([['https://a.example', 'v']]);
+    expect(findOutboundDestinationsOutsideKeys(args, [])).toEqual([
+      { value: 'https://a.example', path: '<Map>[0].key' },
+    ]);
+  });
+
+  it('a Map KEY (not just a value) outside declared keys is found, and multiple entries get correctly incrementing indices', () => {
+    const args = {
+      headers: new Map([
+        ['https://a.example', 'primary'],
+        ['note', 'https://b.example'],
+      ]),
+    };
+    expect(findOutboundDestinationsOutsideKeys(args, ['url'])).toEqual([
+      { value: 'https://a.example', path: 'headers<Map>[0].key' },
+      { value: 'https://b.example', path: 'headers<Map>[1].value' },
+    ]);
+  });
+
+  it('a destination two levels deep under an undeclared key gets a fully dotted path ("outer.inner")', () => {
+    const args = { outer: { inner: 'https://a.example' } };
+    expect(findOutboundDestinationsOutsideKeys(args, ['url'])).toEqual([
+      { value: 'https://a.example', path: 'outer.inner' },
+    ]);
+  });
+
+  // See scan.spec.ts's identical-in-spirit null test: `typeof null ===
+  // 'object'`, so the null/undefined short-circuit at the top of visit() is
+  // the ONLY thing standing between a null leaf and the cycle-guard's
+  // `visited.add(node)` a few lines later, which throws a TypeError for a
+  // non-object value.
+  it('skips a null/undefined leaf cleanly (no crash), even alongside a genuine destination elsewhere in the tree', () => {
+    const args = { a: null, b: undefined, c: 'https://a.example' };
+    expect(findOutboundDestinationsOutsideKeys(args, [])).toEqual([
+      { value: 'https://a.example', path: 'c' },
+    ]);
+  });
+
+  // A plain number/boolean leaf (a wholly ordinary tool-call argument shape
+  // — e.g. `{ retries: 3, dryRun: true }`) must be skipped the same way: the
+  // generic `typeof node !== 'object'` catch-all is what stands between it
+  // and the same `visited.add(node)` crash, since none of the earlier
+  // null/undefined/string/Array/Map/Set checks match a number or boolean.
+  it('skips a plain number/boolean leaf cleanly (no crash), even alongside a genuine destination', () => {
+    const args = { retries: 3, dryRun: true, url: 'https://a.example' };
+    expect(findOutboundDestinationsOutsideKeys(args, [])).toEqual([
+      { value: 'https://a.example', path: 'url' },
+    ]);
+  });
+
+  // Per-branch isolation of the recursion-depth guard — see
+  // findOutboundHosts' identical-in-spirit describe block above and
+  // scan.spec.ts's own version for the full rationale (same
+  // MAX_ARGS_TREE_DEPTH=500 constant and guard shape, one independent
+  // `depth + 1` call site per node-shape branch).
+  describe('recursion-depth guard — isolated per node-shape branch', () => {
+    it('a tree nested exclusively through ARRAYS still trips the depth guard', () => {
+      let deep: unknown = 'https://a.example';
+      for (let i = 0; i < 2000; i++) deep = [deep];
+      expect(() => findOutboundDestinationsOutsideKeys(deep, [])).toThrow(ArgsTooDeepError);
+    });
+
+    it('a tree nested exclusively through Map KEYS still trips the depth guard', () => {
+      let deep: unknown = 'https://a.example';
+      for (let i = 0; i < 2000; i++) deep = new Map([[deep, 'v']]);
+      expect(() => findOutboundDestinationsOutsideKeys(deep, [])).toThrow(ArgsTooDeepError);
+    });
+
+    it('a tree nested exclusively through Map VALUES still trips the depth guard', () => {
+      let deep: unknown = 'https://a.example';
+      for (let i = 0; i < 2000; i++) deep = new Map([['k', deep]]);
+      expect(() => findOutboundDestinationsOutsideKeys(deep, [])).toThrow(ArgsTooDeepError);
+    });
+
+    it('a tree nested exclusively through Sets still trips the depth guard', () => {
+      let deep: unknown = 'https://a.example';
+      for (let i = 0; i < 2000; i++) deep = new Set([deep]);
+      expect(() => findOutboundDestinationsOutsideKeys(deep, [])).toThrow(ArgsTooDeepError);
+    });
+
+    it('a tree nested exactly to MAX_ARGS_TREE_DEPTH (500) does not throw — only one level deeper does', () => {
+      let deep: unknown = 'https://a.example';
+      for (let i = 0; i < 500; i++) deep = { nested: deep };
+      expect(() => findOutboundDestinationsOutsideKeys(deep, [])).not.toThrow();
+    });
   });
 });
