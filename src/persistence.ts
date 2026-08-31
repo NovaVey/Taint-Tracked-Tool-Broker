@@ -343,12 +343,15 @@ function validateSerializedBrokerState(state: SerializedBrokerState): void {
  * conversion for a `TaintRecord` reached via `AuditEvent.taint.matchedRecords`
  * instead of via `TaintRegistry.entries()`, rather than a second,
  * independently-maintained copy of the same three-field mapping drifting out
- * of sync with this one. Not exported: both public entry points below take a
- * whole registry or a whole event, matching every other function in this
- * file, so there is no call site that needs a single record's conversion on
- * its own.
+ * of sync with this one. Exported (module-level only — not re-exported from
+ * `src/index.ts`, the same "internal cross-module reuse, not public API"
+ * convention `internal-audit.ts`'s `trivialTaintContext()` already uses) so
+ * `envelope.ts`'s `createTaintEnvelope()` can reuse this exact conversion a
+ * third time for a single `TaintMatch` reached via a standalone
+ * `TaintContext`, instead of a third independently-maintained copy of the
+ * same mapping.
  */
-function serializeTaintRecord(record: TaintRecord): SerializedTaintRecord {
+export function serializeTaintRecord(record: TaintRecord): SerializedTaintRecord {
   return {
     ...record,
     fingerprint: {

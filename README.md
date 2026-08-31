@@ -16,6 +16,7 @@ Provenance labeling for agent inputs, enforced at the tool-call boundary. Blocks
 - [Quick start](#quick-start)
 - [Core model](#core-model)
 - [Examples](#examples)
+- [Observability](#observability)
 - [Injection corpus](#injection-corpus)
 - [Known gaps](#known-gaps)
 - [Versioning](#versioning)
@@ -189,8 +190,27 @@ Runnable, offline (no API key, no real network calls — everything is mocked ex
 | `npm run example:langchain` | Wiring `broker.wrap()` behind LangChain.js's `tool()`/`Runnable.invoke()` shape. |
 | `npm run example:vercel-ai` | The same pattern behind the Vercel AI SDK's `tool()`/`execute()` shape. |
 | `npm run example:openai-agents` | The same pattern behind the OpenAI Agents SDK's `tool()`/`execute()` shape, exercising the `REQUIRE_APPROVAL` path via `createDeferredApprovalChannel()`. |
+| `npm run example:openai-tool-loop` | A *raw* OpenAI Chat Completions API-style tool loop (`tools`/`tool_choice`, a manual `while` loop feeding results back as `role:'tool'` messages) — distinct from `example:openai-agents` above, which wires the newer, higher-level Agents SDK instead. |
+| `npm run example:mastra` | Wiring `broker.wrap()` behind Mastra's `createTool({ execute: ({ context }) => ... })` shape. |
+| `npm run example:genkit` | Wiring `broker.wrap()` behind Google Genkit's `ai.defineTool()` handler shape. |
+| `npm run example:agent-sdk` | Wiring `broker.wrap()` behind the (Claude) Agent SDK's in-process `tool()`/`createSdkMcpServer()` helper — a third, distinct Anthropic integration shape alongside `example:tool-loop` (the raw Messages API) and `example:mcp-sdk` (a real network MCP server). |
+| `npm run example:llamaindex-ts` | Wiring `broker.wrap()` behind LlamaIndex.TS's `FunctionTool.from()`/`tool()` shape. |
+| `npm run example:semantic-kernel-js` | Wiring `broker.wrap()` behind Semantic Kernel JS's `KernelFunction.from()`/plugin shape. |
+| `npm run example:taint-envelope` | Packaging a blocked/quarantined call's `TaintContext` into a portable, JSON-safe `TaintEnvelope` (`createTaintEnvelope()`) and handing it off across a process boundary. |
+| `npm run example:grounding-check` | Rejecting a `broker.summarize()` extraction whose Q-LLM fabricated a field absent from its source, using the standalone `checkFieldGrounding()` utility inside a `QuarantineImpl` wrapper. |
 
-The three framework examples don't depend on the real `langchain`/`ai`/`@openai/agents` packages — each uses a small structural stand-in for that framework's real tool-definition shape, since the integration point (a `name`/`description`/schema object with an async execute function) is what matters, not fidelity to a fast-moving package's exact current types. Every framework's real dispatch loop calls that function the same way once `broker.wrap()` has interposed it. `example:mcp-sdk` is the one exception: it depends on the real `@modelcontextprotocol/sdk` (a devDependency, not a runtime dependency of this library) to confirm the stand-in pattern used by `example:mcp` actually holds against the genuine SDK's current shapes.
+The framework examples above don't depend on the real `langchain`/`ai`/`@openai/agents`/`mastra`/`genkit`/`llamaindex`/`@microsoft/semantic-kernel` packages — each uses a small structural stand-in for that framework's real tool-definition shape, since the integration point (a `name`/`description`/schema object with an async execute function) is what matters, not fidelity to a fast-moving package's exact current types. Every framework's real dispatch loop calls that function the same way once `broker.wrap()` has interposed it. `example:mcp-sdk` is the one exception: it depends on the real `@modelcontextprotocol/sdk` (a devDependency, not a runtime dependency of this library) to confirm the stand-in pattern used by `example:mcp` actually holds against the genuine SDK's current shapes.
+
+**AWS Bedrock Agents** isn't in the table above — its Action Group execution model (a Lambda/REST callout from AWS's own managed orchestrator, not an in-process function call) doesn't fit this shape, so a copy-paste mock would misrepresent the actual integration rather than simplify it. See [`docs/aws-bedrock-agents-pattern.md`](./docs/aws-bedrock-agents-pattern.md) for the correct pattern (wrapping inside the Lambda handler) and its one real limitation (watermark state does not survive a cold start without wiring in `serializeBrokerState()`/`restoreBrokerState()`, GAPS.md #12).
+
+## Observability
+
+The default `auditSink` — what `createBroker()` gets when you configure nothing, including by following Quick start above verbatim — is a silent no-op (GAPS.md #25). Every gate is still enforced correctly either way; you just get zero record of it. Configuring a real one turns this library's audit trail into something you can actually query, render, and alert on:
+
+- **`formatAuditTrail(events)` / `explainWatermark(scope)`** (`src/debug.ts`, exported from the package root) — pure renderers over `AuditEvent[]`/`TaintScope.watermark.sources` you already have. No storage, no aggregation — just readable prose for a terminal or log line. See Quick start above for a working snippet.
+- **`AggregatingAuditSink`** (`src/debug.ts`) — a small, dependency-free `AuditSink` wrapping an optional delegate, accumulating verdict-by-sink-class counts, `REQUIRE_APPROVAL` grant/deny counts and latency, and `QUARANTINE_AND_RETRY` offer counts into a plain `snapshot(): Record<string, number>`. `npm run example:audit-prometheus` renders that snapshot as real Prometheus text-exposition format (`# HELP`/`# TYPE`/labeled samples) — no `prom-client` dependency, pure string formatting.
+- **Durable storage** — `serializeAuditEvent()` (`src/persistence.ts`) makes an `AuditEvent` JSON-safe (its `fingerprint.simhash`/`shingleHashes` fields are a `bigint`/`Uint32Array`, which `JSON.stringify` either throws on or silently mangles). `npm run example:audit-sqlite` writes events to a real SQL table via `node:sqlite`, queries them back with a real `GROUP BY`, and renders the revived events with `formatAuditTrail()` — proof the round trip is lossless, not just "doesn't throw."
+- **Redaction before any of the above sees it** — `BrokerOptions.redactAuditArgs` strips or replaces `call.args` before it reaches your sink at all. See [`docs/audit-redaction.md`](./docs/audit-redaction.md) for worked patterns (by `sinkClass`, by `privateDataSeen`, a key denylist).
 
 ## Injection corpus
 
