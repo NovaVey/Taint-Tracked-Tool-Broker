@@ -125,6 +125,42 @@ describe('defaultPolicy matrix (DESIGN.md §7.2)', () => {
     it('never loosens an already-BLOCK verdict', async () => {
       expect(await decide('RAW_UNTRUSTED', 'EXEC', false, 'CLEAN')).toBe('BLOCK');
     });
+
+    // The OR-condition gating this block is `decision.action === 'ALLOW' ||
+    // decision.action === 'ALLOW_WITH_WARNING'` — the test above only ever
+    // drives the 'ALLOW' disjunct (scopeLevel CLEAN always base-decides
+    // ALLOW). These two pin the OTHER disjunct, and the "must not fire for
+    // an already-gated verdict" direction, independently:
+    it("also floors an otherwise-ALLOW_WITH_WARNING verdict to REQUIRE_APPROVAL when a fingerprint outranks scopeLevel (the OR condition's other disjunct)", async () => {
+      // DERIVED_UNTRUSTED/MUTATE without private data base-decides
+      // ALLOW_WITH_WARNING (not ALLOW) — distinct from every other test in
+      // this describe block, all of which reach this code via scopeLevel
+      // CLEAN's base ALLOW instead.
+      expect(await decide('DERIVED_UNTRUSTED', 'MUTATE', false, 'RAW_UNTRUSTED')).toBe(
+        'REQUIRE_APPROVAL',
+      );
+    });
+
+    it('does NOT re-tighten (or overwrite the reason) a verdict that is already REQUIRE_APPROVAL, even when a fingerprint outranks scopeLevel', async () => {
+      // DERIVED_UNTRUSTED/EXEC is unconditionally REQUIRE_APPROVAL at the
+      // base matrix — never ALLOW/ALLOW_WITH_WARNING — so this block's own
+      // OR-condition must stay false here despite argFingerprintFloor
+      // (RAW_UNTRUSTED) outranking scopeLevel (DERIVED_UNTRUSTED). Checking
+      // only `.action` wouldn't catch a bug that re-fires this block anyway
+      // (REQUIRE_APPROVAL -> REQUIRE_APPROVAL is an invisible no-op on
+      // action alone) — the ORIGINAL matrix reason must survive untouched,
+      // not get silently overwritten with this block's own "outranks scope
+      // watermark" reason text.
+      const decision = await defaultPolicy(
+        CALL,
+        ctx('DERIVED_UNTRUSTED', 'EXEC', false, 'RAW_UNTRUSTED'),
+      );
+      expect(decision.action).toBe('REQUIRE_APPROVAL');
+      if (decision.action === 'REQUIRE_APPROVAL') {
+        expect(decision.reason).toContain('quarantine-derived');
+        expect(decision.reason).not.toContain('after a turn reset');
+      }
+    });
   });
 
   describe('QUARANTINE_AND_RETRY (DESIGN.md §7.2)', () => {
@@ -202,6 +238,31 @@ describe('defaultPolicy matrix (DESIGN.md §7.2)', () => {
     it('does NOT replace a low-scoring shingle match (below the "specifically identifiable" bar)', async () => {
       const action = await decide('RAW_UNTRUSTED', 'EXEC', false, 'CLEAN', [
         match('shingle', 0.62, 'RAW_UNTRUSTED'),
+      ]);
+      expect(action).toBe('BLOCK');
+    });
+
+    it('DOES replace when a fuzzy match scores exactly at the "specifically identifiable" bar (>=, not >)', async () => {
+      // QUARANTINE_MIN_FUZZY_SCORE is 0.85 — this pins the boundary is
+      // inclusive, the mirror image of the low-scoring-shingle test above
+      // (0.62, comfortably below). A bare `>` here would wrongly reject the
+      // exact threshold value.
+      const action = await decide('RAW_UNTRUSTED', 'EXEC', false, 'CLEAN', [
+        match('simhash', 0.85, 'RAW_UNTRUSTED'),
+      ]);
+      expect(action).toBe('QUARANTINE_AND_RETRY');
+    });
+
+    it('does NOT replace a verdict whose only qualifying-shaped match is against a CLEAN-level record (explicitly-trusted content, not an untrusted source)', async () => {
+      // `record.level` here is the MATCHED RECORD's own taint level (e.g.
+      // content registered via markContextExposure(..., 'CLEAN')) — not the
+      // call's scopeLevel (which is RAW_UNTRUSTED below, driving the base
+      // BLOCK). An exact match against explicitly-trusted content says
+      // nothing about which untrusted source explains THIS call's risk, so
+      // it must not be treated as "specifically identifiable" evidence any
+      // more than a low-scoring or wrong-matchType match would be.
+      const action = await decide('RAW_UNTRUSTED', 'EXEC', false, 'CLEAN', [
+        match('exact', 1, 'CLEAN'),
       ]);
       expect(action).toBe('BLOCK');
     });
