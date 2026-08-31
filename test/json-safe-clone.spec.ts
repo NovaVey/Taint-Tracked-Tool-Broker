@@ -91,6 +91,46 @@ describe('jsonSafeClone', () => {
     expect(jsonSafeClone(bare)).toEqual({ x: 1 });
   });
 
+  it('faithfully clones an own, enumerable property literally named "__proto__" instead of corrupting the clone\'s actual prototype — found by test/json-safe-clone.property.spec.ts', () => {
+    // Computed-property syntax, not the `__proto__:` object-literal
+    // shorthand: this creates a genuine OWN data property named
+    // "__proto__" on `original` (Object.keys(original) includes it), as
+    // opposed to `{ __proto__: { poisoned: true } }`, which would set
+    // original's actual prototype and create no own property at all. Only
+    // the computed-property form reaches the buggy code path: the clone
+    // loop's `Object.keys()` walk sees "__proto__" as an ordinary key to
+    // copy, and a plain `out[key] = value` bracket assignment on the
+    // FRESH output object then hits Object.prototype's inherited
+    // `__proto__` accessor setter (since `out` has no own "__proto__"
+    // property yet to shadow it) — silently reassigning the clone's real
+    // prototype to the cloned value instead of creating an own property.
+    const original: Record<string, unknown> = {};
+    Object.defineProperty(original, '__proto__', {
+      value: { poisoned: true },
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+    expect(Object.keys(original)).toEqual(['__proto__']);
+
+    const cloned = jsonSafeClone(original) as Record<string, unknown>;
+
+    // The pre-fix bug: `cloned`'s actual prototype became `{ poisoned:
+    // true }` (an object with no Object.prototype methods of its own, and
+    // Object.keys(cloned) empty since the "__proto__" key was consumed by
+    // the prototype-set instead of becoming an own property) rather than
+    // faithfully copying the key. Both assertions below fail against the
+    // pre-fix code (Object.getPrototypeOf(cloned) !== Object.prototype,
+    // and Object.keys(cloned) is [] not ['__proto__']) and pass now that
+    // Object.defineProperty is used for every key, "__proto__" included.
+    expect(Object.getPrototypeOf(cloned)).toBe(Object.prototype);
+    expect(Object.keys(cloned)).toEqual(['__proto__']);
+    expect(cloned['__proto__']).toEqual({ poisoned: true });
+    // The cloned value under that key is itself a fresh, independent copy
+    // — the same invariant every other key already gets.
+    expect(cloned['__proto__']).not.toBe(original['__proto__']);
+  });
+
   it('works end-to-end as a custom cloneArgs, and still fails loud (NonCloneableArgsError) on a type it rejects', async () => {
     const shellExec: ToolExecutor = {
       name: 'shell_exec',
