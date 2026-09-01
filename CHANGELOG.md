@@ -4,6 +4,10 @@ All notable changes to this project are documented here. Format loosely follows 
 
 ## [Unreleased]
 
+### Added
+
+- README.md's Core model section gained a `createToolDescriptorGuard(broker)` bullet — PR #56 promoted it from example-only glue to an exported core capability, but README wasn't updated at the time (only the agent working on `requireQuarantineSchema` was asked to touch README; the tool-descriptor-guard agent wasn't). The `example:mcp` Examples-table row was updated to match, naming the exported function instead of describing it only as "a tool-description rug-pull guard."
+
 ## [1.2.0] - 2026-09-01
 
 ### Added
