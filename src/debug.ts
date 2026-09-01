@@ -51,6 +51,19 @@ import type { AuditEvent, AuditSink, PolicyDecision, TaintScope } from './types.
  * `BrokerOptions.redactAuditArgs` upstream, or filtered/mapped `events`
  * before calling `formatAuditTrail()` themselves. This function applies no
  * redaction of its own; it renders whatever `AuditEvent`s it is handed.
+ *
+ * Plain text, no markdown/HTML escaping. `call.args` can carry untrusted
+ * content the model saw fit to pass as an argument (that is the entire
+ * reason this library exists), so the rendered string can contain
+ * arbitrary characters — including ones with syntactic meaning in
+ * whatever surface an integrator ultimately renders this into. Printing
+ * to a plain-text terminal or log line (this function's own intended use,
+ * per this file's header) is safe as-is; feeding this output into a
+ * markdown renderer, an HTML page, or a chat surface that interprets
+ * formatting is the integrator's own choice of rendering surface, not
+ * this library's, and the integrator is responsible for escaping it
+ * appropriately for that surface first, the same way any other
+ * untrusted-content-bearing string would need to be.
  */
 function summarizeArgs(args: unknown, maxLength = 100): string {
   let text: string;

@@ -21,10 +21,17 @@
  *     broker touches this channel — it's the canonical example GAPS.md #1
  *     itself names.
  *
- * This file demonstrates all three, plus a reusable guard for the third
- * case: fingerprinting each tool's description (via the library's own
- * `exactHash`) and calling `markContextExposure()` the moment a
- * previously-seen tool's description changes.
+ * This file demonstrates all three, plus `createToolDescriptorGuard()` — a
+ * core-library capability (`src/tool-descriptor-guard.ts`, re-exported from
+ * the package root) for the third case: fingerprinting each tool's FULL
+ * descriptor (name, description, AND input schema — via the library's own
+ * `exactHash`/`toRegistrableText`) and calling `markContextExposure()` the
+ * moment a previously-seen tool's descriptor changes. This file used to
+ * hand-roll its own copy of this exact logic as a local
+ * `createMcpDescriptionGuard()`/`checkDescriptions()` closure (description
+ * text only, no schema); it now imports and dogfoods the real shipped
+ * utility instead — see that module's own doc comment for the full threat
+ * model, the baseline semantics, and its documented known limitations.
  *
  * The `Mcp*` types and `makeMockMcpClient()` below stand in for a real MCP
  * SDK client (e.g. `@modelcontextprotocol/sdk`) — swap them for real calls
@@ -32,12 +39,7 @@
  * these specific shapes.
  */
 
-import {
-  createBroker,
-  exactHash,
-  ToolCallBlockedError,
-  type ToolCallBroker,
-} from '../src/index.js';
+import { createBroker, createToolDescriptorGuard, ToolCallBlockedError } from '../src/index.js';
 
 interface McpToolDescriptor {
   name: string;
@@ -51,37 +53,7 @@ interface McpClient {
 }
 
 // ---------------------------------------------------------------------------
-// 1. The tool-description rug-pull guard.
-// ---------------------------------------------------------------------------
-
-/**
- * Call once per `tools/list` response. Fingerprints every tool's
- * description and compares it to the last-seen fingerprint for that tool
- * name; the first time a name is seen, its description is just recorded
- * (nothing to compare against yet — not itself suspicious). A description
- * that CHANGES between calls is flagged via `markContextExposure()`, since
- * a server can rewrite a tool's description at any point after initial
- * discovery to smuggle new instructions into whatever later reads it —
- * this is deliberately about DETECTING a change, not judging whether any
- * one description is malicious (that's exactly the content-matching
- * approach this whole design avoids, for the same reason GAPS.md #14 names).
- */
-function createMcpDescriptionGuard(broker: ToolCallBroker): (tools: McpToolDescriptor[]) => void {
-  const lastSeenHash = new Map<string, string>();
-  return function checkDescriptions(tools: McpToolDescriptor[]): void {
-    for (const tool of tools) {
-      const hash = exactHash(tool.description);
-      const previous = lastSeenHash.get(tool.name);
-      if (previous !== undefined && previous !== hash) {
-        broker.markToolDescriptionExposure(tool.name, tool.description, 'RAW_UNTRUSTED');
-      }
-      lastSeenHash.set(tool.name, hash);
-    }
-  };
-}
-
-// ---------------------------------------------------------------------------
-// 2. tools/call: ordinary source/sink wrapping.
+// 1. tools/call: ordinary source/sink wrapping.
 // ---------------------------------------------------------------------------
 
 async function demonstrateToolWiring(client: McpClient): Promise<void> {
@@ -133,7 +105,7 @@ async function demonstrateToolWiring(client: McpClient): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// 3. resources/read: the SAME source/sink wrapping as tools/call.
+// 2. resources/read: the SAME source/sink wrapping as tools/call.
 // ---------------------------------------------------------------------------
 
 /**
@@ -189,7 +161,7 @@ async function demonstrateResourceRead(client: McpClient): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// 4. tools/list: the description rug-pull, caught by the guard above.
+// 3. tools/list: the description rug-pull, caught by createToolDescriptorGuard().
 // ---------------------------------------------------------------------------
 
 async function demonstrateDescriptionGuard(
@@ -197,7 +169,7 @@ async function demonstrateDescriptionGuard(
 ): Promise<void> {
   console.log('\n=== tools/list: the description rug-pull guard (GAPS.md #1) ===');
   const broker = createBroker();
-  const checkDescriptions = createMcpDescriptionGuard(broker);
+  const checkDescriptions = createToolDescriptorGuard(broker);
 
   // First discovery: nothing to compare against yet, so nothing is
   // flagged, even though this tool's description happens to be benign.

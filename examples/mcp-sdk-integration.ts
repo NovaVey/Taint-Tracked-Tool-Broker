@@ -9,10 +9,11 @@
  * the real SDK, on the theory that the wiring pattern is what matters, not
  * fidelity to a fast-moving package's exact current types. This file proves
  * that theory holds: it's the identical pattern — `broker.wrap()` around
- * `tools/call`, `markToolDescriptionExposure()` on a changed `tools/list`
- * description — but the client and server are genuine `McpServer`/`Client`
- * instances doing real JSON-RPC request/response and real tool
- * registration/discovery/invocation, not a mock returning canned values.
+ * `tools/call`, `createToolDescriptorGuard()` (`src/tool-descriptor-guard.ts`)
+ * on a changed `tools/list` description — but the client and server are
+ * genuine `McpServer`/`Client` instances doing real JSON-RPC request/response
+ * and real tool registration/discovery/invocation, not a mock returning
+ * canned values.
  *
  * Client and server are connected via `InMemoryTransport.createLinkedPair()`
  * — a pair of in-process transports the SDK ships specifically for this —
@@ -30,12 +31,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { z } from 'zod';
 
-import {
-  createBroker,
-  exactHash,
-  ToolCallBlockedError,
-  type ToolCallBroker,
-} from '../src/index.js';
+import { createBroker, createToolDescriptorGuard, ToolCallBlockedError } from '../src/index.js';
 
 // ---------------------------------------------------------------------------
 // The real MCP server: one source tool, one sink tool, one tool that exists
@@ -148,24 +144,13 @@ async function demonstrateToolWiring(client: Client): Promise<void> {
 //    change is a real server-side RegisteredTool.update() call, which the
 //    SDK turns into a real `notifications/tools/list_changed` + the next
 //    `client.listTools()` genuinely returning the new description, not a
-//    mock swapping a value in a Map.
+//    mock swapping a value in a Map. The guard itself is `createToolDescriptorGuard()`
+//    (`src/tool-descriptor-guard.ts`, re-exported from the package root) —
+//    this file used to hand-roll its own copy of this exact logic as a
+//    local `createMcpDescriptionGuard()`/`checkDescriptions()` closure; it
+//    now imports and dogfoods the real shipped utility instead, exactly like
+//    `examples/mcp-integration.ts` does.
 // ---------------------------------------------------------------------------
-
-function createMcpDescriptionGuard(
-  broker: ToolCallBroker,
-): (tools: { name: string; description?: string | undefined }[]) => void {
-  const lastSeenHash = new Map<string, string>();
-  return function checkDescriptions(tools): void {
-    for (const tool of tools) {
-      const hash = exactHash(tool.description ?? '');
-      const previous = lastSeenHash.get(tool.name);
-      if (previous !== undefined && previous !== hash) {
-        broker.markToolDescriptionExposure(tool.name, tool.description ?? '', 'RAW_UNTRUSTED');
-      }
-      lastSeenHash.set(tool.name, hash);
-    }
-  };
-}
 
 async function demonstrateDescriptionGuard(
   client: Client,
@@ -173,10 +158,16 @@ async function demonstrateDescriptionGuard(
 ): Promise<void> {
   console.log('\n=== tools/list rug-pull guard (GAPS.md #1), over a real client ===');
   const broker = createBroker();
-  const checkDescriptions = createMcpDescriptionGuard(broker);
+  const checkDescriptions = createToolDescriptorGuard(broker);
 
+  // The SDK's real `Tool` shape carries `description` as optional
+  // (`string | undefined`) — `ToolDescriptor.description` is required, so
+  // this maps the same `?? ''` coercion the original hand-rolled guard used
+  // rather than changing what gets hashed for a tool with no description.
   const before = await client.listTools();
-  checkDescriptions(before.tools);
+  checkDescriptions(
+    before.tools.map((tool) => ({ name: tool.name, description: tool.description ?? '' })),
+  );
   console.log('after first real tools/list — scope watermark:', broker.scope.watermark.level);
 
   // A real server-side description rewrite — the SDK's own update() call,
@@ -188,7 +179,9 @@ async function demonstrateDescriptionGuard(
   });
 
   const after = await client.listTools();
-  checkDescriptions(after.tools);
+  checkDescriptions(
+    after.tools.map((tool) => ({ name: tool.name, description: tool.description ?? '' })),
+  );
   console.log(
     'after the description changed server-side and was re-discovered — scope watermark:',
     broker.scope.watermark.level,

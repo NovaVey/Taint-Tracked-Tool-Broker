@@ -12,6 +12,7 @@ import {
   PlanNotDeclarableError,
   QuarantineInputMismatchError,
   QuarantineInputUnknownError,
+  QuarantineSchemaRequiredError,
   ReentrantCallError,
   ReservedToolNameError,
   ToolCallBlockedError,
@@ -1929,6 +1930,130 @@ describe('broker.summarize() (quarantine path)', () => {
 
     expect(sawError).toBeInstanceOf(ReentrantCallError);
     expect(sinkRan).toBe(false);
+  });
+});
+
+// GAPS.md #4 names opts.schema's optionality by design ("a documented usage
+// discipline, not something the type system enforces") -- requireQuarantineSchema
+// converts that discipline into an integrator-selectable hard guarantee. These
+// tests establish: (1) unset/false changes nothing about today's behavior,
+// (2) true rejects a schema-less call, audits it exactly like the sibling
+// rejection paths above, and fails CLOSED (no registry/watermark side effect),
+// (3) true still allows a call that DOES provide opts.schema.
+describe('requireQuarantineSchema (opt-in strict mode, GAPS.md #4)', () => {
+  it('unset (default): a schema-less summarize() call still succeeds exactly as it always has', async () => {
+    const broker = createBroker({ quarantineImpl: stubQuarantineImpl });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    const record = broker.registry.lookupExact(MALICIOUS_PAGE);
+    if (!record) throw new Error('setup failed: source not registered');
+    await expect(
+      broker.summarize(MALICIOUS_PAGE, { sessionId: 's', sourceTaintRecordId: record.id }),
+    ).resolves.toMatchObject({ level: 'DERIVED_UNTRUSTED', value: 'summary' });
+  });
+
+  it('explicit false: identical to unset -- a schema-less call still succeeds', async () => {
+    const broker = createBroker({
+      quarantineImpl: stubQuarantineImpl,
+      requireQuarantineSchema: false,
+    });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    const record = broker.registry.lookupExact(MALICIOUS_PAGE);
+    if (!record) throw new Error('setup failed: source not registered');
+    await expect(
+      broker.summarize(MALICIOUS_PAGE, { sessionId: 's', sourceTaintRecordId: record.id }),
+    ).resolves.toMatchObject({ level: 'DERIVED_UNTRUSTED', value: 'summary' });
+  });
+
+  it('true: rejects a schema-less call with QuarantineSchemaRequiredError and fails CLOSED -- nothing new registered, watermark untouched by this call', async () => {
+    const broker = createBroker({
+      quarantineImpl: stubQuarantineImpl,
+      requireQuarantineSchema: true,
+    });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    const record = broker.registry.lookupExact(MALICIOUS_PAGE);
+    if (!record) throw new Error('setup failed: source not registered');
+    const sizeBefore = broker.registry.size;
+    const levelBefore = broker.scope.watermark.level;
+
+    await expect(
+      broker.summarize(MALICIOUS_PAGE, { sessionId: 's', sourceTaintRecordId: record.id }),
+    ).rejects.toBeInstanceOf(QuarantineSchemaRequiredError);
+
+    // Not a partial success: no new DERIVED_UNTRUSTED record for the
+    // (never-run) quarantine output, and the watermark this call would have
+    // raised (to at least DERIVED_UNTRUSTED) never moved.
+    expect(broker.registry.size).toBe(sizeBefore);
+    expect(broker.registry.lookupExact('summary')).toBeUndefined();
+    expect(broker.scope.watermark.level).toBe(levelBefore);
+  });
+
+  it('true: audits the rejection as a BLOCK, matching the sibling rejection paths’ own trivial-taint-context shape', async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      quarantineImpl: stubQuarantineImpl,
+      requireQuarantineSchema: true,
+      auditSink: { record: (e) => events.push(e) },
+    });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    const record = broker.registry.lookupExact(MALICIOUS_PAGE);
+    if (!record) throw new Error('setup failed: source not registered');
+    events.length = 0; // drop the fetch_url source-call's own audit event; isolate summarize()'s
+
+    await expect(
+      broker.summarize(MALICIOUS_PAGE, { sessionId: 's', sourceTaintRecordId: record.id }),
+    ).rejects.toBeInstanceOf(QuarantineSchemaRequiredError);
+
+    expect(events).toHaveLength(1);
+    const event = events[0]!;
+    expect(event.verdict.action).toBe('BLOCK');
+    const reason = (event.verdict.action === 'BLOCK' && event.verdict.reason) || '';
+    expect(reason).toMatch(/requireQuarantineSchema/);
+    expect(event.executed).toBe(false);
+    expect(event.call.toolName).toBe('__tttb_summarize');
+    // Same "trivial taint context" shape recordTrivialAudit() gives the
+    // unknown-source-record rejection above -- nothing sink-related happened,
+    // only ambient scope state.
+    expect(event.taint.matchedRecords).toEqual([]);
+    expect(event.taint.argFingerprintFloor).toBe('CLEAN');
+    expect(event.taint.sinkClass).toBe('NONE');
+    expect(event.taint.hasUnattributedSubstantialContent).toBe(false);
+    expect(event.taint.scopeLevel).toBe('RAW_UNTRUSTED'); // fetch_url's own source call already raised the watermark
+    expect(event.taint.scopeId).toBe(broker.scope.id);
+  });
+
+  it('true: still allows a call that DOES provide opts.schema, unaffected', async () => {
+    const schema = { parse: (x: unknown) => String(x) };
+    const broker = createBroker({
+      quarantineImpl: stubQuarantineImpl,
+      requireQuarantineSchema: true,
+    });
+    broker.register(fetchUrl(MALICIOUS_PAGE));
+    await broker.call('fetch_url', {});
+    const record = broker.registry.lookupExact(MALICIOUS_PAGE);
+    if (!record) throw new Error('setup failed: source not registered');
+
+    const result = await broker.summarize(MALICIOUS_PAGE, {
+      sessionId: 's',
+      sourceTaintRecordId: record.id,
+      schema,
+    });
+    expect(result.level).toBe('DERIVED_UNTRUSTED');
+    expect(broker.registry.getById(result.taintRecordId)).toBeDefined();
+  });
+
+  it('true: the other summarize() rejection paths still take priority-independent effect — an unknown source record is still rejected as QuarantineInputUnknownError when opts.schema IS supplied', async () => {
+    const schema = { parse: (x: unknown) => String(x) };
+    const broker = createBroker({
+      quarantineImpl: stubQuarantineImpl,
+      requireQuarantineSchema: true,
+    });
+    await expect(
+      broker.summarize('text', { sessionId: 's', sourceTaintRecordId: 'unknown-id', schema }),
+    ).rejects.toBeInstanceOf(QuarantineInputUnknownError);
   });
 });
 

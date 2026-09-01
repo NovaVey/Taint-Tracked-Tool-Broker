@@ -122,6 +122,28 @@ export interface BrokerOptions {
   auditSink?: AuditSink;
   /** The capability-less LLM call used by broker.summarize(). No default — see quarantine.ts. */
   quarantineImpl?: QuarantineImpl;
+  /**
+   * Opt-in strict mode for GAPS.md #4: when `true`, `broker.summarize()`
+   * rejects any call whose `opts.schema` is omitted — throwing
+   * `QuarantineSchemaRequiredError`, with a matching `BLOCK` `AuditEvent` —
+   * instead of silently falling back to `opts.schema`'s own default
+   * (`S = string`, unconstrained free-text extraction). A narrow/enum/
+   * bounded schema is the actual safety property a quarantine extraction
+   * buys (it shrinks both the injection surface of the output and the
+   * value an operator has to trust); left unset, nothing stops a call site
+   * — this integrator's own, or a teammate's — from simply omitting it and
+   * getting free text back instead, which is exactly what GAPS.md #4
+   * describes as "a documented usage discipline, not something the type
+   * system enforces." This option is that enforcement, for an integrator
+   * who wants it. Mirrors `declarePlan()`'s plan-freeze strict mode
+   * (DESIGN.md §11) in spirit: additive on top of the default permissive
+   * behavior, never instead of it — a broker constructed without this
+   * option (the default) behaves exactly as it always has, including every
+   * OTHER `summarize()` rejection path (`QuarantineInputUnknownError`,
+   * `QuarantineInputMismatchError`), which this check runs before and
+   * cannot affect. Default `false`/unset.
+   */
+  requireQuarantineSchema?: boolean;
   registry?: TaintRegistry;
   /**
    * Restores a previously-exported `broker.scope.watermark` (e.g. from a
@@ -461,6 +483,7 @@ class Broker implements ToolCallBroker {
     readonly string[] | ((hostname: string) => boolean) | undefined;
   private readonly warnOnLikelyUnclassifiedSink: readonly string[] | undefined;
   private readonly warnOnLikelyDestinationKeysMismatch: boolean;
+  private readonly requireQuarantineSchema: boolean;
   private readonly tools = new Map<string, ToolExecutor>();
   private currentScope: TaintScope;
 
@@ -528,6 +551,7 @@ class Broker implements ToolCallBroker {
           ? undefined
           : opts.warnOnLikelyUnclassifiedSink;
     this.warnOnLikelyDestinationKeysMismatch = opts.warnOnLikelyDestinationKeysMismatch === true;
+    this.requireQuarantineSchema = opts.requireQuarantineSchema === true;
     this.registry = opts.registry ?? new InMemoryTaintRegistry();
     this.currentScope = createScope(this.resetScopeMode, this.sessionId);
     if (opts.initialWatermark) {
@@ -555,6 +579,7 @@ class Broker implements ToolCallBroker {
       raiseToDerivedUntrusted: (tag) => this.raiseWatermarkAndResetDecay('DERIVED_UNTRUSTED', tag),
       getScope: () => this.scopeSnapshot(this.currentScope),
       auditSink: this.auditSink,
+      requireQuarantineSchema: this.requireQuarantineSchema,
     });
     // GAPS.md #17: summarize() raises the watermark exactly like a source
     // call does, so it needs the same happens-before guarantee relative to

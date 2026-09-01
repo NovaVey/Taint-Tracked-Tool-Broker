@@ -27,7 +27,11 @@ import {
   shingleIntersectionSize,
   toRegistrableText,
 } from './taint/fingerprint.js';
-import { QuarantineInputMismatchError, QuarantineInputUnknownError } from './errors.js';
+import {
+  QuarantineInputMismatchError,
+  QuarantineInputUnknownError,
+  QuarantineSchemaRequiredError,
+} from './errors.js';
 import { recordTrivialAudit } from './internal-audit.js';
 
 // Two independent, asymmetric checks — text must be substantially DERIVED
@@ -68,10 +72,13 @@ export interface CreateQuarantineOpts {
   /** Also supplies `id` (the current `TaintScope.id`) for `TaintContext.scopeId` — see that field's own doc comment (types.ts). */
   getScope: () => { id: string; level: TaintLevel; privateDataSeen: boolean };
   auditSink: AuditSink;
+  /** Threaded straight from `BrokerOptions.requireQuarantineSchema` (default `false`) — see that field's own doc comment (broker.ts) and GAPS.md #4. */
+  requireQuarantineSchema?: boolean;
 }
 
 export function createQuarantine(config: CreateQuarantineOpts): QuarantineFn {
-  const { impl, registry, raiseToDerivedUntrusted, getScope, auditSink } = config;
+  const { impl, registry, raiseToDerivedUntrusted, getScope, auditSink, requireQuarantineSchema } =
+    config;
   return async function summarize<S = string>(
     text: string,
     opts: QuarantineOpts<S>,
@@ -92,6 +99,31 @@ export function createQuarantine(config: CreateQuarantineOpts): QuarantineFn {
       },
       sessionId: opts.sessionId,
     };
+
+    // Opt-in strict mode (GAPS.md #4, BrokerOptions.requireQuarantineSchema's
+    // own doc comment): checked first, before the input-provenance work
+    // below, since it's a pure call-shape/config check, independent of
+    // whether sourceTaintRecordId even names a real record. Fails exactly
+    // like the two rejection paths that follow it — audited as a BLOCK via
+    // the same trivial-taint-context helper, thrown before impl() is ever
+    // invoked and before anything reaches the registry, so a rejected call
+    // cannot partially succeed.
+    if (requireQuarantineSchema === true && opts.schema === undefined) {
+      recordTrivialAudit(
+        auditSink,
+        {
+          action: 'BLOCK',
+          reason:
+            'summarize() input omitted opts.schema, but this broker requires a narrowing ' +
+            'extraction schema on every quarantine call (BrokerOptions.requireQuarantineSchema) ' +
+            '— see GAPS.md #4, DESIGN.md §6.2.',
+        },
+        call,
+        getScope(),
+        false,
+      );
+      throw new QuarantineSchemaRequiredError();
+    }
 
     const sourceRecord = registry.getById(opts.sourceTaintRecordId);
     if (!sourceRecord) {
