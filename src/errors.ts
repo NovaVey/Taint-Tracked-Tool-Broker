@@ -103,6 +103,31 @@ export class QuarantineInputMismatchError extends TaintBrokerError {
 }
 
 /**
+ * Thrown by broker.summarize() when `BrokerOptions.requireQuarantineSchema`
+ * is enabled and the call omitted `opts.schema`. `opts.schema` is optional
+ * by default (defaulting to `S = string`, i.e. unconstrained free-text
+ * extraction) — GAPS.md #4 documents at length why a wide-open schema
+ * quietly reintroduces much of the risk the `DERIVED_UNTRUSTED` tier
+ * distinction exists to reduce; without this option that stays a
+ * documented usage discipline, not something the type system enforces.
+ * `requireQuarantineSchema: true` converts it into a hard guarantee: a
+ * schema-less call is rejected here, before the Q-LLM (`QuarantineImpl`)
+ * is ever invoked, rather than silently falling back to free text. See
+ * DESIGN.md §6.2, GAPS.md #4.
+ */
+export class QuarantineSchemaRequiredError extends TaintBrokerError {
+  constructor() {
+    super(
+      'summarize() was called with no opts.schema, but this broker was constructed with ' +
+        'requireQuarantineSchema: true. A schema-less call defaults to unconstrained free-text ' +
+        'extraction, which quietly reintroduces much of the risk the DERIVED_UNTRUSTED tier exists ' +
+        'to reduce — see GAPS.md #4, DESIGN.md §6.2. Pass a narrowing opts.schema to this summarize() call.',
+    );
+    this.name = 'QuarantineSchemaRequiredError';
+  }
+}
+
+/**
  * Thrown by register()/wrap() when a tool declares itself both a source of
  * untrusted content (isSource: true, not trusted) AND a privileged sink
  * (non-empty capabilities). Such a tool can read and act on untrusted

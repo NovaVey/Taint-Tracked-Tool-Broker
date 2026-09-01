@@ -116,6 +116,8 @@ export { diffProposedArgs } from './taint/counterfactual-diff.js';
 export type { ArgDiff } from './taint/counterfactual-diff.js';
 export { checkFieldGrounding } from './grounding.js';
 export type { CheckFieldGroundingOpts, FieldGroundingResult } from './grounding.js';
+export { createToolDescriptorGuard } from './tool-descriptor-guard.js';
+export type { ToolDescriptor } from './tool-descriptor-guard.js';
 export {
   createScope,
   createWatermark,
@@ -154,6 +156,7 @@ export {
   UnknownToolError,
   QuarantineInputMismatchError,
   QuarantineInputUnknownError,
+  QuarantineSchemaRequiredError,
   DualRoleToolError,
   ReentrantCallError,
   NonCloneableArgsError,
