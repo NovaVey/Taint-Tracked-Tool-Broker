@@ -4,6 +4,8 @@ All notable changes to this project are documented here. Format loosely follows 
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-01
+
 ### Added
 
 - **`createToolDescriptorGuard()` — the MCP tool-descriptor rug-pull guard promoted from example glue into a reusable, exported core-library capability** (`src/tool-descriptor-guard.ts`; `ToolDescriptor`/`createToolDescriptorGuard` re-exported from `src/index.ts`). `examples/mcp-integration.ts` and `examples/mcp-sdk-integration.ts` each used to define their own byte-for-byte-identical `createMcpDescriptionGuard()`/`checkDescriptions()` closure for GAPS.md #1's own canonical example — hashing a tool's description at each discovery call and calling `broker.markToolDescriptionExposure()` when it changes since last seen. That logic is now one tested, importable function both examples import instead of redefining, and it closes a real gap the description-only original had: it hashes a tool's FULL descriptor — `name`, `description`, AND its input/parameter JSON schema when present, via this library's own `exactHash()`/`toRegistrableText()` — not description text alone, since a schema is exactly as attacker-controlled as a description once you're talking to an MCP server. On a detected change it calls `broker.markToolDescriptionExposure()` — `ALLOW_WITH_WARNING` plus a taint raise, the same warn-and-taint shape every other advisory heuristic in this library already uses, never a hard deny. See GAPS.md #1's own new paragraph and DESIGN.md's matching implementation note for the full detail, including this guard's documented known limitations.
