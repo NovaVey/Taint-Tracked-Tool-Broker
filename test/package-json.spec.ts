@@ -14,6 +14,7 @@ const packageJsonPath = fileURLToPath(new URL('../package.json', import.meta.url
 const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as {
   version: string;
   files: string[];
+  bin?: Record<string, string>;
 };
 
 describe('package.json files allowlist', () => {
@@ -35,6 +36,19 @@ describe('package.json files allowlist', () => {
       expect(pkg.files).toContain(file);
     },
   );
+});
+
+describe("package.json bin entry (GAPS.md #30's `tttb doctor` CLI)", () => {
+  it('points "tttb" at a path under dist/ — the one directory `files` above already covers recursively', () => {
+    const tttbBin = pkg.bin?.tttb;
+    expect(tttbBin).toBeDefined();
+    // Not `startsWith('dist/')` — package.json conventionally (and this
+    // one, for main/types too) writes bin paths with a leading "./", and
+    // `files: ['dist', ...]` covers dist/cli/doctor.js either way; this
+    // just confirms the two haven't drifted (e.g. a rename that moved the
+    // CLI entry outside dist/ without updating `files`).
+    expect(tttbBin).toMatch(/^\.?\/?dist\//);
+  });
 });
 
 describe('package-lock.json stays in sync with package.json', () => {

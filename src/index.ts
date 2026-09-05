@@ -151,6 +151,14 @@ export type { DefineSourceOpts, DefineSinkOpts } from './define.js';
 
 export { formatAuditTrail, explainWatermark, AggregatingAuditSink } from './debug.js';
 
+export { checkToolCatalog, checkBrokerConfig, runDoctor, formatDoctorReport } from './doctor.js';
+export type {
+  DoctorSeverity,
+  DoctorFinding,
+  DoctorToolCatalogOpts,
+  DoctorBrokerConfig,
+} from './doctor.js';
+
 export {
   TaintBrokerError,
   ToolCallBlockedError,

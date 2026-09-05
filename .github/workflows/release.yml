@@ -70,6 +70,10 @@ jobs:
       # call through it, so a regression confined to tsc's emit can't
       # reach npm invisibly. See scripts/smoke-test-dist.mjs's header.
       - run: node scripts/smoke-test-dist.mjs
+      # Same rationale, applied to the SEPARATE shipped artifact `tttb doctor`
+      # is: dist/cli/doctor.js, package.json's "bin" entry. See
+      # scripts/smoke-test-doctor-cli.mjs's own header.
+      - run: node scripts/smoke-test-doctor-cli.mjs
       - run: npm test
       - run: npm run corpus
 

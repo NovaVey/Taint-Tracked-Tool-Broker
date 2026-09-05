@@ -16,6 +16,7 @@ Provenance labeling for agent inputs, enforced at the tool-call boundary. Blocks
 - [Quick start](#quick-start)
 - [Core model](#core-model)
 - [Examples](#examples)
+- [Doctor CLI](#doctor-cli)
 - [Observability](#observability)
 - [Injection corpus](#injection-corpus)
 - [Known gaps](#known-gaps)
@@ -208,6 +209,20 @@ Runnable, offline (no API key, no real network calls — everything is mocked ex
 The framework examples above don't depend on the real `langchain`/`ai`/`@openai/agents`/`mastra`/`genkit`/`llamaindex`/`@microsoft/semantic-kernel` packages — each uses a small structural stand-in for that framework's real tool-definition shape, since the integration point (a `name`/`description`/schema object with an async execute function) is what matters, not fidelity to a fast-moving package's exact current types. Every framework's real dispatch loop calls that function the same way once `broker.wrap()` has interposed it. `example:mcp-sdk` is the one exception: it depends on the real `@modelcontextprotocol/sdk` (a devDependency, not a runtime dependency of this library) to confirm the stand-in pattern used by `example:mcp` actually holds against the genuine SDK's current shapes.
 
 **AWS Bedrock Agents** isn't in the table above — its Action Group execution model (a Lambda/REST callout from AWS's own managed orchestrator, not an in-process function call) doesn't fit this shape, so a copy-paste mock would misrepresent the actual integration rather than simplify it. See [`docs/aws-bedrock-agents-pattern.md`](./docs/aws-bedrock-agents-pattern.md) for the correct pattern (wrapping inside the Lambda handler) and its one real limitation (watermark state does not survive a cold start without wiring in `serializeBrokerState()`/`restoreBrokerState()`, GAPS.md #12).
+
+## Doctor CLI
+
+`checkToolCatalog(tools)` / `checkBrokerConfig(config, tools)` / `runDoctor({ tools, brokerConfig })` (`src/doctor.ts`, exported from the package root; GAPS.md #30) are a CI-runnable preflight over a tool catalog and broker configuration — catching the same shapes an integrator would otherwise only discover the hard way, at runtime or in review:
+
+- **Two deterministic `register()`/`wrap()` rejections** — a dual-role tool (`isSource: true` plus a non-empty `capabilities` array) and a reserved `__tttb_`-prefixed name — flagged before a live broker ever sees the catalog.
+- **The same `warnOnLikelyUnclassifiedSink` keyword check** `docs/classifying-tools.md` already documents running as a manifest lint, packaged into one call.
+- **Config-inertness**: a missing `auditSink` (silent no-op, GAPS.md #25), a missing/unconfigured `quarantineImpl` (escalated to an error the moment a tool declares `mayCallSummarize: true`), `requireQuarantineSchema` left off (GAPS.md #4), and an `EXFIL`-capable tool with no `allowedOutboundHosts` configured (GAPS.md #18).
+
+```bash
+npx tttb doctor ./dist/my-tools-config.js   # a plain, already-built JS module exporting `tools`/`brokerConfig`
+```
+
+Calling `checkToolCatalog()`/`checkBrokerConfig()`/`runDoctor()` directly from your own CI test suite works identically and needs no CLI, no separate config module, and no build step — usually the more natural fit for a TypeScript-first integration. See `docs/classifying-tools.md`'s "A packaged `doctor` preflight" section and `src/cli/doctor.ts`'s own header for the CLI's exact config-module contract, and — same honesty bar as everything else in `docs/classifying-tools.md` — what this still cannot catch (a deliberately-deceptive tool, or one whose real behavior doesn't show up in its name).
 
 ## Observability
 
