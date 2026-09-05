@@ -258,6 +258,34 @@ export interface TaintScope {
 }
 
 /**
+ * `'enforce'` (the default) is every behavior this library has always had:
+ * a `BLOCK`/`REQUIRE_APPROVAL`(denied)/`QUARANTINE_AND_RETRY` verdict
+ * prevents the call, throwing `ToolCallBlockedError`. `'observe'` is the
+ * standard adoption ramp for a hot-path enforcement mechanism (CSP
+ * report-only, a WAF's detection mode, seccomp's audit mode): every call
+ * still runs `policy()` and still computes the exact same `PolicyDecision`
+ * it would under `'enforce'`, and the scope watermark, the Layer 2
+ * registry, and every `AuditEvent` are populated identically either way —
+ * but a `BLOCK`/`REQUIRE_APPROVAL`/`QUARANTINE_AND_RETRY` verdict no longer
+ * prevents the call. It executes anyway, audited with its TRUE,
+ * unmodified verdict (never silently rewritten to look like an `ALLOW`) and
+ * `AuditEvent.enforcement: 'observe'` on every event this library records
+ * — so an operator can measure, against real production traffic, both the
+ * blanket-gating friction GAPS.md #3 names as the core usability cost of
+ * this whole design AND whether a tool that should have been declared
+ * `isSource: true` was simply missed (GAPS.md #1's own most likely
+ * trigger) — before ever paying either cost for real. See
+ * `BrokerOptions.enforcement`'s own doc comment (`broker.ts`) for the full
+ * mechanism, the construction-time safeguard, and exactly what does NOT
+ * change under `'observe'` (plan-freeze, `allowedOutboundHosts`,
+ * `summarize()`'s own input-provenance checks — none of these are
+ * `policy()` verdicts, and none of them are affected by this setting at
+ * all), and GAPS.md #31 for the full gap this closes and its own named
+ * limits.
+ */
+export type EnforcementMode = 'enforce' | 'observe';
+
+/**
  * Whether `startNewTurn()` clears the watermark. 'session' (the default) never
  * clears until an explicit declassify(); 'turn' is a lower-friction opt-in
  * that trades soundness for usability — see GAPS.md #2 (cross-turn latent
@@ -723,6 +751,44 @@ export interface AuditEvent {
    * `at - requestedAt` when it is absent.
    */
   requestedAt?: number;
+
+  /**
+   * The broker's `BrokerOptions.enforcement` mode at the moment this event
+   * was recorded (GAPS.md #31) — `'enforce'` (the default) for every
+   * behavior this library has always had, or `'observe'` when a
+   * `BLOCK`/`REQUIRE_APPROVAL`/`QUARANTINE_AND_RETRY` `verdict` on this
+   * event did NOT actually prevent the call (see `EnforcementMode`'s own
+   * doc comment, above, for the full mechanism). Set on EVERY `AuditEvent`
+   * this library constructs — administrative events (`declassify()`,
+   * `startNewTurn()`, `markContextExposure()`) included, not just gated
+   * ones — via a single wrapping choke point at broker construction
+   * (`broker.ts`'s `withEnforcementMode()`, the identical "wrap the
+   * configured sink once, so a call site added later inherits it
+   * automatically" shape `redactAuditArgs` already uses), so no individual
+   * `auditSink.record()` call site has to remember to set it.
+   *
+   * A reader checking "was this call actually gated" should read this
+   * field alongside `verdict.action` and `executed`: `enforcement ===
+   * 'observe'` combined with a non-`ALLOW`/`ALLOW_WITH_WARNING` `verdict`
+   * and `executed: true` is the exact, unambiguous signature of "this call
+   * would have been prevented under `'enforce'`, but this broker let it
+   * through" — `src/debug.ts`'s `formatAuditTrail()` renders that specific
+   * combination with an explicit `[OBSERVE MODE: NOT ENFORCED]` marker
+   * rather than leaving a reader to reconstruct the combination by hand.
+   *
+   * **Optional, not required — deliberately, for API stability**, the
+   * identical `1.0.0` SemVer reasoning `requestedAt`/`scopeId`/
+   * `hasUnattributedSubstantialContent`/`sourceClasses` already give on
+   * this same interface: `AuditEvent` is the parameter to every
+   * `AuditSink.record()` call, so a NEW REQUIRED field here would be
+   * exactly the breaking shape change `1.0.0` rules out short of a major
+   * bump. This library itself always sets it explicitly on every event it
+   * constructs; a reader should treat `undefined` as "this event predates
+   * `enforcement` existing" (a hand-built fixture, or an `AuditEvent`
+   * restored from a durable log written before this field shipped), never
+   * as evidence either way about whether the call was actually gated.
+   */
+  enforcement?: EnforcementMode;
 }
 
 export interface AuditSink {
@@ -998,4 +1064,6 @@ export interface ToolCallBroker {
 
   readonly scope: Readonly<TaintScope>;
   readonly registry: TaintRegistry;
+  /** This broker's `BrokerOptions.enforcement` mode (`'enforce'` by default) — see `EnforcementMode`'s own doc comment and GAPS.md #31. Fixed for the life of the broker; not settable after construction. */
+  readonly enforcement: EnforcementMode;
 }

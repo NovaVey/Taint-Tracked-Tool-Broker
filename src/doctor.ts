@@ -42,7 +42,11 @@ import { unconfiguredQuarantineImpl } from './quarantine.js';
  */
 export type DoctorBrokerConfig = Pick<
   BrokerOptions,
-  'auditSink' | 'quarantineImpl' | 'requireQuarantineSchema' | 'allowedOutboundHosts'
+  | 'auditSink'
+  | 'quarantineImpl'
+  | 'requireQuarantineSchema'
+  | 'allowedOutboundHosts'
+  | 'enforcement'
 >;
 
 export type DoctorSeverity = 'info' | 'warning' | 'error';
@@ -163,9 +167,9 @@ export function checkToolCatalog(
 }
 
 /**
- * Checks a broker configuration for the four config-inertness shapes
- * GAPS.md #30 names — each one a way a broker can look fully configured
- * while quietly providing much less protection than it appears to:
+ * Checks a broker configuration for the config-inertness shapes GAPS.md
+ * #30/#31 name — each one a way a broker can look fully configured while
+ * quietly providing much less protection than it appears to:
  *
  * - **`'noop-audit-sink'` (warning)** — no `auditSink` configured.
  *   `createBroker()` still enforces every gate correctly (GAPS.md #25),
@@ -192,6 +196,18 @@ export function checkToolCatalog(
  *   egress — omitting it isn't a defense-in-depth loss, it can be a
  *   complete absence of that one check for every EXFIL call this catalog
  *   makes.
+ * - **`'observe-mode-active'` (warning)** — `config.enforcement ===
+ *   'observe'` (GAPS.md #31): this broker computes and audits every
+ *   verdict exactly as `'enforce'` would, but does not actually gate any
+ *   call — a `BLOCK`/`REQUIRE_APPROVAL`/`QUARANTINE_AND_RETRY` verdict
+ *   executes anyway. `createBroker()` itself already refuses to construct
+ *   an observe-mode broker with no `auditSink` at all
+ *   (`ObserveModeRequiresAuditSinkError`) — this finding is for the
+ *   subtler case: a config that DOES have a real `auditSink` (so it looks
+ *   fully protective in a review that only checks for that) but is still,
+ *   deliberately or by a stale leftover setting, non-enforcing. A `doctor`
+ *   run against a production config is exactly where that distinction
+ *   matters.
  */
 export function checkBrokerConfig(
   config: DoctorBrokerConfig,
@@ -251,6 +267,16 @@ export function checkBrokerConfig(
         'warning',
         'exfil-without-allowlist',
         `${exfilTools.length} EXFIL-capable tool(s) registered (${exfilTools.map((t) => t.name).join(', ')}) but allowedOutboundHosts is not configured — per GAPS.md #18, this allowlist is often the SOLE structural check between a CLEAN scope and a real, unapproved network egress. Consider createBroker({ allowedOutboundHosts }).`,
+      ),
+    );
+  }
+
+  if (config.enforcement === 'observe') {
+    findings.push(
+      finding(
+        'warning',
+        'observe-mode-active',
+        "enforcement is 'observe' — every BLOCK/REQUIRE_APPROVAL/QUARANTINE_AND_RETRY verdict is computed and audited but does NOT gate the call; it executes regardless (GAPS.md #31). This is the standard adoption ramp for measuring what enforcement: 'enforce' would have blocked before actually blocking it — confirm this is intentional for this deployment, not a leftover setting.",
       ),
     );
   }

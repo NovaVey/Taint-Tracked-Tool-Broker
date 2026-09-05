@@ -11,6 +11,7 @@ import type {
   ApprovalChannel,
   AuditSink,
   CallResult,
+  EnforcementMode,
   PlanState,
   PlanStep,
   PolicyDecision,
@@ -58,6 +59,7 @@ import {
   DisallowedOutboundHostError,
   DualRoleToolError,
   NonCloneableArgsError,
+  ObserveModeRequiresAuditSinkError,
   PlanNotDeclarableError,
   QuarantineSourceUnavailableError,
   ReentrantCallError,
@@ -102,6 +104,65 @@ export interface BrokerOptions {
    * choose deliberately. See DESIGN.md's implementation note and GAPS.md #2.
    */
   turnDecayWindow?: number;
+  /**
+   * `'enforce'` (the default) is every behavior this library has always
+   * had. `'observe'` (GAPS.md #31) is the standard adoption ramp for a
+   * hot-path enforcement mechanism — CSP report-only, a WAF's detection
+   * mode, seccomp's audit mode: every call still runs `policy()`, the
+   * scope watermark/Layer 2 registry/every `AuditEvent` are all populated
+   * EXACTLY as they would be under `'enforce'`, but a
+   * `BLOCK`/`REQUIRE_APPROVAL`/`QUARANTINE_AND_RETRY` verdict no longer
+   * prevents the call — it executes anyway, audited with its TRUE,
+   * unmodified verdict (`AuditEvent.enforcement: 'observe'` on every
+   * event). This exists so an operator can measure, against real
+   * production traffic, both GAPS.md #3's blanket-gating friction and
+   * GAPS.md #1's "forgot `isSource: true`" trigger BEFORE ever paying
+   * either cost for real — see `EnforcementMode`'s own doc comment
+   * (`types.ts`) for the full mechanism.
+   *
+   * **What this does NOT relax — deliberately, so this setting can never
+   * silently weaken a boundary that isn't a `policy()` verdict in the
+   * first place.** Plan-freeze (`declarePlan()`, §11) and the
+   * `allowedOutboundHosts` egress allowlist (§7.4) are both structural
+   * checks inside `gateDecision()` that run and reject BEFORE `policy()`
+   * is ever consulted — `UnplannedPrivilegedActionError`/
+   * `DisallowedOutboundHostError` are thrown exactly as they are under
+   * `'enforce'`, completely unaffected by this option. Likewise,
+   * `broker.summarize()`'s own input-provenance checks
+   * (`QuarantineInputMismatchError`/`QuarantineInputUnknownError`/
+   * `QuarantineSchemaRequiredError`) have no `sinkClass` to observe in the
+   * first place and are untouched. `allowedOutboundHosts`'s own doc
+   * comment already frames it as "a structural boundary... rather than
+   * another approval prompt a human could rubber-stamp" (GAPS.md #7) —
+   * this option respects that framing by construction rather than
+   * needing a special case to preserve it.
+   *
+   * **`REQUIRE_APPROVAL` never reaches a configured `approvalChannel` in
+   * observe mode.** Since the call proceeds regardless of the verdict,
+   * consulting a real approval channel would only produce a pointless
+   * human-facing notification (a Slack ping, an approval-queue entry) for
+   * something that already ran by the time anyone could act on it —
+   * `dispatchGated()` finalizes a `REQUIRE_APPROVAL` decision immediately,
+   * in the same lock hold as every other verdict, never entering the
+   * unlocked approval-wait phase `'enforce'` mode uses. `AuditEvent
+   * .requestedAt` is correspondingly never set for an observed
+   * `REQUIRE_APPROVAL` event — there genuinely was no wait.
+   *
+   * **Refuses to construct without a real `auditSink`** —
+   * `ObserveModeRequiresAuditSinkError` — since a broker that never gates
+   * AND has nowhere to record what it would have gated provides strictly
+   * negative value (silently permissive, zero visibility): see that
+   * error's own doc comment. A loud, impossible-to-miss administrative
+   * `AuditEvent` (`__tttb_observe_mode_warning`) is also recorded once, at
+   * construction, and `src/debug.ts`'s `formatAuditTrail()` marks every
+   * observed-but-not-enforced event explicitly rather than leaving it to
+   * look like an ordinary `ALLOW`. `docs`/`checkBrokerConfig()` (GAPS.md
+   * #30) also flags a broker config declaring this as a `'warning'`-level
+   * finding, so a `doctor` preflight run against a production config
+   * catches this before it ships too. Default `'enforce'`; a broker
+   * constructed without this option behaves exactly as it always has.
+   */
+  enforcement?: EnforcementMode;
   policy?: PolicyFn;
   /**
    * Consulted only for a `REQUIRE_APPROVAL` verdict (§7.2/§7.3); every
@@ -459,6 +520,25 @@ function withRedactedAuditArgs(
   };
 }
 
+/**
+ * Wraps `sink` so every `AuditEvent.enforcement` is stamped with `mode` —
+ * the single choke point `AuditEvent.enforcement`'s own doc comment
+ * (`types.ts`) describes, applied once at broker construction rather than
+ * threaded individually through each `auditSink.record()`/`recordTrivialAudit()`
+ * call site across this file/`internal-audit.ts`/`quarantine.ts` — the
+ * identical "wrap, don't thread" shape `withRedactedAuditArgs()` above
+ * already uses for `BrokerOptions.redactAuditArgs`. `event` itself is never
+ * mutated: a fresh event object is built around the stamped field, matching
+ * that function's own convention.
+ */
+function withEnforcementMode(sink: AuditSink, mode: EnforcementMode): AuditSink {
+  return {
+    record(event) {
+      sink.record({ ...event, enforcement: mode });
+    },
+  };
+}
+
 function blockedMessage(toolName: string, decision: { action: string; reason?: string }): string {
   const reason = decision.reason ?? 'no approval channel was configured to grant it';
   return `Tool call "${toolName}" was not executed (${decision.action}): ${reason}`;
@@ -475,6 +555,7 @@ class Broker implements ToolCallBroker {
   // only while the watermark is non-CLEAN. Inert (never read) in 'turn'/
   // 'session' mode.
   private turnsSinceExposure = 0;
+  readonly enforcement: EnforcementMode;
   private readonly policy: PolicyFn;
   private readonly approvalChannel: ApprovalChannel | undefined;
   private readonly auditSink: AuditSink;
@@ -530,9 +611,13 @@ class Broker implements ToolCallBroker {
     } else {
       this.turnDecayWindow = undefined;
     }
+    this.enforcement = opts.enforcement ?? 'enforce';
+    if (this.enforcement === 'observe' && opts.auditSink === undefined) {
+      throw new ObserveModeRequiresAuditSinkError();
+    }
     this.policy = opts.policy ?? defaultPolicy;
     this.approvalChannel = opts.approvalChannel;
-    const configuredAuditSink = opts.auditSink ?? NOOP_AUDIT;
+    const configuredAuditSink = withEnforcementMode(opts.auditSink ?? NOOP_AUDIT, this.enforcement);
     this.auditSink = opts.redactAuditArgs
       ? withRedactedAuditArgs(configuredAuditSink, opts.redactAuditArgs)
       : configuredAuditSink;
@@ -607,6 +692,39 @@ class Broker implements ToolCallBroker {
         ),
       );
     };
+
+    // GAPS.md #31: a loud, impossible-to-miss administrative AuditEvent the
+    // instant an observe-mode broker exists — reaches the SAME auditSink
+    // every other event does (already validated non-NOOP above), so
+    // whatever real sink an integrator configured sees this as literally
+    // its first line, before any real call is ever dispatched. Deliberately
+    // not a console.warn()/other side channel: this library never does I/O
+    // of its own outside AuditSink (see AuditSink's own doc comment,
+    // types.ts) — auditing is the one, consistent mechanism for "the
+    // library needs to tell you something," and this is no exception.
+    if (this.enforcement === 'observe') {
+      recordTrivialAudit(
+        this.auditSink,
+        {
+          action: 'ALLOW_WITH_WARNING',
+          reason:
+            "This broker was constructed with enforcement: 'observe' — BLOCK/REQUIRE_APPROVAL/" +
+            'QUARANTINE_AND_RETRY verdicts are computed and audited exactly as they would be under ' +
+            "'enforce', but do NOT gate calls: every privileged call proceeds regardless of its " +
+            "verdict. This is NOT protection — see GAPS.md #31, BrokerOptions.enforcement's own doc " +
+            'comment. Plan-freeze and allowedOutboundHosts (if configured) remain fully enforced ' +
+            'regardless of this setting.',
+        },
+        {
+          id: randomUUID(),
+          toolName: '__tttb_observe_mode_warning',
+          args: {},
+          sessionId: this.sessionId,
+        },
+        this.scopeSnapshot(this.currentScope),
+        true,
+      );
+    }
   }
 
   get scope(): Readonly<TaintScope> {
@@ -1253,7 +1371,16 @@ class Broker implements ToolCallBroker {
       decision.action === 'ALLOW_WITH_WARNING' ||
       (decision.action === 'REQUIRE_APPROVAL' && approvedByHuman);
 
-    if (provisionallyApproved) {
+    // GAPS.md #31: in 'observe' mode, EVERY decision proceeds to execute()
+    // regardless of its own verdict — the AUDITED verdict below is still
+    // the true, unmodified decision (revalidateBeforeExecute()'s own
+    // up-to-date recomputation included), never silently rewritten to look
+    // like an ALLOW. `this.enforcement` is a broker-wide constant, so this
+    // is checked once here rather than threaded as a parameter — every
+    // caller of finalizeGated() already runs on `this`.
+    const observing = this.enforcement === 'observe';
+
+    if (provisionallyApproved || observing) {
       const revalidated = await this.revalidateBeforeExecute(
         call,
         argsSnapshot,
@@ -1263,7 +1390,13 @@ class Broker implements ToolCallBroker {
       );
       auditTaint = revalidated.taint;
       auditDecision = revalidated.decision;
-      if (revalidated.proceed) {
+      // `|| observing`: revalidateBeforeExecute()'s own `proceed` reflects
+      // what 'enforce' mode would do with the (possibly re-decided) verdict
+      // — irrelevant here, since observe mode executes regardless. Still
+      // called unconditionally above so `auditTaint`/`auditDecision` reflect
+      // the CURRENT watermark at execution time, not a stale snapshot —
+      // exactly the same accuracy 'enforce' mode's own audit trail gets.
+      if (revalidated.proceed || observing) {
         // `executed` flips to true here, before execute() is even called —
         // matching AuditEvent.executed's own documented meaning ("the
         // underlying tool actually ran"), which is about whether policy let
@@ -1378,9 +1511,9 @@ class Broker implements ToolCallBroker {
    * of turn (this is a real regression this fix hit and reverted — see the
    * "gates correctly regardless of which call is listed first" test).
    *
-   * Only a REQUIRE_APPROVAL decision splits into three phases, so the
-   * (potentially human-timescale) approval wait does not hold the
-   * broker-wide lock for its full duration:
+   * Only a REQUIRE_APPROVAL decision under `'enforce'` mode splits into
+   * three phases, so the (potentially human-timescale) approval wait does
+   * not hold the broker-wide lock for its full duration:
    *   1. gateDecision() under the lock — reach a decision against the
    *      current watermark, atomically with respect to any concurrently-
    *      dispatched source call.
@@ -1393,6 +1526,13 @@ class Broker implements ToolCallBroker {
    *      executing, closing the race phase 2's unlocked window (and,
    *      independently, markContextExposure()'s always-unlocked nature)
    *      would otherwise open.
+   *
+   * `this.enforcement === 'observe'` (GAPS.md #31) skips phases 2/3 for a
+   * REQUIRE_APPROVAL decision too, folding it into phase 1's own immediate
+   * finalize — see that branch's own comment below for why: the call
+   * proceeds regardless of the verdict, so an unlocked wait on a real
+   * approvalChannel would only produce a pointless notification for
+   * something that already ran.
    */
   private async dispatchGated(
     tool: ToolExecutor,
@@ -1404,7 +1544,16 @@ class Broker implements ToolCallBroker {
       const { taint, decision } = await this.reentrancyGuard.run({ lockHeld: true }, () =>
         this.gateDecision(tool, call, argsSnapshot, sinkClass),
       );
-      if (decision.action !== 'REQUIRE_APPROVAL') {
+      // GAPS.md #31: 'observe' mode never enters the unlocked approval-wait
+      // phase below, REQUIRE_APPROVAL included — since the call proceeds
+      // regardless of the verdict, consulting a real approvalChannel would
+      // only produce a pointless human-facing notification for something
+      // that already ran by the time anyone could act on it. Every
+      // decision finalizes immediately, in this same lock hold, exactly
+      // like the non-REQUIRE_APPROVAL branch below already does —
+      // finalizeGated()'s own `observing` override (above) is what
+      // actually lets it proceed despite `approvedByHuman: false`.
+      if (decision.action !== 'REQUIRE_APPROVAL' || this.enforcement === 'observe') {
         const result = await this.reentrancyGuard.run({ lockHeld: true }, () =>
           this.finalizeGated(tool, call, argsSnapshot, sinkClass, taint, decision, false),
         );

@@ -371,6 +371,7 @@ describe('AggregatingAuditSink', () => {
       'requireApproval.latencyTotalMs': 0,
       'requireApproval.latencyAvgMs': 0,
       'quarantineAndRetry.offered': 0,
+      'observeMode.wouldHaveGated': 0,
     });
   });
 

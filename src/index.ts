@@ -37,6 +37,7 @@ export type {
   TaintWatermark,
   ScopeKind,
   TaintScope,
+  EnforcementMode,
   ResetScope,
   SinkClass,
   SinkCapability,
@@ -175,4 +176,5 @@ export {
   QuarantineSourceUnavailableError,
   DisallowedOutboundHostError,
   ArgsTooDeepError,
+  ObserveModeRequiresAuditSinkError,
 } from './errors.js';

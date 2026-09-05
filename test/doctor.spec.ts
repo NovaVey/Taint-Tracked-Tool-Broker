@@ -193,6 +193,20 @@ describe('checkBrokerConfig()', () => {
     ]);
     expect(findingsOfCode(findings, 'exfil-without-allowlist')).toHaveLength(0);
   });
+
+  it('flags enforcement: "observe" as a warning (GAPS.md #31)', () => {
+    const findings = checkBrokerConfig({ enforcement: 'observe' }, []);
+    const f = findingsOfCode(findings, 'observe-mode-active');
+    expect(f).toHaveLength(1);
+    expect(f[0]?.severity).toBe('warning');
+  });
+
+  it('does not flag observe-mode-active for the default enforcement', () => {
+    expect(findingsOfCode(checkBrokerConfig({}, []), 'observe-mode-active')).toHaveLength(0);
+    expect(
+      findingsOfCode(checkBrokerConfig({ enforcement: 'enforce' }, []), 'observe-mode-active'),
+    ).toHaveLength(0);
+  });
 });
 
 describe('runDoctor()', () => {
