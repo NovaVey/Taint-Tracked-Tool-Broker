@@ -122,6 +122,7 @@ export {
   createScope,
   createWatermark,
   declassifyScope,
+  deriveSourceClasses,
   markPrivateDataSeen,
   raiseWatermark,
 } from './taint/scope.js';

@@ -38,6 +38,7 @@ import { InMemoryTaintRegistry } from './taint/registry.js';
 import {
   createScope,
   declassifyScope,
+  deriveSourceClasses,
   markPrivateDataSeen,
   raiseWatermark,
 } from './taint/scope.js';
@@ -646,11 +647,13 @@ class Broker implements ToolCallBroker {
     id: string;
     level: TaintLevel;
     privateDataSeen: boolean;
+    sourceClasses: readonly string[];
   } {
     return {
       id: scope.id,
       level: scope.watermark.level,
       privateDataSeen: scope.watermark.privateDataSeen,
+      sourceClasses: deriveSourceClasses(scope.watermark.sources),
     };
   }
 
@@ -972,6 +975,7 @@ class Broker implements ToolCallBroker {
       sinkClass,
       hasUnattributedSubstantialContent,
       scopeId: this.currentScope.id,
+      sourceClasses: deriveSourceClasses(this.currentScope.watermark.sources),
     };
   }
 
@@ -1201,6 +1205,7 @@ class Broker implements ToolCallBroker {
       sinkClass,
       hasUnattributedSubstantialContent: false,
       scopeId: this.currentScope.id,
+      sourceClasses: deriveSourceClasses(this.currentScope.watermark.sources),
     };
     this.auditSink.record({
       verdict: { action: 'BLOCK', reason: error.message },
@@ -1519,7 +1524,7 @@ class Broker implements ToolCallBroker {
   }
 
   markContextExposure(
-    source: { toolName?: string; note: string; text?: string },
+    source: { toolName?: string; note: string; text?: string; sourceClass?: string },
     level: TaintLevel = 'RAW_UNTRUSTED',
   ): void {
     // Optional `text`: registers the actual exposed content into the Layer
@@ -1537,6 +1542,13 @@ class Broker implements ToolCallBroker {
       sessionId: this.sessionId,
       capturedAt: Date.now(),
       note: source.note,
+      // GAPS.md #28 — see ProvenanceTag.sourceClass's own doc comment
+      // (types.ts). Conditionally spread (rather than
+      // `sourceClass: source.sourceClass`) because exactOptionalPropertyTypes
+      // treats an explicit `sourceClass: undefined` as distinct from the key
+      // being absent, and this field is typed `string | undefined` on
+      // `source` but `string` (optional key) on ProvenanceTag.
+      ...(source.sourceClass !== undefined ? { sourceClass: source.sourceClass } : {}),
     };
     if (source.text !== undefined) {
       this.registry.register(source.text, provenance, level, NOT_SENSITIVE);
@@ -1568,23 +1580,31 @@ class Broker implements ToolCallBroker {
     toolName: string,
     description: string,
     level: TaintLevel = 'RAW_UNTRUSTED',
+    sourceClass?: string,
   ): void {
     this.markContextExposure(
       {
         toolName,
         note: `tool/plugin description exposure: "${toolName}"'s description was ingested (or changed) outside a tracked tool call — see GAPS.md #1.`,
         text: description,
+        ...(sourceClass !== undefined ? { sourceClass } : {}),
       },
       level,
     );
   }
 
-  markSystemPromptExposure(note: string, text?: string, level: TaintLevel = 'RAW_UNTRUSTED'): void {
+  markSystemPromptExposure(
+    note: string,
+    text?: string,
+    level: TaintLevel = 'RAW_UNTRUSTED',
+    sourceClass?: string,
+  ): void {
     this.markContextExposure(
       {
         toolName: 'system-prompt',
         note: `system-prompt exposure: ${note}`,
         ...(text !== undefined ? { text } : {}),
+        ...(sourceClass !== undefined ? { sourceClass } : {}),
       },
       level,
     );
@@ -1594,12 +1614,14 @@ class Broker implements ToolCallBroker {
     note: string,
     text?: string,
     level: TaintLevel = 'RAW_UNTRUSTED',
+    sourceClass?: string,
   ): void {
     this.markContextExposure(
       {
         toolName: 'pasted-content',
         note: `user-pasted content exposure: ${note}`,
         ...(text !== undefined ? { text } : {}),
+        ...(sourceClass !== undefined ? { sourceClass } : {}),
       },
       level,
     );
@@ -1645,6 +1667,13 @@ class Broker implements ToolCallBroker {
     const priorScopeId = this.currentScope.id;
     const priorLevel = this.currentScope.watermark.level;
     const priorPrivateDataSeen = this.currentScope.watermark.privateDataSeen;
+    // Captured as a reference, not copied: createScope() below replaces
+    // `this.currentScope` with a brand-new TaintScope object entirely — it
+    // never mutates the old one's `watermark.sources` array in place — so
+    // this reference stays valid and unaffected for deriveSourceClasses()
+    // to read from after the reassignment. Same GAPS.md #28 "describe what
+    // was cleared" convention as priorLevel/priorPrivateDataSeen above.
+    const priorSources = this.currentScope.watermark.sources;
     const hadPlan = this.plan !== undefined;
     this.currentScope = createScope(kind, randomUUID());
     this.plan = undefined;
@@ -1655,7 +1684,12 @@ class Broker implements ToolCallBroker {
         this.auditSink,
         { action: 'ALLOW_WITH_WARNING', reason: buildReason(priorLevel, hadPlan) },
         { id: randomUUID(), toolName: '__tttb_turn_reset', args: {}, sessionId: this.sessionId },
-        { id: priorScopeId, level: priorLevel, privateDataSeen: priorPrivateDataSeen },
+        {
+          id: priorScopeId,
+          level: priorLevel,
+          privateDataSeen: priorPrivateDataSeen,
+          sourceClasses: deriveSourceClasses(priorSources),
+        },
         true,
       );
     }
@@ -1698,6 +1732,11 @@ class Broker implements ToolCallBroker {
     // nothing) is the point of auditing this action at all.
     const priorLevel = this.currentScope.watermark.level;
     const priorPrivateDataSeen = this.currentScope.watermark.privateDataSeen;
+    // GAPS.md #28: declassifyScope() below reassigns `watermark.sources` to
+    // a fresh `[]` rather than mutating the existing array in place, so
+    // capturing this reference beforehand (not a copy) is enough — it stays
+    // valid, unaffected by that reassignment, for the audit call below.
+    const priorSources = this.currentScope.watermark.sources;
     // A declared plan (declarePlan(), §11) is a commitment tied to the
     // exposure episode it was made against — the SAME reasoning
     // clearScopeForTurnReset() (below) already applies to a turn-boundary
@@ -1737,7 +1776,12 @@ class Broker implements ToolCallBroker {
       // turn-boundary reset, the scope's `id` itself does not change here;
       // `this.currentScope.id` at this point is still the same id the
       // watermark being cleared belonged to.
-      { id: this.currentScope.id, level: priorLevel, privateDataSeen: priorPrivateDataSeen },
+      {
+        id: this.currentScope.id,
+        level: priorLevel,
+        privateDataSeen: priorPrivateDataSeen,
+        sourceClasses: deriveSourceClasses(priorSources),
+      },
       true,
     );
   }
@@ -1783,6 +1827,10 @@ class Broker implements ToolCallBroker {
         toolName: tool.name,
         sessionId: this.sessionId,
         capturedAt: Date.now(),
+        // GAPS.md #28 — see ToolExecutor.sourceClass's own doc comment
+        // (types.ts). Conditional spread for the same exactOptionalPropertyTypes
+        // reason markContextExposure()'s own provenance literal above uses.
+        ...(tool.sourceClass !== undefined ? { sourceClass: tool.sourceClass } : {}),
       };
       if (text !== undefined) {
         const sensitivity = capabilities.readsPrivateData

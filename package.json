@@ -74,6 +74,7 @@
     "example:grounding-check": "tsx examples/quarantine-grounding-check.ts",
     "example:audit-sqlite": "tsx examples/audit-sqlite.ts",
     "example:audit-prometheus": "tsx examples/audit-prometheus.ts",
+    "example:source-class-policy": "tsx examples/source-class-policy.ts",
     "bench": "tsx bench/args-clone.ts",
     "bench:minhash": "tsx bench/minhash-sketch-tradeoff.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",

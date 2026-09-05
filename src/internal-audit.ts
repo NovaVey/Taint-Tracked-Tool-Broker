@@ -60,12 +60,18 @@ export function isUntrustedSource(tool: Pick<ToolExecutor, 'isSource' | 'trusted
  * captured `dispatchScope`/prior-scope id for the two call sites that need
  * one other than the live current scope, or `getScope().id` from
  * quarantine.ts's own scope accessor), so there is no call site that would
- * have to fabricate one.
+ * have to fabricate one. `scope.sourceClasses` (GAPS.md #28) populates
+ * `TaintContext.sourceClasses` the same way — every caller already has it
+ * precomputed via `deriveSourceClasses()` (taint/scope.ts) alongside the id,
+ * since unlike `hasUnattributedSubstantialContent` it needs no real args
+ * scan to compute correctly, only whichever watermark's `sources` was in
+ * effect for this event.
  */
 export function trivialTaintContext(scope: {
   id: string;
   level: TaintLevel;
   privateDataSeen: boolean;
+  sourceClasses: readonly string[];
 }): TaintContext {
   return {
     matchedRecords: [],
@@ -75,6 +81,7 @@ export function trivialTaintContext(scope: {
     sinkClass: 'NONE',
     hasUnattributedSubstantialContent: false,
     scopeId: scope.id,
+    sourceClasses: scope.sourceClasses,
   };
 }
 
@@ -83,7 +90,12 @@ export function recordTrivialAudit(
   auditSink: AuditSink,
   verdict: PolicyDecision,
   call: ToolCall,
-  scope: { id: string; level: TaintLevel; privateDataSeen: boolean },
+  scope: {
+    id: string;
+    level: TaintLevel;
+    privateDataSeen: boolean;
+    sourceClasses: readonly string[];
+  },
   executed: boolean,
 ): void {
   auditSink.record({ verdict, call, taint: trivialTaintContext(scope), at: Date.now(), executed });
