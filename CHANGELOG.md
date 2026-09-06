@@ -4,6 +4,8 @@ All notable changes to this project are documented here. Format loosely follows 
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-06
+
 ### Added
 
 - **A model-based test for PROTOCOL.md §1.2/§1.3's own two load-bearing properties, `test/model-based-invariants.spec.ts`.** Uses `fast-check`'s model-based testing support (`fc.commands`/`fc.asyncModelRun`) to generate random SEQUENTIAL sequences of `call()`/`summarize()`/`startNewTurn()` (across all three `resetScope` modes)/`declassify()`/`serializeBrokerState()`+`restoreBrokerState()`, run one at a time against a real broker, and check the result against a small hand-written reference model after every single step — not a fixed expected outcome for a fixed sequence, full state equivalence for every randomly-generated one. This is the sequential counterpart to the existing `test/concurrency-stress.spec.ts` harness (which randomizes CONCURRENT interleaving instead) and covers a combination no existing test does: `serializeBrokerState()`/`restoreBrokerState()` interleaved with ordinary scope operations, including the `turn-decay` mode's own decay counter and its documented (and easy to silently regress) "not part of `SerializedBrokerState`, always restarts at 0 on restore" behavior. Deliberately does not exercise concurrency at all — see DESIGN.md §4.1's matching implementation note for exactly how this complements, rather than duplicates, the concurrency harness. Verified to actually catch a real regression: `taint/scope.ts`'s `raiseWatermark()` was temporarily made non-monotonic, and all three properties failed immediately on the same minimal two-command shrunk counterexample; the edit was reverted and the suite reconfirmed green.
