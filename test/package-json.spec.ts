@@ -26,6 +26,21 @@ describe('package.json files allowlist', () => {
     expect(pkg.files).toContain('examples');
   });
 
+  it('ships conformance/ (vectors.json — the machine-readable conformance vectors linked from README.md/PROTOCOL.md §6.1)', () => {
+    expect(pkg.files).toContain('conformance');
+  });
+
+  // PROTOCOL.md itself used to be missing from this exact list — the same
+  // "linked from the shipped README.md but not itself shipped" shape GAPS.md
+  // #10 already found and fixed once for docs/classifying-tools.md (see this
+  // file's own header comment above). README.md's "Language-neutral
+  // specification" section links to ./PROTOCOL.md by relative path; without
+  // it in `files`, that link dead-ended for anyone reading an installed (not
+  // cloned) copy of the package, even though README.md itself IS shipped.
+  it('ships PROTOCOL.md (the language-neutral specification linked from README.md)', () => {
+    expect(pkg.files).toContain('PROTOCOL.md');
+  });
+
   // README.md links to all three of these by relative path (./SECURITY.md,
   // ./CONTRIBUTING.md, ./CODE_OF_CONDUCT.md) — without them in `files`,
   // those links dead-end for anyone reading an installed (not cloned) copy

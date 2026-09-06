@@ -263,6 +263,8 @@ That covenant is about API shape only. Behavioral limitations — what the broke
 
 This is a TypeScript/Node-only library, but the underlying model — the taint lattice, the watermark semantics, the sink-class taxonomy, the default policy decision table, the sanctioned quarantine path, and the audit-event shape — is published separately as [`PROTOCOL.md`](./PROTOCOL.md), in pseudocode/tables/prose rather than TypeScript. It exists for anyone wanting to implement or evaluate this model in a different language or runtime (a Python port, for instance) without requiring this repository to become a second security-critical codebase in a second language: this project is small and solo-maintained (see [`SECURITY.md`](./SECURITY.md)), and a full cross-language port of a security-critical library was deliberately rejected in favor of a shared specification an independent implementation can build against. This TypeScript implementation is the reference implementation of that specification — see `PROTOCOL.md`'s own Conformance section.
 
+**[`conformance/vectors.json`](./conformance/vectors.json)** is that specification's executable counterpart — the same 22-case, 10-tool injection corpus `corpus/cases.ts`/`corpus/fixtures.ts` now LOAD from this plain JSON file (not a second, independently-maintained copy of it) as an ordered sequence of operations (register a tool, call it with arguments, start a new turn, declare a plan, summarize a piece of text) plus each case's expected verdict, final watermark level, and minimum Layer 2 attribution strength. Any language's own conformance runner can read it directly — no JavaScript/TypeScript toolchain, and no dependency on this repository's own test harness — turning "this implementation matches `PROTOCOL.md`" from a claim into something a second implementation can mechanically check itself against. `npm run corpus`/`npm test` running green is, definitionally, this reference implementation conforming to its own published vectors, not a separately-maintained claim that could silently drift from them.
+
 ## Development
 
 ```bash
@@ -272,7 +274,7 @@ npm test            # vitest (unit tests + the injection corpus)
 npm run corpus      # just the corpus, with a readable pass/fail table
 npm run coverage    # vitest --coverage, enforced against vitest.config.ts's thresholds in CI
 npm run lint        # eslint . — type-aware, enforced in CI
-npm run format      # prettier --write over src/test/corpus/examples/bench
+npm run format      # prettier --write over src/test/corpus/examples/bench/conformance
 npm run build       # emit dist/
 npm run bench       # structuredClone vs jsonSafeClone args-cloning benchmark
 npm run bench:minhash  # why fixed-size MinHash sketches were investigated and NOT shipped for the registry (DESIGN.md)

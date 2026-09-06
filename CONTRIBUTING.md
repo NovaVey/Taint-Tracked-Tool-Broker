@@ -27,7 +27,7 @@ npm test             # vitest — unit tests + the injection corpus
 npm run corpus       # just the corpus, with a readable pass/fail table
 npm run coverage     # vitest --coverage, enforced against vitest.config.ts's thresholds
 npm run lint         # eslint . — type-aware (typescript-eslint), enforced in CI
-npm run format       # prettier --write over src/test/corpus/examples/bench
+npm run format       # prettier --write over src/test/corpus/examples/bench/conformance
 npm run build        # emit dist/, exactly what CI and the release workflow run
 ```
 

@@ -499,3 +499,48 @@ not to the reference implementation's release cadence. A future revision
 that changes normative content (rather than only clarifying wording)
 SHOULD bump this document's version number and note what changed and why,
 the same way `CHANGELOG.md` already does for the code.
+
+### 6.1 Machine-readable conformance vectors
+
+`conformance/vectors.json` is this section's own claim made mechanically
+checkable rather than only prose-asserted. It carries the reference
+implementation's full 22-case injection corpus and its 10-tool fixture
+catalog as plain JSON: a `tools` array (each entry a declarative
+`ToolExecutor` shape — `name`, `capabilities`, `isSource`, `trusted`,
+`readsPrivateData` — with no executable code at all, since §5 already
+establishes that a conformant implementation's OWN sink/source taxonomy is
+what a tool's declared `capabilities`/`isSource` map onto, not anything
+this format needs to prescribe) and a `cases` array, each entry an ordered
+sequence of operations (register a source's exposure, call a sink with
+given arguments, cross a turn boundary, declare a plan, quarantine a piece
+of text under a named extraction-schema `kind`) paired with that sequence's
+expected final verdict, expected final watermark level, expected
+`privateDataSeen`, and — since §5 marks Layer 2 attribution as explicitly
+OPTIONAL — an expected MINIMUM attribution strength a Layer-2-equipped
+implementation's explanation should reach, never a requirement a
+Layer-0-only implementation must satisfy to be conformant.
+
+This is deliberately the reference implementation's OWN corpus,
+data-lifted rather than independently authored: `corpus/cases.ts` and
+`corpus/fixtures.ts` (the TypeScript files `npm test`/`npm run corpus`
+actually run) now LOAD this JSON file at runtime and convert it into their
+own internal shapes, rather than the JSON being a separate, hand-maintained
+export that could silently drift from what `npm test` actually exercises.
+Running this repository's own test suite green is, by construction, this
+implementation conforming to `vectors.json` — there is no second copy of
+the case data for the two to disagree about. A future independent
+implementation can read `vectors.json` directly (a plain JSON parser, no
+Node/TypeScript toolchain, and no dependency on this repository's own test
+harness) and mechanically check its own decision function's output against
+every case's `expected` block, rather than manually re-deriving each case
+from this document's prose or from reading `corpus/cases.ts`'s TypeScript
+by eye.
+
+The one JSON cannot express directly is the sanctioned quarantine path's
+extraction schema (§3, `QuarantineOpts.schema`) — genuinely a function in
+the reference implementation. `vectors.json` encodes it as a small, named
+`kind` descriptor instead (currently one kind exists,
+`'reviewed-with-length'`, meaning "produce `{status: 'reviewed',
+[lengthField]: input.length}`"); an implementation in any language
+reconstructs the equivalent transform from the kind name and its
+parameters, the same way this repository's own `corpus/cases.ts` does.

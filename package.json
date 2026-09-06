@@ -44,9 +44,11 @@
     "dist",
     "docs",
     "examples",
+    "conformance",
     "README.md",
     "DESIGN.md",
     "GAPS.md",
+    "PROTOCOL.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
     "SECURITY.md",
@@ -84,8 +86,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"corpus/**/*.ts\" \"examples/**/*.ts\" \"bench/**/*.ts\" \"*.{js,ts}\"",
-    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"corpus/**/*.ts\" \"examples/**/*.ts\" \"bench/**/*.ts\" \"*.{js,ts}\""
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"corpus/**/*.ts\" \"examples/**/*.ts\" \"bench/**/*.ts\" \"conformance/**/*.json\" \"*.{js,ts}\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"corpus/**/*.ts\" \"examples/**/*.ts\" \"bench/**/*.ts\" \"conformance/**/*.json\" \"*.{js,ts}\""
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
