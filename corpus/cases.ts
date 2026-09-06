@@ -1,14 +1,14 @@
 /**
  * The injection corpus: loaded from `conformance/vectors.json`, the
  * language-neutral behavioral spec `PROTOCOL.md` §6 names as authoritative
- * alongside this TypeScript reference implementation — twenty-two cases
- * across fifteen attack classes (the eleven canonical classes from the
+ * alongside this TypeScript reference implementation — twenty-three cases
+ * across sixteen attack classes (the eleven canonical classes from the
  * design panel's synthesis, plus plan-freeze-unplanned-privileged-action,
- * unapproved-egress-host, quarantine-provenance-spoof, and
- * quarantine-and-retry-offered, each added once the feature it exercises
- * shipped — see `vectors.json`'s own per-case `description`/`expected.notes`
- * fields for the full history each case used to carry as a hand-written
- * comment here).
+ * unapproved-egress-host, quarantine-provenance-spoof,
+ * quarantine-and-retry-offered, and cross-session-memory-laundering, each
+ * added once the feature it exercises shipped — see `vectors.json`'s own
+ * per-case `description`/`expected.notes` fields for the full history each
+ * case used to carry as a hand-written comment here).
  *
  * This module is now a thin loader/converter, not the source of the case
  * data itself: `vectors.json` is a plain JSON document any language's own
@@ -28,8 +28,9 @@
  * kind here, not a bespoke inline closure the way this file used to define
  * one per case.
  *
- * Two cases are TRUE, asserted known gaps (see GAPS.md #1 and #2) — the
- * corpus proves the library is honest about them, not that it catches them.
+ * Three cases are TRUE, asserted known gaps (see GAPS.md #1, #2, and #12) —
+ * the corpus proves the library is honest about them, not that it catches
+ * them.
  */
 
 import { readFileSync } from 'node:fs';
@@ -127,14 +128,14 @@ const vectorsPath = fileURLToPath(new URL('../conformance/vectors.json', import.
 const vectors = JSON.parse(readFileSync(vectorsPath, 'utf8')) as VectorsFile;
 
 /**
- * Case ids for the two TRUE, asserted known gaps (GAPS.md #1 and #2) — as
- * opposed to any case whose `expected.notes` merely happens to mention
- * "KNOWN GAP" in passing (e.g. "turn-decay-narrows-cross-turn-gap", which
- * narrows but does not close one of these same two gaps, and says so in its
- * own notes). This is the single source of truth both run-corpus.ts's
+ * Case ids for the three TRUE, asserted known gaps (GAPS.md #1, #2, and
+ * #12) — as opposed to any case whose `expected.notes` merely happens to
+ * mention "KNOWN GAP" in passing (e.g. "turn-decay-narrows-cross-turn-gap",
+ * which narrows but does not close one of these same gaps, and says so in
+ * its own notes). This is the single source of truth both run-corpus.ts's
  * summary line and test/corpus.spec.ts's "covers every documented true
  * known gap" test read from — loaded straight from `vectors.json.trueGapIds`
- * rather than hand-duplicated here, so a third true known gap added to the
+ * rather than hand-duplicated here, so a future true known gap added to the
  * JSON can't silently go unlisted in one copy while present in the other.
  */
 export const TRUE_GAP_IDS: readonly string[] = vectors.trueGapIds;

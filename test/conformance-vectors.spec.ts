@@ -63,9 +63,9 @@ describe('conformance/vectors.json — internal consistency', () => {
     expect(Array.isArray(vectors.cases)).toBe(true);
   });
 
-  it("has exactly 10 tools and 22 cases, matching README.md/DESIGN.md's own stated counts", () => {
-    expect(vectors.tools).toHaveLength(10);
-    expect(vectors.cases).toHaveLength(22);
+  it("has exactly 12 tools and 23 cases, matching README.md/DESIGN.md's own stated counts", () => {
+    expect(vectors.tools).toHaveLength(12);
+    expect(vectors.cases).toHaveLength(23);
   });
 
   it('every tool name is unique', () => {

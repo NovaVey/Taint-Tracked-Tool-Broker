@@ -311,6 +311,29 @@ export type SinkCapability =
   | 'write:fs'
   | 'write:external-account'
   | 'finance:purchase'
+  /**
+   * A write to the agent's own durable, cross-session memory (a vector
+   * store, a memory file, a scratchpad an orchestration layer re-injects
+   * into a future turn or session) — classed `MUTATE` like every other
+   * plain state-changing write, but categorically different from
+   * `write:fs`/`write:external-account` in what it's FOR: it is the
+   * mechanism by which content read THIS session becomes context in a
+   * FUTURE one, the exact channel GAPS.md #12 already names as having no
+   * *automatic* cross-session taint propagation. Declaring a memory-write
+   * tool under this capability (rather than leaving it unclassified —
+   * `NONE`, ungated — or lumping it under `write:fs`/`irreversible:other`,
+   * where its cross-session significance is invisible to anyone reading
+   * the declaration) at least makes the WRITE itself gated exactly like
+   * any other `MUTATE` sink; it does nothing for the READ side of the
+   * round trip — a later tool that reads this same memory store back is a
+   * completely separate declaration, and unless THAT tool is also marked
+   * `isSource: true`, content it returns re-enters the model's context
+   * with no taint at all, regardless of how carefully the original write
+   * was classified or gated. See GAPS.md #12's own paragraph on this
+   * capability and the `agent-memory-cross-session-laundering` corpus
+   * case (a TRUE, asserted known gap) for the concrete demonstration.
+   */
+  | 'write:agent-memory'
   | 'irreversible:other'
   | 'net:outbound'
   | 'net:email'
@@ -323,6 +346,7 @@ const CAPABILITY_TO_CLASS: Record<SinkCapability, SinkClass> = {
   'write:fs': 'MUTATE',
   'write:external-account': 'MUTATE',
   'finance:purchase': 'MUTATE',
+  'write:agent-memory': 'MUTATE',
   'irreversible:other': 'MUTATE',
   'net:outbound': 'EXFIL',
   'net:email': 'EXFIL',
@@ -347,6 +371,48 @@ export interface SinkCapabilities {
   /** Empty ⇒ sinkClass NONE — the tool is not policy-gated at all. */
   capabilities: SinkCapability[];
   readsPrivateData?: { categories: string[] } | false;
+  /**
+   * Free-form-in-spirit but deliberately typed as a plain boolean (unlike
+   * `sourceClass`'s open vocabulary): does undoing this call's real-world
+   * effect require anything beyond calling this same tool again with
+   * opposite arguments? `true` for an irreversible payment
+   * (`finance:purchase`), a sent email (`net:email`) or webhook post that
+   * cannot be unsent, a destructive `write:fs` delete; `false`/unset for a
+   * `write:fs` write to a value you could overwrite back, an idempotent
+   * `net:api-call` GET-shaped read-through-a-mutation-looking-tool, or
+   * anything else undoing itself with a follow-up call of the same shape.
+   *
+   * **The gap this narrows (GAPS.md #32):** `CLASS_SEVERITY`
+   * (`SinkClass`'s own severity ranking, above — `EXEC` > `EXFIL` >
+   * `MUTATE`) is doing double duty as both "what KIND of side effect is
+   * this" and "how BAD would it be" on a single ordered axis, and those two
+   * questions do not actually correlate: an irreversible `finance:purchase`
+   * (`MUTATE`, severity 1) is gated identically to a fully reversible
+   * `write:fs` scratch-file write, and — at `DERIVED_UNTRUSTED` with no
+   * private data seen — BOTH land on `defaultPolicy`'s permissive
+   * `ALLOW_WITH_WARNING` cell (`policy/default-policy.ts`'s `MATRIX`),
+   * identically to how a genuinely reversible `net:api-call` (`EXFIL`,
+   * severity 2, same cell) is treated. This field is the SAME "integrator
+   * declares, library enforces" split GAPS.md #10/#28 already apply
+   * elsewhere, applied one level down from GAPS.md #28's source-*class*
+   * axis: an ORTHOGONAL boolean, not a fifth `SinkClass` or a change to
+   * `CLASS_SEVERITY`'s ordering, surfaced on `TaintContext.sinkIrreversible`
+   * (see that field's own doc comment) for a custom `PolicyFn` to read.
+   *
+   * **`defaultPolicy` deliberately never reads this field** — exactly like
+   * `sourceClass`/`sourceClasses` (GAPS.md #28): this library ships the
+   * plumbing (the declaration, the derivation onto `TaintContext`), never
+   * an opinion on how much MORE friction an irreversible sink should get
+   * relative to `defaultPolicy`'s own class-and-level table. A custom
+   * `PolicyFn` that wants to, say, upgrade an otherwise-`ALLOW_WITH_WARNING`
+   * verdict to `REQUIRE_APPROVAL` whenever `taint.sinkIrreversible` is
+   * `true` is free to do so — see `examples/irreversible-sink-policy.ts`
+   * for a worked pattern. Optional and unset by default (treated
+   * identically to `false` everywhere this library reads it): a tool
+   * declaring no `irreversible` behaves exactly as it did before this field
+   * existed.
+   */
+  irreversible?: boolean;
 }
 
 export interface ToolExecutor<A = unknown, R = unknown> {
@@ -463,6 +529,59 @@ export interface ToolExecutor<A = unknown, R = unknown> {
    * all.
    */
   destinationKeys?: readonly string[];
+  /**
+   * Optional escape valve for GAPS.md #33: `toRegistrableText()`
+   * (`taint/fingerprint.ts`) — the fallback this library uses when
+   * `extractText` is not declared — only knows how to turn a result into
+   * registrable text two ways: pass a string through unchanged, or
+   * `JSON.stringify()` anything else. Neither produces anything
+   * MATCHABLE for a source tool whose successful result is an image (a
+   * screenshot, a scanned document page, a rendered chart), audio, or any
+   * other binary/non-text payload — a base64 blob or a stringified opaque
+   * object registers into the Layer 2 fingerprint registry, but no future
+   * exact/fuzzy lookup will ever meaningfully match against it, since
+   * nothing about that string relates to the result's actual semantic
+   * content the way registrable text from an HTML page or a JSON API
+   * response does.
+   *
+   * **This is a Layer 2 (attribution/explainability) gap only — Layer 0
+   * (the scope watermark) is completely unaffected either way.**
+   * `applyPostExecutionEffects()` (`broker.ts`) always raises the
+   * watermark for an untrusted source's result regardless of what this
+   * hook returns, throws, or whether it's declared at all — the load-
+   * bearing safety gate has never depended on registrability, exactly the
+   * same "Layer 2 best-effort, never gating" split `toRegistrableText()`
+   * throwing on a circular object already relies on (see
+   * `applyPostExecutionEffects()`'s own doc comment). What's lost without
+   * this field, for a non-text source, is purely the ABILITY to later
+   * explain "this argument literally contains text from source X" — the
+   * scope still gates that content exactly as strictly either way.
+   *
+   * Declared per source tool, like `isSource`/`trusted`/`sourceClass`
+   * above: `(result: R) => string | undefined`, called with the tool's
+   * raw `execute()` result the instant it succeeds, BEFORE
+   * `toRegistrableText()` would otherwise run — an integrator with OCR
+   * output, an image's alt-text, a transcript, or any other textual
+   * proxy for a non-text result's actual content feeds it here instead of
+   * letting the result fall through to a useless stringified blob.
+   * Returning `undefined` (as opposed to not declaring this field at all)
+   * means "no registrable text for THIS PARTICULAR result" — e.g. OCR
+   * found no text in this specific screenshot — and skips registration
+   * for that one call the same honest way a `toRegistrableText()` failure
+   * already does, without falling back to the fallback (a declared
+   * `extractText` that returns `undefined` or throws does NOT cause this
+   * library to then try `toRegistrableText()` on the raw result as a
+   * second attempt — that would silently reintroduce the exact
+   * unmatchable-blob problem this field exists to let an integrator opt
+   * out of).
+   *
+   * Optional and unset by default: a source tool declaring no
+   * `extractText` behaves exactly as it did before this field existed —
+   * `toRegistrableText()` runs unchanged. Ignored for a tool that isn't
+   * an untrusted source at all (`trusted: true`, or not `isSource: true`
+   * in the first place) — there is no registration event to feed it into.
+   */
+  extractText?(result: R): string | undefined;
   execute(args: A): Promise<R>;
 }
 
@@ -485,6 +604,45 @@ export interface TaintContext {
   argFingerprintFloor: TaintLevel;
   privateDataSeen: boolean;
   sinkClass: SinkClass;
+  /**
+   * The registered tool's own declared `SinkCapabilities.irreversible` for
+   * THIS call (see that field's own doc comment, above, for the full
+   * GAPS.md #32 motivation: `SinkClass`'s `CLASS_SEVERITY` ranking conflates
+   * "what kind of side effect" with "how bad is it," so an irreversible
+   * `finance:purchase` and a fully reversible `write:fs` scratch write are
+   * gated identically today). Populated at every real `TaintContext`
+   * construction site that has an actual registered tool to read it from —
+   * the live gating path (`buildTaintContext()`, `broker.ts`) and the
+   * `ArgsTooDeepError` audit path (`auditArgsTooDeep()`) — as
+   * `tool.capabilities.irreversible === true`, never left `undefined` for
+   * those. Administrative, `sinkClass: 'NONE'` events
+   * (`internal-audit.ts`'s `trivialTaintContext()`, `quarantine.ts`'s own
+   * audit records) have no real sink to ask and correctly leave this
+   * `undefined` — there is no "this call's own irreversibility" for an
+   * event that isn't a sink call at all, the same reasoning `sinkClass:
+   * 'NONE'` itself already encodes for those sites.
+   *
+   * **`defaultPolicy` deliberately never reads this field** — the identical
+   * "integrator declares, library enforces" split GAPS.md #10/#28 already
+   * apply to `sourceClass`/`sourceClasses`/`destinationKeys`: this library
+   * ships the signal, never an opinion on how much additional friction an
+   * irreversible sink should get beyond `defaultPolicy`'s own class-and-level
+   * table. See `SinkCapabilities.irreversible`'s own doc comment for the
+   * full rationale and `examples/irreversible-sink-policy.ts` for a worked
+   * `PolicyFn` that reads it.
+   *
+   * **Optional, not required — deliberately, for API stability**, the
+   * identical `1.0.0` SemVer reasoning every other field added to this
+   * interface post-`1.0.0` already gives (`hasUnattributedSubstantialContent`/
+   * `scopeId`/`sourceClasses`, below): a `TaintContext` literal written
+   * before this field existed — plausibly a hand-built fixture in a custom
+   * `PolicyFn`'s own test suite — still type-checks unchanged. A reader
+   * should treat `undefined` here as "unknown/not applicable for this
+   * event" (an administrative event, or a `TaintContext` predating this
+   * field), never the same as `false` — unlike `SinkCapabilities
+   * .irreversible` itself, where unset IS treated as `false`.
+   */
+  sinkIrreversible?: boolean;
   /**
    * Mirrors `taint/scan.ts`'s `ScanResult.hasUnattributedSubstantialContent`
    * — see that field's own doc comment for the exact bar (a string leaf of
