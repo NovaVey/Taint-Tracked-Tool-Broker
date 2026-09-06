@@ -505,6 +505,59 @@ export interface ToolExecutor<A = unknown, R = unknown> {
    * all.
    */
   destinationKeys?: readonly string[];
+  /**
+   * Optional escape valve for GAPS.md #33: `toRegistrableText()`
+   * (`taint/fingerprint.ts`) — the fallback this library uses when
+   * `extractText` is not declared — only knows how to turn a result into
+   * registrable text two ways: pass a string through unchanged, or
+   * `JSON.stringify()` anything else. Neither produces anything
+   * MATCHABLE for a source tool whose successful result is an image (a
+   * screenshot, a scanned document page, a rendered chart), audio, or any
+   * other binary/non-text payload — a base64 blob or a stringified opaque
+   * object registers into the Layer 2 fingerprint registry, but no future
+   * exact/fuzzy lookup will ever meaningfully match against it, since
+   * nothing about that string relates to the result's actual semantic
+   * content the way registrable text from an HTML page or a JSON API
+   * response does.
+   *
+   * **This is a Layer 2 (attribution/explainability) gap only — Layer 0
+   * (the scope watermark) is completely unaffected either way.**
+   * `applyPostExecutionEffects()` (`broker.ts`) always raises the
+   * watermark for an untrusted source's result regardless of what this
+   * hook returns, throws, or whether it's declared at all — the load-
+   * bearing safety gate has never depended on registrability, exactly the
+   * same "Layer 2 best-effort, never gating" split `toRegistrableText()`
+   * throwing on a circular object already relies on (see
+   * `applyPostExecutionEffects()`'s own doc comment). What's lost without
+   * this field, for a non-text source, is purely the ABILITY to later
+   * explain "this argument literally contains text from source X" — the
+   * scope still gates that content exactly as strictly either way.
+   *
+   * Declared per source tool, like `isSource`/`trusted`/`sourceClass`
+   * above: `(result: R) => string | undefined`, called with the tool's
+   * raw `execute()` result the instant it succeeds, BEFORE
+   * `toRegistrableText()` would otherwise run — an integrator with OCR
+   * output, an image's alt-text, a transcript, or any other textual
+   * proxy for a non-text result's actual content feeds it here instead of
+   * letting the result fall through to a useless stringified blob.
+   * Returning `undefined` (as opposed to not declaring this field at all)
+   * means "no registrable text for THIS PARTICULAR result" — e.g. OCR
+   * found no text in this specific screenshot — and skips registration
+   * for that one call the same honest way a `toRegistrableText()` failure
+   * already does, without falling back to the fallback (a declared
+   * `extractText` that returns `undefined` or throws does NOT cause this
+   * library to then try `toRegistrableText()` on the raw result as a
+   * second attempt — that would silently reintroduce the exact
+   * unmatchable-blob problem this field exists to let an integrator opt
+   * out of).
+   *
+   * Optional and unset by default: a source tool declaring no
+   * `extractText` behaves exactly as it did before this field existed —
+   * `toRegistrableText()` runs unchanged. Ignored for a tool that isn't
+   * an untrusted source at all (`trusted: true`, or not `isSource: true`
+   * in the first place) — there is no registration event to feed it into.
+   */
+  extractText?(result: R): string | undefined;
   execute(args: A): Promise<R>;
 }
 

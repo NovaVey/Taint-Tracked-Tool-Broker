@@ -1978,9 +1978,20 @@ class Broker implements ToolCallBroker {
       // suppress the raise it would otherwise gate. structuredClone (used
       // to snapshot args elsewhere) tolerates cycles; JSON.stringify does
       // not, so this is a real, reachable gap, not just a theoretical one.
+      //
+      // GAPS.md #33: a declared tool.extractText() (types.ts's own doc
+      // comment has the full motivation — a non-text result, e.g. an
+      // image, otherwise registers an unmatchable base64/stringified
+      // blob) takes over ENTIRELY in place of toRegistrableText() — never
+      // as a first attempt this library falls back FROM on failure/undefined,
+      // which would silently reintroduce the exact problem the hook exists
+      // to opt out of. Same best-effort, never-load-bearing discipline
+      // either way: a throwing or undefined-returning extractText() simply
+      // skips registration for this call, identically to a
+      // toRegistrableText() failure.
       let text: string | undefined;
       try {
-        text = toRegistrableText(result);
+        text = tool.extractText ? tool.extractText(result) : toRegistrableText(result);
       } catch {
         text = undefined;
       }
