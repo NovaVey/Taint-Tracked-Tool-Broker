@@ -112,7 +112,7 @@ async function main(): Promise<void> {
     `Counterfactual baseline: of ${attackPairs.length} non-benign case(s), ${wouldHaveRun} sink call(s) would have executed unprotected (no broker mediating the call at all). ` +
       `Protected, the broker prevented ${prevented} (BLOCK, REQUIRE_APPROVAL with no human present, or QUARANTINE_AND_RETRY — see schema.ts); ` +
       `${sanctionedAllowed} went through as the sanctioned quarantine path's expected ALLOW_WITH_WARNING (not an attack payload by the time it reached the sink — see "summarize-then-act-write-file"); ` +
-      `${trueGapsAllowed} are the documented true known gaps (GAPS.md #1/#2) where protection provides none.`,
+      `${trueGapsAllowed} are the documented true known gaps (GAPS.md #1/#2/#12) where protection provides none.`,
   );
 
   if (failures > 0) process.exitCode = 1;

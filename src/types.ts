@@ -311,6 +311,29 @@ export type SinkCapability =
   | 'write:fs'
   | 'write:external-account'
   | 'finance:purchase'
+  /**
+   * A write to the agent's own durable, cross-session memory (a vector
+   * store, a memory file, a scratchpad an orchestration layer re-injects
+   * into a future turn or session) — classed `MUTATE` like every other
+   * plain state-changing write, but categorically different from
+   * `write:fs`/`write:external-account` in what it's FOR: it is the
+   * mechanism by which content read THIS session becomes context in a
+   * FUTURE one, the exact channel GAPS.md #12 already names as having no
+   * *automatic* cross-session taint propagation. Declaring a memory-write
+   * tool under this capability (rather than leaving it unclassified —
+   * `NONE`, ungated — or lumping it under `write:fs`/`irreversible:other`,
+   * where its cross-session significance is invisible to anyone reading
+   * the declaration) at least makes the WRITE itself gated exactly like
+   * any other `MUTATE` sink; it does nothing for the READ side of the
+   * round trip — a later tool that reads this same memory store back is a
+   * completely separate declaration, and unless THAT tool is also marked
+   * `isSource: true`, content it returns re-enters the model's context
+   * with no taint at all, regardless of how carefully the original write
+   * was classified or gated. See GAPS.md #12's own paragraph on this
+   * capability and the `agent-memory-cross-session-laundering` corpus
+   * case (a TRUE, asserted known gap) for the concrete demonstration.
+   */
+  | 'write:agent-memory'
   | 'irreversible:other'
   | 'net:outbound'
   | 'net:email'
@@ -323,6 +346,7 @@ const CAPABILITY_TO_CLASS: Record<SinkCapability, SinkClass> = {
   'write:fs': 'MUTATE',
   'write:external-account': 'MUTATE',
   'finance:purchase': 'MUTATE',
+  'write:agent-memory': 'MUTATE',
   'irreversible:other': 'MUTATE',
   'net:outbound': 'EXFIL',
   'net:email': 'EXFIL',
