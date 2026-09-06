@@ -504,7 +504,7 @@ the same way `CHANGELOG.md` already does for the code.
 
 `conformance/vectors.json` is this section's own claim made mechanically
 checkable rather than only prose-asserted. It carries the reference
-implementation's full 22-case injection corpus and its 10-tool fixture
+implementation's full 23-case injection corpus and its 12-tool fixture
 catalog as plain JSON: a `tools` array (each entry a declarative
 `ToolExecutor` shape — `name`, `capabilities`, `isSource`, `trusted`,
 `readsPrivateData` — with no executable code at all, since §5 already
