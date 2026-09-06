@@ -1079,8 +1079,12 @@ class Broker implements ToolCallBroker {
     return this.dispatchGated(tool, call, argsSnapshot, sinkClass);
   }
 
-  /** Builds a fresh TaintContext from the CURRENT watermark — the same shape captured once at the top of the (former) gated dispatch path, now re-derivable on demand so it can be recomputed after an async gap. */
-  private buildTaintContext(argsSnapshot: unknown, sinkClass: SinkClass): TaintContext {
+  /** Builds a fresh TaintContext from the CURRENT watermark — the same shape captured once at the top of the (former) gated dispatch path, now re-derivable on demand so it can be recomputed after an async gap. `tool` is the registered tool this call is against — GAPS.md #32's `sinkIrreversible` reads its own `capabilities.irreversible` declaration directly from it, the same way `sinkClass` is itself derived from the same tool's capabilities one level up in dispatch(). */
+  private buildTaintContext(
+    argsSnapshot: unknown,
+    sinkClass: SinkClass,
+    tool: ToolExecutor,
+  ): TaintContext {
     const { matches, floor, hasUnattributedSubstantialContent } = scanArgsForTaint(
       argsSnapshot,
       this.registry,
@@ -1091,6 +1095,7 @@ class Broker implements ToolCallBroker {
       argFingerprintFloor: floor,
       privateDataSeen: this.currentScope.watermark.privateDataSeen,
       sinkClass,
+      sinkIrreversible: tool.capabilities.irreversible === true,
       hasUnattributedSubstantialContent,
       scopeId: this.currentScope.id,
       sourceClasses: deriveSourceClasses(this.currentScope.watermark.sources),
@@ -1125,6 +1130,7 @@ class Broker implements ToolCallBroker {
    * approved rather than looping.
    */
   private async revalidateBeforeExecute(
+    tool: ToolExecutor,
     call: ToolCall,
     argsSnapshot: unknown,
     sinkClass: SinkClass,
@@ -1141,7 +1147,7 @@ class Broker implements ToolCallBroker {
     // (unchanged) argsSnapshot, so it cannot throw here having already
     // succeeded there. dispatchGated() would never have reached this far
     // otherwise.
-    const freshTaint = this.buildTaintContext(argsSnapshot, sinkClass);
+    const freshTaint = this.buildTaintContext(argsSnapshot, sinkClass, tool);
     const freshDecision = await this.policy(call, freshTaint);
     const proceed =
       freshDecision.action === 'ALLOW' || freshDecision.action === 'ALLOW_WITH_WARNING';
@@ -1158,9 +1164,9 @@ class Broker implements ToolCallBroker {
     const toolName = call.toolName;
     let taint: TaintContext;
     try {
-      taint = this.buildTaintContext(argsSnapshot, sinkClass);
+      taint = this.buildTaintContext(argsSnapshot, sinkClass, tool);
     } catch (error) {
-      if (error instanceof ArgsTooDeepError) this.auditArgsTooDeep(call, sinkClass, error);
+      if (error instanceof ArgsTooDeepError) this.auditArgsTooDeep(call, sinkClass, error, tool);
       throw error;
     }
 
@@ -1234,7 +1240,7 @@ class Broker implements ToolCallBroker {
             : undefined,
         );
       } catch (error) {
-        if (error instanceof ArgsTooDeepError) this.auditArgsTooDeep(call, sinkClass, error);
+        if (error instanceof ArgsTooDeepError) this.auditArgsTooDeep(call, sinkClass, error, tool);
         throw error;
       }
       const disallowedHosts = hosts.filter((host) => !isAllowedOutboundHost(host, allowlist));
@@ -1279,7 +1285,8 @@ class Broker implements ToolCallBroker {
           // buildTaintContext()/findOutboundHosts() calls throw first.
           outOfScope = findOutboundDestinationsOutsideKeys(argsSnapshot, tool.destinationKeys);
         } catch (error) {
-          if (error instanceof ArgsTooDeepError) this.auditArgsTooDeep(call, sinkClass, error);
+          if (error instanceof ArgsTooDeepError)
+            this.auditArgsTooDeep(call, sinkClass, error, tool);
           throw error;
         }
         if (outOfScope.length > 0) {
@@ -1314,13 +1321,19 @@ class Broker implements ToolCallBroker {
    * that Layer 2 never got to run — never claiming a clean scan that didn't
    * actually happen. See ArgsTooDeepError's doc comment (errors.ts).
    */
-  private auditArgsTooDeep(call: ToolCall, sinkClass: SinkClass, error: ArgsTooDeepError): void {
+  private auditArgsTooDeep(
+    call: ToolCall,
+    sinkClass: SinkClass,
+    error: ArgsTooDeepError,
+    tool: ToolExecutor,
+  ): void {
     const taint: TaintContext = {
       matchedRecords: [],
       scopeLevel: this.currentScope.watermark.level,
       argFingerprintFloor: 'CLEAN',
       privateDataSeen: this.currentScope.watermark.privateDataSeen,
       sinkClass,
+      sinkIrreversible: tool.capabilities.irreversible === true,
       hasUnattributedSubstantialContent: false,
       scopeId: this.currentScope.id,
       sourceClasses: deriveSourceClasses(this.currentScope.watermark.sources),
@@ -1382,6 +1395,7 @@ class Broker implements ToolCallBroker {
 
     if (provisionallyApproved || observing) {
       const revalidated = await this.revalidateBeforeExecute(
+        tool,
         call,
         argsSnapshot,
         sinkClass,

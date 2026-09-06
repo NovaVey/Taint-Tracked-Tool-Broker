@@ -347,6 +347,48 @@ export interface SinkCapabilities {
   /** Empty ⇒ sinkClass NONE — the tool is not policy-gated at all. */
   capabilities: SinkCapability[];
   readsPrivateData?: { categories: string[] } | false;
+  /**
+   * Free-form-in-spirit but deliberately typed as a plain boolean (unlike
+   * `sourceClass`'s open vocabulary): does undoing this call's real-world
+   * effect require anything beyond calling this same tool again with
+   * opposite arguments? `true` for an irreversible payment
+   * (`finance:purchase`), a sent email (`net:email`) or webhook post that
+   * cannot be unsent, a destructive `write:fs` delete; `false`/unset for a
+   * `write:fs` write to a value you could overwrite back, an idempotent
+   * `net:api-call` GET-shaped read-through-a-mutation-looking-tool, or
+   * anything else undoing itself with a follow-up call of the same shape.
+   *
+   * **The gap this narrows (GAPS.md #32):** `CLASS_SEVERITY`
+   * (`SinkClass`'s own severity ranking, above — `EXEC` > `EXFIL` >
+   * `MUTATE`) is doing double duty as both "what KIND of side effect is
+   * this" and "how BAD would it be" on a single ordered axis, and those two
+   * questions do not actually correlate: an irreversible `finance:purchase`
+   * (`MUTATE`, severity 1) is gated identically to a fully reversible
+   * `write:fs` scratch-file write, and — at `DERIVED_UNTRUSTED` with no
+   * private data seen — BOTH land on `defaultPolicy`'s permissive
+   * `ALLOW_WITH_WARNING` cell (`policy/default-policy.ts`'s `MATRIX`),
+   * identically to how a genuinely reversible `net:api-call` (`EXFIL`,
+   * severity 2, same cell) is treated. This field is the SAME "integrator
+   * declares, library enforces" split GAPS.md #10/#28 already apply
+   * elsewhere, applied one level down from GAPS.md #28's source-*class*
+   * axis: an ORTHOGONAL boolean, not a fifth `SinkClass` or a change to
+   * `CLASS_SEVERITY`'s ordering, surfaced on `TaintContext.sinkIrreversible`
+   * (see that field's own doc comment) for a custom `PolicyFn` to read.
+   *
+   * **`defaultPolicy` deliberately never reads this field** — exactly like
+   * `sourceClass`/`sourceClasses` (GAPS.md #28): this library ships the
+   * plumbing (the declaration, the derivation onto `TaintContext`), never
+   * an opinion on how much MORE friction an irreversible sink should get
+   * relative to `defaultPolicy`'s own class-and-level table. A custom
+   * `PolicyFn` that wants to, say, upgrade an otherwise-`ALLOW_WITH_WARNING`
+   * verdict to `REQUIRE_APPROVAL` whenever `taint.sinkIrreversible` is
+   * `true` is free to do so — see `examples/irreversible-sink-policy.ts`
+   * for a worked pattern. Optional and unset by default (treated
+   * identically to `false` everywhere this library reads it): a tool
+   * declaring no `irreversible` behaves exactly as it did before this field
+   * existed.
+   */
+  irreversible?: boolean;
 }
 
 export interface ToolExecutor<A = unknown, R = unknown> {
@@ -485,6 +527,45 @@ export interface TaintContext {
   argFingerprintFloor: TaintLevel;
   privateDataSeen: boolean;
   sinkClass: SinkClass;
+  /**
+   * The registered tool's own declared `SinkCapabilities.irreversible` for
+   * THIS call (see that field's own doc comment, above, for the full
+   * GAPS.md #32 motivation: `SinkClass`'s `CLASS_SEVERITY` ranking conflates
+   * "what kind of side effect" with "how bad is it," so an irreversible
+   * `finance:purchase` and a fully reversible `write:fs` scratch write are
+   * gated identically today). Populated at every real `TaintContext`
+   * construction site that has an actual registered tool to read it from —
+   * the live gating path (`buildTaintContext()`, `broker.ts`) and the
+   * `ArgsTooDeepError` audit path (`auditArgsTooDeep()`) — as
+   * `tool.capabilities.irreversible === true`, never left `undefined` for
+   * those. Administrative, `sinkClass: 'NONE'` events
+   * (`internal-audit.ts`'s `trivialTaintContext()`, `quarantine.ts`'s own
+   * audit records) have no real sink to ask and correctly leave this
+   * `undefined` — there is no "this call's own irreversibility" for an
+   * event that isn't a sink call at all, the same reasoning `sinkClass:
+   * 'NONE'` itself already encodes for those sites.
+   *
+   * **`defaultPolicy` deliberately never reads this field** — the identical
+   * "integrator declares, library enforces" split GAPS.md #10/#28 already
+   * apply to `sourceClass`/`sourceClasses`/`destinationKeys`: this library
+   * ships the signal, never an opinion on how much additional friction an
+   * irreversible sink should get beyond `defaultPolicy`'s own class-and-level
+   * table. See `SinkCapabilities.irreversible`'s own doc comment for the
+   * full rationale and `examples/irreversible-sink-policy.ts` for a worked
+   * `PolicyFn` that reads it.
+   *
+   * **Optional, not required — deliberately, for API stability**, the
+   * identical `1.0.0` SemVer reasoning every other field added to this
+   * interface post-`1.0.0` already gives (`hasUnattributedSubstantialContent`/
+   * `scopeId`/`sourceClasses`, below): a `TaintContext` literal written
+   * before this field existed — plausibly a hand-built fixture in a custom
+   * `PolicyFn`'s own test suite — still type-checks unchanged. A reader
+   * should treat `undefined` here as "unknown/not applicable for this
+   * event" (an administrative event, or a `TaintContext` predating this
+   * field), never the same as `false` — unlike `SinkCapabilities
+   * .irreversible` itself, where unset IS treated as `false`.
+   */
+  sinkIrreversible?: boolean;
   /**
    * Mirrors `taint/scan.ts`'s `ScanResult.hasUnattributedSubstantialContent`
    * — see that field's own doc comment for the exact bar (a string leaf of
