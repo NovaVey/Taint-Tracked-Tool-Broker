@@ -128,6 +128,32 @@ export class QuarantineSchemaRequiredError extends TaintBrokerError {
 }
 
 /**
+ * Thrown by createBroker() when constructed with `enforcement: 'observe'`
+ * but no `auditSink` (GAPS.md #31). Observe mode's entire value proposition
+ * is measuring what `'enforce'` WOULD have gated, against real traffic,
+ * before actually gating anything — a broker that never prevents a
+ * BLOCK/REQUIRE_APPROVAL/QUARANTINE_AND_RETRY call AND has nowhere to
+ * record that fact provides strictly negative value: every privileged call
+ * proceeds regardless of taint, with zero way for anyone to notice. This is
+ * refused outright at construction, rather than silently falling back to
+ * NOOP_AUDIT the way an ordinary (`enforcement: 'enforce'`) broker does —
+ * the whole point of this error is that "silently permissive with no audit
+ * trail" is exactly the footgun observe mode must never let ship
+ * unnoticed. Pass a real `auditSink` to opt into observe mode.
+ */
+export class ObserveModeRequiresAuditSinkError extends TaintBrokerError {
+  constructor() {
+    super(
+      "createBroker({ enforcement: 'observe' }) requires a real auditSink — observe mode's entire " +
+        'point is measuring what would have been gated, and a broker with no way to record that ' +
+        'measurement (the default NOOP_AUDIT) would silently let every privileged call through with ' +
+        "zero visibility. Pass createBroker({ enforcement: 'observe', auditSink: {...} }). See GAPS.md #31.",
+    );
+    this.name = 'ObserveModeRequiresAuditSinkError';
+  }
+}
+
+/**
  * Thrown by register()/wrap() when a tool declares itself both a source of
  * untrusted content (isSource: true, not trusted) AND a privileged sink
  * (non-empty capabilities). Such a tool can read and act on untrusted

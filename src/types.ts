@@ -49,6 +49,42 @@ export interface ProvenanceTag {
   sessionId: string;
   capturedAt: number;
   note?: string;
+  /**
+   * Free-form, integrator-defined origin-type label (e.g. `'internal-mcp'`,
+   * `'public-web'`, `'user-pasted'`) — the *source-class* axis GAPS.md #28
+   * names as missing from `TaintLevel`, which orders trust *degree* only
+   * (how far from provably clean) and deliberately collapses every
+   * untrusted source to the same level regardless of *why* it's untrusted.
+   * Declared on the originating `ToolExecutor.sourceClass` for an ordinary
+   * source-tool call, or on `markContextExposure()`'s `source.sourceClass`
+   * for the GAPS.md #1 escape-hatch channels — see both fields' own doc
+   * comments. Purely a label this library carries through unchanged; it is
+   * never interpreted, ordered, or validated against a fixed set — an
+   * integrator invents whatever vocabulary fits their own deployment.
+   *
+   * **Deliberately NOT a second gating axis.** `defaultPolicy`
+   * (`policy/default-policy.ts`) never reads this field or
+   * `TaintContext.sourceClasses` below — the "integrator declares, library
+   * enforces" split GAPS.md #10 already applies everywhere else applies
+   * here too: this library ships the plumbing, not an opinion on which
+   * source classes should be treated as lower-risk. A custom `PolicyFn`
+   * that wants to, say, treat a scope tainted only by an internal MCP
+   * server more leniently than one that also saw a public web page is free
+   * to branch on `TaintContext.sourceClasses`/`TaintMatch.record.provenance
+   * .sourceClass` itself — see `examples/source-class-policy.ts` for a
+   * worked pattern.
+   *
+   * Optional and unset by default: a `ProvenanceTag` this library builds
+   * without a declared `sourceClass` to copy (or a pre-existing hand-built
+   * one predating this field) simply carries none — exactly today's
+   * behavior for every integrator who doesn't opt in. See GAPS.md #28 for
+   * the full gap this narrows and what it deliberately leaves open (most
+   * notably: `defaultPolicy` never branching on it is a considered choice,
+   * not an oversight, and this field says nothing about whether a labeled
+   * source's CONTENT is actually less dangerous than an unlabeled one's —
+   * it is exactly as attacker-influenceable as before, TaintLevel-wise).
+   */
+  sourceClass?: string;
 }
 
 export interface SensitivityLabel {
@@ -198,7 +234,18 @@ export interface TaintWatermark {
   level: TaintLevel;
   /** Independent dimension: an escalator on policy decisions, never itself a gate (§3.2, §7.2). */
   privateDataSeen: boolean;
-  /** Audit trail only — policy gating logic must never branch on the contents of this array. */
+  /**
+   * Audit trail only — policy gating logic must never branch on the raw
+   * contents of this array (individual `sourceCallId`s, timestamps, notes,
+   * or how many entries it has). The one deliberate, narrow exception:
+   * `TaintContext.sourceClasses` (GAPS.md #28) is a small, bounded, derived
+   * SUMMARY — the distinct `ProvenanceTag.sourceClass` values present here,
+   * deduplicated — computed fresh at each decision specifically to give a
+   * custom `PolicyFn` a policy-visible source-*class* signal without
+   * exposing this raw, unbounded, ever-growing list itself. `defaultPolicy`
+   * still never reads either the raw array or the derived summary — see
+   * that field's own doc comment (`TaintContext.sourceClasses`, below).
+   */
   sources: ProvenanceTag[];
 }
 
@@ -209,6 +256,34 @@ export interface TaintScope {
   id: string;
   watermark: TaintWatermark;
 }
+
+/**
+ * `'enforce'` (the default) is every behavior this library has always had:
+ * a `BLOCK`/`REQUIRE_APPROVAL`(denied)/`QUARANTINE_AND_RETRY` verdict
+ * prevents the call, throwing `ToolCallBlockedError`. `'observe'` is the
+ * standard adoption ramp for a hot-path enforcement mechanism (CSP
+ * report-only, a WAF's detection mode, seccomp's audit mode): every call
+ * still runs `policy()` and still computes the exact same `PolicyDecision`
+ * it would under `'enforce'`, and the scope watermark, the Layer 2
+ * registry, and every `AuditEvent` are populated identically either way —
+ * but a `BLOCK`/`REQUIRE_APPROVAL`/`QUARANTINE_AND_RETRY` verdict no longer
+ * prevents the call. It executes anyway, audited with its TRUE,
+ * unmodified verdict (never silently rewritten to look like an `ALLOW`) and
+ * `AuditEvent.enforcement: 'observe'` on every event this library records
+ * — so an operator can measure, against real production traffic, both the
+ * blanket-gating friction GAPS.md #3 names as the core usability cost of
+ * this whole design AND whether a tool that should have been declared
+ * `isSource: true` was simply missed (GAPS.md #1's own most likely
+ * trigger) — before ever paying either cost for real. See
+ * `BrokerOptions.enforcement`'s own doc comment (`broker.ts`) for the full
+ * mechanism, the construction-time safeguard, and exactly what does NOT
+ * change under `'observe'` (plan-freeze, `allowedOutboundHosts`,
+ * `summarize()`'s own input-provenance checks — none of these are
+ * `policy()` verdicts, and none of them are affected by this setting at
+ * all), and GAPS.md #31 for the full gap this closes and its own named
+ * limits.
+ */
+export type EnforcementMode = 'enforce' | 'observe';
 
 /**
  * Whether `startNewTurn()` clears the watermark. 'session' (the default) never
@@ -312,6 +387,31 @@ export interface ToolExecutor<A = unknown, R = unknown> {
    * for the full checklist and worked examples.
    */
   trusted?: boolean;
+  /**
+   * Free-form, integrator-defined origin-type label for an `isSource: true`
+   * tool — e.g. `'internal-mcp'`, `'public-web'`, `'user-pasted'` — copied
+   * verbatim into `ProvenanceTag.sourceClass` (see that field's own doc
+   * comment, above) every time this tool's result raises the watermark.
+   * This is the *source-class* axis GAPS.md #28 names as missing: `trusted`
+   * is a binary "does this content get tracked at all" switch, and
+   * `TaintLevel` orders trust *degree*, but neither can say "our internal
+   * MCP server is untrusted but not random-web-page untrusted" — this field
+   * exists specifically to let an integrator label THAT distinction without
+   * resorting to either of the two workarounds GAPS.md #28 names as bad
+   * (running two separate brokers, or declaring the whole tool `trusted:
+   * true` and losing taint tracking for it entirely).
+   *
+   * Purely a label, never interpreted by this library: `defaultPolicy`
+   * never reads it (directly or via `TaintContext.sourceClasses`) — see
+   * that field's own doc comment for why, and `examples/source-class-policy.ts`
+   * for how a custom `PolicyFn` can. Ignored for a tool that isn't
+   * `isSource: true` (there is no watermark raise to attach it to), and for
+   * a `trusted: true` source (its result is never registered or raised in
+   * the first place — see `isUntrustedSource()`, `internal-audit.ts`).
+   * Optional and unset by default — a tool declaring no `sourceClass`
+   * behaves exactly as it did before this field existed.
+   */
+  sourceClass?: string;
   /**
    * Declare `true` if this tool's `execute()` calls `broker.summarize()`
    * internally (the fetch-and-quarantine composite-tool pattern, DESIGN.md
@@ -479,6 +579,60 @@ export interface TaintContext {
    * about which episode it belongs to.
    */
   scopeId?: string;
+
+  /**
+   * The distinct `ProvenanceTag.sourceClass` values present across
+   * `TaintScope.watermark.sources` at the moment this `TaintContext` was
+   * built — deduplicated, in order of first appearance, skipping any
+   * `ProvenanceTag` with no declared `sourceClass`. This is the
+   * *source-class* axis GAPS.md #28 describes as missing from `TaintLevel`
+   * (a totally-ordered trust-*degree* lattice that deliberately collapses
+   * *why* a scope is untrusted): a custom `PolicyFn` that wants to treat a
+   * scope tainted only by, say, `['internal-mcp']` differently from one
+   * that also picked up `['public-web']` reads this field to do so — see
+   * `examples/source-class-policy.ts` for a worked pattern.
+   *
+   * **`defaultPolicy` never reads this field.** Consistent with GAPS.md
+   * #10's "integrator declares, library enforces" framing already applied
+   * everywhere else in this codebase, this library ships the plumbing —
+   * computing and surfacing the signal — without taking a position on
+   * which source classes should be treated as lower-risk; that decision, if
+   * wanted at all, belongs entirely to an integrator's own `PolicyFn`.
+   *
+   * A DERIVED SUMMARY, not the raw `ProvenanceTag[]` array itself —
+   * `TaintWatermark.sources`'s own doc comment (above) still holds: policy
+   * gating logic must never branch on that raw, unbounded, ever-growing
+   * list (individual call ids, timestamps, notes). This field is
+   * deliberately narrower and bounded to the same small vocabulary an
+   * integrator's own `sourceClass` declarations define, recomputed fresh
+   * from the CURRENT watermark at every decision — the same "Layer 2
+   * belt-and-suspenders signal a `PolicyFn` may read" register
+   * `argFingerprintFloor`/`hasUnattributedSubstantialContent` already use,
+   * applied to a new axis instead of a new layer.
+   *
+   * Administrative `TaintContext`s built for non-sink audit events
+   * (`internal-audit.ts`'s `trivialTaintContext()`, `quarantine.ts`'s own
+   * audit records, `broker.ts`'s `auditArgsTooDeep()`) still compute this
+   * honestly from whichever watermark's `sources` was actually in effect at
+   * that event (e.g. the watermark just discarded by a turn-boundary reset
+   * or `declassify()`, mirroring `scopeLevel`'s own "describe what was
+   * cleared" convention on those same events) — unlike
+   * `hasUnattributedSubstantialContent`, this field needs no real args scan
+   * to compute correctly, so there is no "no scan ran" case to honestly
+   * flatten to a default the way that field does.
+   *
+   * **Optional, not required — deliberately, for API stability**, the
+   * identical `1.0.0` SemVer reasoning `hasUnattributedSubstantialContent`/
+   * `scopeId` already give on this same interface: every `TaintContext`
+   * this library itself constructs always sets this explicitly (as `[]`
+   * when no source in scope declared a `sourceClass` — never omitted for
+   * that case, the same "false, not absent" discipline
+   * `hasUnattributedSubstantialContent` already follows), so `undefined`
+   * here means specifically "this `TaintContext` predates the field" (a
+   * hand-built fixture in a custom `PolicyFn`'s own test suite), never "no
+   * source classes were present" — a reader must not conflate the two.
+   */
+  sourceClasses?: readonly string[];
 }
 
 export type PolicyDecision =
@@ -597,6 +751,44 @@ export interface AuditEvent {
    * `at - requestedAt` when it is absent.
    */
   requestedAt?: number;
+
+  /**
+   * The broker's `BrokerOptions.enforcement` mode at the moment this event
+   * was recorded (GAPS.md #31) — `'enforce'` (the default) for every
+   * behavior this library has always had, or `'observe'` when a
+   * `BLOCK`/`REQUIRE_APPROVAL`/`QUARANTINE_AND_RETRY` `verdict` on this
+   * event did NOT actually prevent the call (see `EnforcementMode`'s own
+   * doc comment, above, for the full mechanism). Set on EVERY `AuditEvent`
+   * this library constructs — administrative events (`declassify()`,
+   * `startNewTurn()`, `markContextExposure()`) included, not just gated
+   * ones — via a single wrapping choke point at broker construction
+   * (`broker.ts`'s `withEnforcementMode()`, the identical "wrap the
+   * configured sink once, so a call site added later inherits it
+   * automatically" shape `redactAuditArgs` already uses), so no individual
+   * `auditSink.record()` call site has to remember to set it.
+   *
+   * A reader checking "was this call actually gated" should read this
+   * field alongside `verdict.action` and `executed`: `enforcement ===
+   * 'observe'` combined with a non-`ALLOW`/`ALLOW_WITH_WARNING` `verdict`
+   * and `executed: true` is the exact, unambiguous signature of "this call
+   * would have been prevented under `'enforce'`, but this broker let it
+   * through" — `src/debug.ts`'s `formatAuditTrail()` renders that specific
+   * combination with an explicit `[OBSERVE MODE: NOT ENFORCED]` marker
+   * rather than leaving a reader to reconstruct the combination by hand.
+   *
+   * **Optional, not required — deliberately, for API stability**, the
+   * identical `1.0.0` SemVer reasoning `requestedAt`/`scopeId`/
+   * `hasUnattributedSubstantialContent`/`sourceClasses` already give on
+   * this same interface: `AuditEvent` is the parameter to every
+   * `AuditSink.record()` call, so a NEW REQUIRED field here would be
+   * exactly the breaking shape change `1.0.0` rules out short of a major
+   * bump. This library itself always sets it explicitly on every event it
+   * constructs; a reader should treat `undefined` as "this event predates
+   * `enforcement` existing" (a hand-built fixture, or an `AuditEvent`
+   * restored from a durable log written before this field shipped), never
+   * as evidence either way about whether the call was actually gated.
+   */
+  enforcement?: EnforcementMode;
 }
 
 export interface AuditSink {
@@ -802,16 +994,31 @@ export interface ToolCallBroker {
    * description changed since last seen"), not its content.
    */
   markContextExposure(
-    source: { toolName?: string; note: string; text?: string },
+    source: { toolName?: string; note: string; text?: string; sourceClass?: string },
     level?: TaintLevel,
   ): void;
 
-  /** markContextExposure() specialized for a tool/plugin/MCP-server description read at discovery time (GAPS.md #1's own canonical example) — see examples/mcp-integration.ts's rug-pull guard for a worked pattern. */
-  markToolDescriptionExposure(toolName: string, description: string, level?: TaintLevel): void;
-  /** markContextExposure() specialized for an untrusted system-prompt fragment. `text` is optional, same as markContextExposure() — omit it when only the fact of the exposure, not its content, is known. */
-  markSystemPromptExposure(note: string, text?: string, level?: TaintLevel): void;
-  /** markContextExposure() specialized for content a user pastes directly into a turn. `text` is optional, same as markContextExposure(). */
-  markPastedContentExposure(note: string, text?: string, level?: TaintLevel): void;
+  /** markContextExposure() specialized for a tool/plugin/MCP-server description read at discovery time (GAPS.md #1's own canonical example) — see examples/mcp-integration.ts's rug-pull guard for a worked pattern. `sourceClass` is the same GAPS.md #28 origin-type label `ProvenanceTag.sourceClass`/`ToolExecutor.sourceClass` carry — e.g. labeling a drifted description from your own internal MCP server distinctly from one from a third-party server. */
+  markToolDescriptionExposure(
+    toolName: string,
+    description: string,
+    level?: TaintLevel,
+    sourceClass?: string,
+  ): void;
+  /** markContextExposure() specialized for an untrusted system-prompt fragment. `text` is optional, same as markContextExposure() — omit it when only the fact of the exposure, not its content, is known. `sourceClass` is the same GAPS.md #28 origin-type label as markContextExposure()'s own `source.sourceClass`. */
+  markSystemPromptExposure(
+    note: string,
+    text?: string,
+    level?: TaintLevel,
+    sourceClass?: string,
+  ): void;
+  /** markContextExposure() specialized for content a user pastes directly into a turn. `text` is optional, same as markContextExposure(). `sourceClass` is the same GAPS.md #28 origin-type label as markContextExposure()'s own `source.sourceClass`. */
+  markPastedContentExposure(
+    note: string,
+    text?: string,
+    level?: TaintLevel,
+    sourceClass?: string,
+  ): void;
 
   /** Per `resetScope`: clears the watermark ('turn' mode) or is a no-op ('session' mode, the default). */
   startNewTurn(): void;
@@ -857,4 +1064,6 @@ export interface ToolCallBroker {
 
   readonly scope: Readonly<TaintScope>;
   readonly registry: TaintRegistry;
+  /** This broker's `BrokerOptions.enforcement` mode (`'enforce'` by default) — see `EnforcementMode`'s own doc comment and GAPS.md #31. Fixed for the life of the broker; not settable after construction. */
+  readonly enforcement: EnforcementMode;
 }

@@ -355,6 +355,14 @@ function buildQuarantineReason(
   );
 }
 
+// GAPS.md #28: this policy deliberately never reads taint.sourceClasses (or
+// any matched record's provenance.sourceClass) — a source-CLASS distinction
+// ("our internal MCP server" vs. "a random fetched page") is left entirely
+// to an integrator's own custom PolicyFn to act on, if they want to at all,
+// the same "integrator declares, library enforces" split GAPS.md #10
+// applies everywhere else. See TaintContext.sourceClasses's own doc comment
+// (types.ts) and examples/source-class-policy.ts for a worked custom policy
+// that DOES read it.
 export const defaultPolicy: PolicyFn = (_call, taint) => {
   const decision = baseDecision(taint);
 

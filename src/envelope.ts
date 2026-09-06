@@ -83,6 +83,18 @@ export interface TaintEnvelope<T = unknown> {
    * not invent one.
    */
   scopeId?: string;
+  /**
+   * `TaintContext.sourceClasses` at capture time (GAPS.md #28), when the
+   * source `TaintContext` carried one — optional for the identical reason
+   * `scopeId` is above: a hand-built `TaintContext` fixture predating this
+   * field has none to copy. Unlike `argFingerprintFloor`/`sinkClass`/
+   * `hasUnattributedSubstantialContent`, this describes `value`'s own
+   * exposure-episode story (which source classes contributed to its
+   * scope's watermark), not the specific call `taint` was computed for —
+   * the same reason `scopeLevel`/`privateDataSeen`/`scopeId` are carried
+   * over here and those three are not.
+   */
+  sourceClasses?: readonly string[];
   /** `Date.now()` at the moment this envelope was built — when the snapshot below was taken, not when `value` itself was produced (that provenance, if any, lives inside `matchedRecords[].record.provenance.capturedAt`). */
   capturedAt: number;
   /** A human-readable, one-line rendering of the fields above — see `summarizeTaintContext()` below. Not meant to be parsed; a durable consumer should read the structured fields instead. */
@@ -101,8 +113,12 @@ export interface TaintEnvelope<T = unknown> {
  */
 function summarizeTaintContext(taint: TaintContext): string {
   const privateNote = taint.privateDataSeen ? '; private data seen' : '';
+  const sourceClassNote =
+    taint.sourceClasses !== undefined && taint.sourceClasses.length > 0
+      ? `; source classes: ${taint.sourceClasses.join(', ')}`
+      : '';
   if (taint.matchedRecords.length === 0) {
-    return `${taint.scopeLevel}${privateNote}; no fingerprint matches`;
+    return `${taint.scopeLevel}${privateNote}${sourceClassNote}; no fingerprint matches`;
   }
   const matchList = taint.matchedRecords
     .map(
@@ -111,7 +127,7 @@ function summarizeTaintContext(taint: TaintContext): string {
     )
     .join(', ');
   return (
-    `${taint.scopeLevel}${privateNote}; ${taint.matchedRecords.length} fingerprint ` +
+    `${taint.scopeLevel}${privateNote}${sourceClassNote}; ${taint.matchedRecords.length} fingerprint ` +
     `match${taint.matchedRecords.length === 1 ? '' : 'es'}: ${matchList}`
   );
 }
@@ -148,6 +164,7 @@ export function createTaintEnvelope<T>(value: T, taint: TaintContext): TaintEnve
       record: serializeTaintRecord(match.record),
     })),
     ...(taint.scopeId !== undefined ? { scopeId: taint.scopeId } : {}),
+    ...(taint.sourceClasses !== undefined ? { sourceClasses: taint.sourceClasses } : {}),
     capturedAt: Date.now(),
     summary: summarizeTaintContext(taint),
   };

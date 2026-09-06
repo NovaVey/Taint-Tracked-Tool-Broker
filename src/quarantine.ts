@@ -69,8 +69,18 @@ export interface CreateQuarantineOpts {
   impl: QuarantineImpl;
   registry: TaintRegistry;
   raiseToDerivedUntrusted: (tag: ProvenanceTag) => void;
-  /** Also supplies `id` (the current `TaintScope.id`) for `TaintContext.scopeId` — see that field's own doc comment (types.ts). */
-  getScope: () => { id: string; level: TaintLevel; privateDataSeen: boolean };
+  /**
+   * Also supplies `id` (the current `TaintScope.id`) for `TaintContext
+   * .scopeId`, and `sourceClasses` (GAPS.md #28, precomputed via
+   * `deriveSourceClasses()`) for `TaintContext.sourceClasses` — see both
+   * fields' own doc comments (types.ts).
+   */
+  getScope: () => {
+    id: string;
+    level: TaintLevel;
+    privateDataSeen: boolean;
+    sourceClasses: readonly string[];
+  };
   auditSink: AuditSink;
   /** Threaded straight from `BrokerOptions.requireQuarantineSchema` (default `false`) — see that field's own doc comment (broker.ts) and GAPS.md #4. */
   requireQuarantineSchema?: boolean;
@@ -178,6 +188,7 @@ export function createQuarantine(config: CreateQuarantineOpts): QuarantineFn {
             sinkClass: 'NONE',
             hasUnattributedSubstantialContent: false,
             scopeId: getScope().id,
+            sourceClasses: getScope().sourceClasses,
           },
           at: Date.now(),
           executed: false,
@@ -204,6 +215,13 @@ export function createQuarantine(config: CreateQuarantineOpts): QuarantineFn {
       sessionId: opts.sessionId,
       capturedAt: Date.now(),
       note: `derived from ${sourceRecord.id}`,
+      // GAPS.md #28: a quarantined/derived record inherits its source
+      // record's own sourceClass, if any — it's a condensation of that same
+      // origin, not a new one. See ProvenanceTag.sourceClass's own doc
+      // comment (types.ts).
+      ...(sourceRecord.provenance.sourceClass !== undefined
+        ? { sourceClass: sourceRecord.provenance.sourceClass }
+        : {}),
     };
     const record = registry.register(
       outText,
@@ -238,6 +256,7 @@ export function createQuarantine(config: CreateQuarantineOpts): QuarantineFn {
         sinkClass: 'NONE',
         hasUnattributedSubstantialContent: false,
         scopeId: getScope().id,
+        sourceClasses: getScope().sourceClasses,
       },
       at: Date.now(),
       executed: true,

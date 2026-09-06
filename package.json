@@ -1,12 +1,15 @@
 {
   "name": "taint-tracked-tool-broker",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Provenance labeling for agent inputs, enforced at the tool-call boundary. Blocks untrusted data from reaching shell, filesystem, and network sinks. Ships with an injection corpus and a published list of known gaps.",
   "type": "module",
   "license": "Apache-2.0",
   "author": "NovaVey",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "tttb": "./dist/cli/doctor.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -41,9 +44,11 @@
     "dist",
     "docs",
     "examples",
+    "conformance",
     "README.md",
     "DESIGN.md",
     "GAPS.md",
+    "PROTOCOL.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
     "SECURITY.md",
@@ -74,13 +79,15 @@
     "example:grounding-check": "tsx examples/quarantine-grounding-check.ts",
     "example:audit-sqlite": "tsx examples/audit-sqlite.ts",
     "example:audit-prometheus": "tsx examples/audit-prometheus.ts",
+    "example:source-class-policy": "tsx examples/source-class-policy.ts",
+    "example:observe-mode": "tsx examples/observe-mode.ts",
     "bench": "tsx bench/args-clone.ts",
     "bench:minhash": "tsx bench/minhash-sketch-tradeoff.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"corpus/**/*.ts\" \"examples/**/*.ts\" \"bench/**/*.ts\" \"*.{js,ts}\"",
-    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"corpus/**/*.ts\" \"examples/**/*.ts\" \"bench/**/*.ts\" \"*.{js,ts}\""
+    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"corpus/**/*.ts\" \"examples/**/*.ts\" \"bench/**/*.ts\" \"conformance/**/*.json\" \"*.{js,ts}\"",
+    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"corpus/**/*.ts\" \"examples/**/*.ts\" \"bench/**/*.ts\" \"conformance/**/*.json\" \"*.{js,ts}\""
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

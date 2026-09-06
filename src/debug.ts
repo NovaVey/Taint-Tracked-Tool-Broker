@@ -83,15 +83,41 @@ function reasonOf(decision: PolicyDecision): string | undefined {
   return decision.action === 'ALLOW' ? undefined : decision.reason;
 }
 
+/**
+ * True when `event` is the exact, unambiguous signature GAPS.md #31 names:
+ * a call that would have been prevented under `enforcement: 'enforce'` —
+ * a non-`ALLOW`/`ALLOW_WITH_WARNING` verdict — but ran anyway because this
+ * broker was constructed with `enforcement: 'observe'` (`AuditEvent
+ * .enforcement`'s own doc comment, `types.ts`, spells out why all three
+ * conditions together are needed, not `enforcement` alone: an `ALLOW`
+ * verdict under `'observe'` was never gated in the first place, so calling
+ * that "not enforced" would be misleading noise on the common case).
+ */
+function wasObservedNotEnforced(event: AuditEvent): boolean {
+  return (
+    event.enforcement === 'observe' &&
+    event.executed &&
+    event.verdict.action !== 'ALLOW' &&
+    event.verdict.action !== 'ALLOW_WITH_WARNING'
+  );
+}
+
 function formatOneEvent(event: AuditEvent): string {
   const timestamp = new Date(event.at).toISOString();
   const args = summarizeArgs(event.call.args);
   const executedNote = event.executed ? ', executed' : '';
   const reason = reasonOf(event.verdict);
   const reasonNote = reason !== undefined ? ` — reason: "${reason}"` : '';
+  // Deliberately loud and impossible to mistake for an ordinary executed
+  // ALLOW: this is the one line shape where `verdict.action` and
+  // `executed: true` disagree about whether the call was actually gated —
+  // see GAPS.md #31 and wasObservedNotEnforced()'s own doc comment above.
+  const observeNote = wasObservedNotEnforced(event)
+    ? " [OBSERVE MODE: NOT ENFORCED — would have been prevented under enforcement: 'enforce']"
+    : '';
   return (
     `${timestamp}  ${event.call.toolName}(${args}) -> ${event.verdict.action}` +
-    ` [scope: ${event.taint.scopeLevel}${executedNote}]${reasonNote}`
+    ` [scope: ${event.taint.scopeLevel}${executedNote}]${reasonNote}${observeNote}`
   );
 }
 
@@ -112,7 +138,13 @@ function formatOneEvent(event: AuditEvent): string {
  * truncated, never throwing), the verdict action, the scope watermark
  * level the decision was made against (`event.taint.scopeLevel`), whether
  * the call actually executed, and — for every verdict but plain `ALLOW`,
- * which carries none — the policy's own `reason` text. Deliberately does
+ * which carries none — the policy's own `reason` text. An event where a
+ * non-`ALLOW`/`ALLOW_WITH_WARNING` verdict nonetheless executed because
+ * this broker is in `enforcement: 'observe'` mode (GAPS.md #31) gets an
+ * additional trailing `[OBSERVE MODE: NOT ENFORCED ...]` marker — that
+ * combination (a BLOCK/REQUIRE_APPROVAL/QUARANTINE_AND_RETRY verdict with
+ * `executed: true`) would otherwise read as silently contradictory rather
+ * than as the deliberate, documented behavior it is. Deliberately does
  * NOT render `event.taint.matchedRecords`/`argFingerprintFloor`/
  * `hasUnattributedSubstantialContent` or `event.call.sessionId`/`id`: this
  * is a skimmable one-line-per-event overview, not a full field dump — an
@@ -253,6 +285,16 @@ export function explainWatermark(scope: TaintScope): string {
  *     more load-bearing signals (DESIGN.md §7.2) — worth a stable key an
  *     integrator's dashboard doesn't have to reconstruct from the dynamic
  *     breakdown's key shape.
+ *   - `observeMode.wouldHaveGated` — a count of events matching GAPS.md
+ *     #31's exact "observed, not enforced" signature (`event.enforcement
+ *     === 'observe'`, `executed: true`, and a non-`ALLOW`/
+ *     `ALLOW_WITH_WARNING` verdict) — the same combination `debug.ts`'s own
+ *     `formatOneEvent()` marks with `[OBSERVE MODE: NOT ENFORCED]`. This is
+ *     the actual measurement observe mode exists to produce: how many real
+ *     calls would `enforcement: 'enforce'` have blocked/required approval
+ *     for, against genuine production traffic, before ever paying that
+ *     cost for real. Always `0` for a broker never constructed with
+ *     `enforcement: 'observe'` — there is nothing to count.
  *   - `requireApproval.latencyTotalMs` / `requireApproval.latencyAvgMs` —
  *     `event.at - event.requestedAt` (`AuditEvent.requestedAt`'s own
  *     documented latency computation, `types.ts`), summed/averaged across
@@ -285,6 +327,7 @@ export class AggregatingAuditSink implements AuditSink {
   private requireApprovalLatencyTotalMs = 0;
   private requireApprovalLatencySamples = 0;
   private quarantineAndRetryOffered = 0;
+  private observeModeWouldHaveGated = 0;
 
   constructor(delegate?: AuditSink) {
     this.delegate = delegate;
@@ -308,6 +351,10 @@ export class AggregatingAuditSink implements AuditSink {
       }
     } else if (event.verdict.action === 'QUARANTINE_AND_RETRY') {
       this.quarantineAndRetryOffered += 1;
+    }
+
+    if (wasObservedNotEnforced(event)) {
+      this.observeModeWouldHaveGated += 1;
     }
 
     this.delegate?.record(event);
@@ -336,6 +383,7 @@ export class AggregatingAuditSink implements AuditSink {
           ? 0
           : this.requireApprovalLatencyTotalMs / this.requireApprovalLatencySamples,
       'quarantineAndRetry.offered': this.quarantineAndRetryOffered,
+      'observeMode.wouldHaveGated': this.observeModeWouldHaveGated,
     };
     for (const [key, count] of this.verdictBySinkClass) {
       snapshot[key] = count;

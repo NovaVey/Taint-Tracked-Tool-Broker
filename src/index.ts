@@ -37,6 +37,7 @@ export type {
   TaintWatermark,
   ScopeKind,
   TaintScope,
+  EnforcementMode,
   ResetScope,
   SinkClass,
   SinkCapability,
@@ -122,6 +123,7 @@ export {
   createScope,
   createWatermark,
   declassifyScope,
+  deriveSourceClasses,
   markPrivateDataSeen,
   raiseWatermark,
 } from './taint/scope.js';
@@ -150,6 +152,14 @@ export type { DefineSourceOpts, DefineSinkOpts } from './define.js';
 
 export { formatAuditTrail, explainWatermark, AggregatingAuditSink } from './debug.js';
 
+export { checkToolCatalog, checkBrokerConfig, runDoctor, formatDoctorReport } from './doctor.js';
+export type {
+  DoctorSeverity,
+  DoctorFinding,
+  DoctorToolCatalogOpts,
+  DoctorBrokerConfig,
+} from './doctor.js';
+
 export {
   TaintBrokerError,
   ToolCallBlockedError,
@@ -166,4 +176,5 @@ export {
   QuarantineSourceUnavailableError,
   DisallowedOutboundHostError,
   ArgsTooDeepError,
+  ObserveModeRequiresAuditSinkError,
 } from './errors.js';
