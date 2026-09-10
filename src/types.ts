@@ -791,6 +791,68 @@ export interface TaintContext {
    * source classes were present" — a reader must not conflate the two.
    */
   sourceClasses?: readonly string[];
+
+  /**
+   * The acting principal `createBroker({ principal })` was constructed
+   * with (see `BrokerOptions.principal`'s own doc comment, `broker.ts`),
+   * copied through verbatim into every real `TaintContext` this library
+   * builds — the same "copied through, never interpreted" shape
+   * `sourceClass`/`sinkIrreversible` already use for their own axes.
+   *
+   * **The gap this narrows (GAPS.md #34):** today, `PolicyFn` receives
+   * only WHAT is happening (`call`) and HOW TAINTED the scope is
+   * (everything else on this interface) — never WHO is asking. Two
+   * broker instances bound to two agents with completely different real
+   * -world permissions reach the identical verdict for the identical
+   * call, because nothing in `PolicyFn`'s input lets a custom policy
+   * even ask the question. This field is deliberately the SMALLEST
+   * possible answer to that: an opaque, uninterpreted pass-through, not
+   * a new gating mechanism — it carries whatever value the integrator
+   * bound the broker to, and does nothing else. In particular, it is
+   * **not verification**: this library performs no authentication, no
+   * signature check, no revocation check, and no schema validation on
+   * this value — "principal" here means only "whatever the integrator's
+   * own boundary asserted," and a `PolicyFn` that trusts it more than
+   * that trusts something this library never checked. Delegation-chain
+   * verification, credential expiry, and revocation are explicitly OUT
+   * of scope for this field and this library — see GAPS.md #34's own
+   * "what this does not do" paragraph for the full reasoning, including
+   * why binding this to `sessionId` was considered and rejected.
+   *
+   * **`defaultPolicy` deliberately never reads this field** — the
+   * identical "integrator declares, library enforces" split GAPS.md
+   * #10/#28/#32 already apply to `sourceClass`/`sinkIrreversible`: this
+   * library ships the plumbing (the construction-time binding, the
+   * pass-through onto every real `TaintContext`), never an opinion on
+   * what a principal may or may not do. See
+   * `examples/rbac-policy.ts` for a worked pattern — a custom `PolicyFn`
+   * consulting an external, network-backed authorization service keyed
+   * on this field, with its own timeout/cache/fail-closed handling.
+   *
+   * Deliberately typed `unknown`, not a named `Principal` shape this
+   * library would then have an opinion about — the same reason
+   * `ToolCall.args` is `unknown` rather than some library-defined
+   * envelope: what a "principal" looks like (a user id, a role set, a
+   * signed JWT, an internal service-account identifier) is entirely the
+   * integrator's own concern, and a library-defined shape here would be
+   * exactly the kind of unearned structure GAPS.md #10's framing warns
+   * against. A `PolicyFn` that wants to read this field narrows/casts it
+   * itself, exactly as it already has to for `ToolCall.args`.
+   *
+   * **Optional, not required — deliberately, for API stability**, the
+   * identical `1.0.0` SemVer reasoning every other field added to this
+   * interface post-`1.0.0` already gives: a `TaintContext` literal
+   * written before this field existed — plausibly a hand-built fixture
+   * in a custom `PolicyFn`'s own test suite — still type-checks
+   * unchanged. Unlike the taint-lattice fields above, there is no
+   * conservative direction to bake into how a reader treats `undefined`
+   * here: it simply means "this broker was constructed with no
+   * `principal` bound" (the default — every broker behaves exactly as
+   * it did before this field existed when `BrokerOptions.principal` is
+   * left unset), not "the caller is anonymous" or any other inferred
+   * claim about who is actually calling.
+   */
+  principal?: unknown;
 }
 
 export type PolicyDecision =

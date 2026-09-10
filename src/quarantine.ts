@@ -71,15 +71,19 @@ export interface CreateQuarantineOpts {
   raiseToDerivedUntrusted: (tag: ProvenanceTag) => void;
   /**
    * Also supplies `id` (the current `TaintScope.id`) for `TaintContext
-   * .scopeId`, and `sourceClasses` (GAPS.md #28, precomputed via
-   * `deriveSourceClasses()`) for `TaintContext.sourceClasses` — see both
-   * fields' own doc comments (types.ts).
+   * .scopeId`, `sourceClasses` (GAPS.md #28, precomputed via
+   * `deriveSourceClasses()`) for `TaintContext.sourceClasses`, and
+   * `principal` (GAPS.md #34, the broker's own constructor-bound
+   * `BrokerOptions.principal`, copied through unchanged) for
+   * `TaintContext.principal` — see all three fields' own doc comments
+   * (types.ts).
    */
   getScope: () => {
     id: string;
     level: TaintLevel;
     privateDataSeen: boolean;
     sourceClasses: readonly string[];
+    principal: unknown;
   };
   auditSink: AuditSink;
   /** Threaded straight from `BrokerOptions.requireQuarantineSchema` (default `false`) — see that field's own doc comment (broker.ts) and GAPS.md #4. */
@@ -189,6 +193,7 @@ export function createQuarantine(config: CreateQuarantineOpts): QuarantineFn {
             hasUnattributedSubstantialContent: false,
             scopeId: getScope().id,
             sourceClasses: getScope().sourceClasses,
+            principal: getScope().principal,
           },
           at: Date.now(),
           executed: false,
@@ -257,6 +262,7 @@ export function createQuarantine(config: CreateQuarantineOpts): QuarantineFn {
         hasUnattributedSubstantialContent: false,
         scopeId: getScope().id,
         sourceClasses: getScope().sourceClasses,
+        principal: getScope().principal,
       },
       at: Date.now(),
       executed: true,
