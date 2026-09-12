@@ -403,6 +403,18 @@ const COMMAND_ARBITRARIES = [
 const TURN_DECAY_WINDOW = 2;
 
 describe('model-based scope-lifetime invariants (PROTOCOL.md §1.2/§1.3, sequential)', () => {
+  // Explicit 20s timeout on all three (vitest's default is 5000ms): each
+  // runs 50 generated command sequences through a REAL Broker instance
+  // (fc.asyncModelRun), not a pure in-memory property — under v8 coverage
+  // instrumentation specifically (`npm run coverage`, not plain `npm test`),
+  // the per-line instrumentation overhead has been observed to push this
+  // shape past the 5s default on a loaded CI runner (confirmed reproducing
+  // identically pre-existing on `main`, unrelated to whatever change
+  // happened to be in the diff that tripped it — see GAPS.md's own note, if
+  // any, or the PR that added this comment for the concrete repro). Raising
+  // the timeout, not lowering `numRuns` or the generated command size,
+  // since neither of those problems is real — this is a slow-CI-under-
+  // instrumentation issue, not a hang or a bug in what's under test.
   it("resetScope: 'session' — watermark matches the reference model after every command, for every generated sequence", async () => {
     await fc.assert(
       fc.asyncProperty(fc.commands(COMMAND_ARBITRARIES, { size: '+1' }), async (cmds) => {
@@ -413,7 +425,7 @@ describe('model-based scope-lifetime invariants (PROTOCOL.md §1.2/§1.3, sequen
       }),
       { numRuns: 50 },
     );
-  });
+  }, 20_000);
 
   it("resetScope: 'turn' — watermark matches the reference model after every command, for every generated sequence", async () => {
     await fc.assert(
@@ -425,7 +437,7 @@ describe('model-based scope-lifetime invariants (PROTOCOL.md §1.2/§1.3, sequen
       }),
       { numRuns: 50 },
     );
-  });
+  }, 20_000);
 
   it("resetScope: 'turn-decay' (window=2) — watermark AND the decay counter's observable effect match the reference model after every command, for every generated sequence", async () => {
     await fc.assert(
@@ -441,5 +453,5 @@ describe('model-based scope-lifetime invariants (PROTOCOL.md §1.2/§1.3, sequen
       }),
       { numRuns: 50 },
     );
-  });
+  }, 20_000);
 });
