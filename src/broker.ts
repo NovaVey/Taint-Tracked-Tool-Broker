@@ -210,12 +210,12 @@ export interface BrokerOptions {
    * re-decision after an async-gap watermark escalation — see GAPS.md
    * #35) to at most this many milliseconds, and catches a throwing/
    * rejecting `policy()` call — both call sites run while this broker
-   * instance's own serialization lock is held (§8), so an unbounded
-   * `PolicyFn` (most concretely: one that consults an external,
-   * network-dependent authorization service keyed on
-   * `TaintContext.principal`, GAPS.md #34) can otherwise hang the
-   * ENTIRE broker instance, not just the one caller who happened to
-   * trigger it.
+   * instance's own serialization lock is held (§4.1's concurrency
+   * discussion, `Broker.withLock`), so an unbounded `PolicyFn` (most
+   * concretely: one that consults an external, network-dependent
+   * authorization service keyed on `TaintContext.principal`, GAPS.md
+   * #34) can otherwise hang the ENTIRE broker instance, not just the
+   * one caller who happened to trigger it.
    *
    * **Fails closed, always — the identical precedent this library
    * already uses for a `REQUIRE_APPROVAL` verdict with no configured
@@ -234,13 +234,23 @@ export interface BrokerOptions {
    * caller gets the raw rejection). Both the timeout AND the catch are
    * bundled into this single opt-in specifically so a broker that
    * doesn't configure it gets no behavior change to its error handling
-   * either — this is a hard boundary matching plan-freeze/
-   * `allowedOutboundHosts`'s own "additive on top of, never instead of,
-   * the normal policy check" framing, unaffected by `enforcement:
-   * 'observe'` (GAPS.md #31) exactly like those two are, since a timed-
-   * out or throwing policy call never reached a real verdict for
-   * `'observe'` mode to have anything to let through in the first
-   * place.
+   * either.
+   *
+   * **Unlike plan-freeze/`allowedOutboundHosts` (§7.4), this is NOT a
+   * hard structural bypass immune to `enforcement: 'observe'` (GAPS.md
+   * #31) — it is an ordinary `PolicyDecision`, indistinguishable from
+   * any `BLOCK` a hand-written `PolicyFn` could return.** Plan-freeze
+   * and `allowedOutboundHosts` `throw` directly out of `gateDecision()`
+   * before `policy()` is ever consulted, so `'observe'` genuinely never
+   * touches them. This fail-closed `BLOCK` is different: it flows
+   * through the exact same `finalizeGated()` path as any other verdict,
+   * where the pre-existing `enforcement: 'observe'` override forces
+   * every call to execute regardless of verdict. Combine
+   * `policyTimeoutMs` with `enforcement: 'observe'` and a hung or
+   * throwing `PolicyFn` is audited as `BLOCK` (naming the timeout or
+   * error, exactly as under `'enforce'`) but the call still executes —
+   * not a special case, exactly `'observe'`'s own documented contract
+   * of auditing the true verdict without letting ANY verdict gate.
    *
    * A `PolicyFn` that itself never makes a network call (`defaultPolicy`,
    * every synchronous custom policy) has no reason to configure this —

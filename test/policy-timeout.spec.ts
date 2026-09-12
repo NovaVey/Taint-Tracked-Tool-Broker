@@ -240,3 +240,50 @@ describe('revalidateBeforeExecute()’s re-decision path also respects policyTim
     expect(last.verdict.action === 'BLOCK' && last.verdict.reason).toContain('policyTimeoutMs');
   });
 });
+
+describe("policyTimeoutMs's fail-closed BLOCK is NOT immune to enforcement: 'observe' (GAPS.md #31/#35)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  // Caught by adversarial review: an earlier draft of BrokerOptions
+  // .policyTimeoutMs's own doc comment claimed this synthetic BLOCK was a
+  // hard structural boundary "unaffected by enforcement: 'observe' ...
+  // exactly like" plan-freeze/allowedOutboundHosts. That's wrong — those
+  // two `throw` directly out of gateDecision() before policy() is ever
+  // consulted, genuinely bypassing finalizeGated() (and 'observe''s
+  // override) entirely. callPolicy()'s timeout/catch BLOCK is an ordinary
+  // PolicyDecision that flows through the SAME finalizeGated() path any
+  // other verdict does — so it IS overridden by 'observe', exactly like a
+  // BLOCK from any hand-written PolicyFn would be.
+  it("a hung PolicyFn's fail-closed BLOCK still executes the call under enforcement: 'observe' — audited truthfully, not prevented", async () => {
+    const events: AuditEvent[] = [];
+    const broker = createBroker({
+      policy: hangsForever,
+      policyTimeoutMs: 5000,
+      enforcement: 'observe',
+      auditSink: { record: (e) => events.push(e) },
+    });
+    broker.register({
+      name: 'shell_exec',
+      capabilities: { capabilities: ['exec:shell'] },
+      async execute() {
+        return 'ran';
+      },
+    });
+
+    const callPromise = broker.call('shell_exec', { cmd: 'echo hi' });
+    const assertion = expect(callPromise).resolves.toBe('ran'); // executes despite the BLOCK verdict below
+    await vi.advanceTimersByTimeAsync(5000);
+    await assertion;
+
+    const last = events.at(-1)!;
+    expect(last.verdict.action).toBe('BLOCK'); // audited truthfully...
+    expect(last.verdict.action === 'BLOCK' && last.verdict.reason).toContain('policyTimeoutMs');
+    expect(last.executed).toBe(true); // ...but not enforced, per 'observe''s own contract
+    expect(last.enforcement).toBe('observe');
+  });
+});
