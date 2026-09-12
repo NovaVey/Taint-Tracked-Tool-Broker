@@ -90,6 +90,46 @@ export interface BrokerOptions {
    * one. See createBroker()'s own doc comment.
    */
   sessionId?: string;
+  /**
+   * The acting principal this broker instance is bound to for its entire
+   * lifetime (GAPS.md #34) — copied through, unmodified, onto every real
+   * `TaintContext.principal` this library builds (`buildTaintContext()`),
+   * so a custom `PolicyFn` can finally answer WHO is asking, not just
+   * what and how tainted. **Deliberately NOT verification of any kind**:
+   * this library does not authenticate, sign-check, or validate this
+   * value in any way — it is exactly as trustworthy as whatever the
+   * integrator's own boundary asserted before calling `createBroker()`,
+   * the same "integrator declares, library enforces" split `sourceClass`/
+   * `irreversible` already rest on (GAPS.md #10/#28/#32).
+   *
+   * **Deliberately separate from `sessionId`, never a replacement for
+   * it.** `sessionId`'s own doc comment (above) already states plainly
+   * that it is "NOT a lookup key" and carries no isolation or
+   * authorization weight — GAPS.md #19 explains at length why this
+   * library cannot and does not enforce one-broker-instance-per-session
+   * from the inside, and repurposing `sessionId` to carry authorization
+   * meaning would silently break every existing integrator who already
+   * passes it an arbitrary correlation string, exactly as that field's
+   * own doc comment invites. `principal` is a brand-new, independent,
+   * optional field for exactly this reason: omitting it reproduces
+   * today's behavior byte-for-byte (every `TaintContext.principal` is
+   * simply `undefined`), and setting it changes nothing about
+   * `sessionId`, the watermark, the registry, or `withLock`'s
+   * serialization — it is pure additional signal for a `PolicyFn` that
+   * opts into reading it.
+   *
+   * Deliberately typed `unknown`, matching `TaintContext.principal`'s
+   * own reasoning (`types.ts`) — this library has no opinion on what a
+   * principal looks like (a user id, a role set, a signed JWT, a
+   * service-account identifier), only on faithfully carrying whatever
+   * value is bound here through to every policy decision. Bound once, at
+   * construction, for the broker's whole lifetime — there is no per-call
+   * override, the same "one broker instance = one session" model
+   * `sessionId` and GAPS.md #19 already establish, applied to identity
+   * instead of session labeling. See `examples/rbac-policy.ts` for a
+   * worked pattern.
+   */
+  principal?: unknown;
   /** 'session' (default) never resets until an explicit declassify(); 'turn' trades soundness for usability — GAPS.md #2. 'turn-decay' is a bounded middle ground — see turnDecayWindow. */
   resetScope?: ResetScope;
   /**
@@ -164,6 +204,60 @@ export interface BrokerOptions {
    */
   enforcement?: EnforcementMode;
   policy?: PolicyFn;
+  /**
+   * Bounds every real invocation of `policy()` (`gateDecision()`'s
+   * primary decision and `revalidateBeforeExecute()`'s conditional
+   * re-decision after an async-gap watermark escalation — see GAPS.md
+   * #35) to at most this many milliseconds, and catches a throwing/
+   * rejecting `policy()` call — both call sites run while this broker
+   * instance's own serialization lock is held (§4.1's concurrency
+   * discussion, `Broker.withLock`), so an unbounded `PolicyFn` (most
+   * concretely: one that consults an external, network-dependent
+   * authorization service keyed on `TaintContext.principal`, GAPS.md
+   * #34) can otherwise hang the ENTIRE broker instance, not just the
+   * one caller who happened to trigger it.
+   *
+   * **Fails closed, always — the identical precedent this library
+   * already uses for a `REQUIRE_APPROVAL` verdict with no configured
+   * `approvalChannel` (GAPS.md #20): never silently `ALLOW`.** A timeout
+   * or a caught throw/rejection both resolve to `{ action: 'BLOCK',
+   * reason: ... }`, audited exactly like any other `BLOCK` verdict —
+   * naming the timeout or the underlying error explicitly, never a bare,
+   * uncorrelated hang or an uncaught rejection with no `AuditEvent` at
+   * all.
+   *
+   * **Optional, and deliberately inert when unset — not merely a large
+   * default.** Leaving this unset preserves today's exact unbounded-
+   * `await this.policy(...)` behavior byte-for-byte: no timer, no catch,
+   * a throwing/rejecting `policy()` propagates exactly as it always has
+   * (a `callSafe()` caller gets `{ ok: false, error }`; a plain `call()`
+   * caller gets the raw rejection). Both the timeout AND the catch are
+   * bundled into this single opt-in specifically so a broker that
+   * doesn't configure it gets no behavior change to its error handling
+   * either.
+   *
+   * **Unlike plan-freeze/`allowedOutboundHosts` (§7.4), this is NOT a
+   * hard structural bypass immune to `enforcement: 'observe'` (GAPS.md
+   * #31) — it is an ordinary `PolicyDecision`, indistinguishable from
+   * any `BLOCK` a hand-written `PolicyFn` could return.** Plan-freeze
+   * and `allowedOutboundHosts` `throw` directly out of `gateDecision()`
+   * before `policy()` is ever consulted, so `'observe'` genuinely never
+   * touches them. This fail-closed `BLOCK` is different: it flows
+   * through the exact same `finalizeGated()` path as any other verdict,
+   * where the pre-existing `enforcement: 'observe'` override forces
+   * every call to execute regardless of verdict. Combine
+   * `policyTimeoutMs` with `enforcement: 'observe'` and a hung or
+   * throwing `PolicyFn` is audited as `BLOCK` (naming the timeout or
+   * error, exactly as under `'enforce'`) but the call still executes —
+   * not a special case, exactly `'observe'`'s own documented contract
+   * of auditing the true verdict without letting ANY verdict gate.
+   *
+   * A `PolicyFn` that itself never makes a network call (`defaultPolicy`,
+   * every synchronous custom policy) has no reason to configure this —
+   * it exists specifically for the shape GAPS.md #34/#35 introduce. See
+   * `examples/rbac-policy.ts` for a worked pattern.
+   */
+  policyTimeoutMs?: number;
   /**
    * Consulted only for a `REQUIRE_APPROVAL` verdict (§7.2/§7.3); every
    * other verdict never reads this option. Omitting it entirely is
@@ -546,6 +640,8 @@ function blockedMessage(toolName: string, decision: { action: string; reason?: s
 
 class Broker implements ToolCallBroker {
   private readonly sessionId: string;
+  /** GAPS.md #34 — bound once at construction, copied verbatim onto every real TaintContext.principal. Never verified, never read by this class itself beyond that pass-through. */
+  private readonly principal: unknown;
   private readonly resetScopeMode: ResetScope;
   /** Only meaningful when resetScopeMode === 'turn-decay'; validated non-undefined in the constructor for that mode. */
   private readonly turnDecayWindow: number | undefined;
@@ -557,6 +653,8 @@ class Broker implements ToolCallBroker {
   private turnsSinceExposure = 0;
   readonly enforcement: EnforcementMode;
   private readonly policy: PolicyFn;
+  /** GAPS.md #35 — unset means callPolicy() below is a plain passthrough with no timer/catch, byte-for-byte today's behavior. */
+  private readonly policyTimeoutMs: number | undefined;
   private readonly approvalChannel: ApprovalChannel | undefined;
   private readonly auditSink: AuditSink;
   private readonly cloneArgs: (value: unknown) => unknown;
@@ -599,6 +697,7 @@ class Broker implements ToolCallBroker {
 
   constructor(opts: BrokerOptions = {}) {
     this.sessionId = opts.sessionId ?? randomUUID();
+    this.principal = opts.principal;
     this.resetScopeMode = opts.resetScope ?? 'session';
     if (this.resetScopeMode === 'turn-decay') {
       if (!Number.isInteger(opts.turnDecayWindow) || (opts.turnDecayWindow as number) < 1) {
@@ -616,6 +715,15 @@ class Broker implements ToolCallBroker {
       throw new ObserveModeRequiresAuditSinkError();
     }
     this.policy = opts.policy ?? defaultPolicy;
+    if (
+      opts.policyTimeoutMs !== undefined &&
+      (!Number.isFinite(opts.policyTimeoutMs) || opts.policyTimeoutMs < 0)
+    ) {
+      throw new RangeError(
+        `createBroker({ policyTimeoutMs }) must be a non-negative finite number of milliseconds, got ${opts.policyTimeoutMs}. See GAPS.md #35.`,
+      );
+    }
+    this.policyTimeoutMs = opts.policyTimeoutMs;
     this.approvalChannel = opts.approvalChannel;
     const configuredAuditSink = withEnforcementMode(opts.auditSink ?? NOOP_AUDIT, this.enforcement);
     this.auditSink = opts.redactAuditArgs
@@ -766,12 +874,14 @@ class Broker implements ToolCallBroker {
     level: TaintLevel;
     privateDataSeen: boolean;
     sourceClasses: readonly string[];
+    principal: unknown;
   } {
     return {
       id: scope.id,
       level: scope.watermark.level,
       privateDataSeen: scope.watermark.privateDataSeen,
       sourceClasses: deriveSourceClasses(scope.watermark.sources),
+      principal: this.principal,
     };
   }
 
@@ -1099,7 +1209,56 @@ class Broker implements ToolCallBroker {
       hasUnattributedSubstantialContent,
       scopeId: this.currentScope.id,
       sourceClasses: deriveSourceClasses(this.currentScope.watermark.sources),
+      principal: this.principal,
     };
+  }
+
+  /**
+   * The ONE place both real `policy()` invocations (`gateDecision()`'s
+   * primary decision, `revalidateBeforeExecute()`'s conditional
+   * re-decision) go through — GAPS.md #35. When `this.policyTimeoutMs`
+   * is unset, this is a plain, uninstrumented passthrough: no timer, no
+   * catch, byte-for-byte today's `await this.policy(call, taint)`
+   * behavior, including an uncaught throw/rejection propagating exactly
+   * as it always has. Only once `policyTimeoutMs` is configured does
+   * this race the real call against a timer and catch a throw/rejection,
+   * both resolving to the same fail-closed `BLOCK` — the identical
+   * "never silently ALLOW" precedent this library already applies to a
+   * `REQUIRE_APPROVAL` with no configured `approvalChannel` (GAPS.md
+   * #20).
+   */
+  private async callPolicy(call: ToolCall, taint: TaintContext): Promise<PolicyDecision> {
+    if (this.policyTimeoutMs === undefined) {
+      return this.policy(call, taint);
+    }
+    const timeoutMs = this.policyTimeoutMs;
+    const TIMED_OUT = Symbol('policyTimeout');
+    let timer: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
+      timer = setTimeout(() => resolve(TIMED_OUT), timeoutMs);
+    });
+    try {
+      // Wrapped in an async IIFE so a PolicyFn that throws SYNCHRONOUSLY
+      // (permitted by its own type: `PolicyDecision | Promise<PolicyDecision>`)
+      // is caught here too, not just one that returns a rejected Promise.
+      const result = await Promise.race([(async () => this.policy(call, taint))(), timeout]);
+      if (result === TIMED_OUT) {
+        return {
+          action: 'BLOCK',
+          reason: `GAPS.md #35: this broker's configured PolicyFn did not resolve within policyTimeoutMs (${timeoutMs}ms) — failing closed rather than treating an unresponsive policy as ALLOW.`,
+        };
+      }
+      return result;
+    } catch (error) {
+      return {
+        action: 'BLOCK',
+        reason: `GAPS.md #35: this broker's configured PolicyFn threw/rejected (${
+          error instanceof Error ? error.message : String(error)
+        }) — failing closed rather than propagating an uncaught rejection.`,
+      };
+    } finally {
+      clearTimeout(timer!);
+    }
   }
 
   /** Whether the CURRENT watermark is strictly more tainted than the snapshot captured in `taint` — either dimension moving counts (§3.2's two dimensions are independent escalators). */
@@ -1148,7 +1307,7 @@ class Broker implements ToolCallBroker {
     // succeeded there. dispatchGated() would never have reached this far
     // otherwise.
     const freshTaint = this.buildTaintContext(argsSnapshot, sinkClass, tool);
-    const freshDecision = await this.policy(call, freshTaint);
+    const freshDecision = await this.callPolicy(call, freshTaint);
     const proceed =
       freshDecision.action === 'ALLOW' || freshDecision.action === 'ALLOW_WITH_WARNING';
     return { taint: freshTaint, decision: freshDecision, proceed };
@@ -1306,7 +1465,7 @@ class Broker implements ToolCallBroker {
       }
     }
 
-    const decision = await this.policy(call, taint);
+    const decision = await this.callPolicy(call, taint);
     return { taint, decision };
   }
 
@@ -1337,6 +1496,7 @@ class Broker implements ToolCallBroker {
       hasUnattributedSubstantialContent: false,
       scopeId: this.currentScope.id,
       sourceClasses: deriveSourceClasses(this.currentScope.watermark.sources),
+      principal: this.principal,
     };
     this.auditSink.record({
       verdict: { action: 'BLOCK', reason: error.message },
@@ -1852,6 +2012,7 @@ class Broker implements ToolCallBroker {
           level: priorLevel,
           privateDataSeen: priorPrivateDataSeen,
           sourceClasses: deriveSourceClasses(priorSources),
+          principal: this.principal,
         },
         true,
       );
@@ -1944,6 +2105,7 @@ class Broker implements ToolCallBroker {
         level: priorLevel,
         privateDataSeen: priorPrivateDataSeen,
         sourceClasses: deriveSourceClasses(priorSources),
+        principal: this.principal,
       },
       true,
     );

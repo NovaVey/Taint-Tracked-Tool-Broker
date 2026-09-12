@@ -67,13 +67,20 @@ export function isUntrustedSource(tool: Pick<ToolExecutor, 'isSource' | 'trusted
  * precomputed via `deriveSourceClasses()` (taint/scope.ts) alongside the id,
  * since unlike `hasUnattributedSubstantialContent` it needs no real args
  * scan to compute correctly, only whichever watermark's `sources` was in
- * effect for this event.
+ * effect for this event. `scope.principal` (GAPS.md #34) populates
+ * `TaintContext.principal` the same way — every caller already has it in
+ * hand via `scopeSnapshot()`/`getScope()`, which simply copy the
+ * broker's own constructor-bound `principal` through unchanged; an
+ * administrative event is exactly as much "this broker instance, acting"
+ * as a gated sink call is, so it carries the identical acting-principal
+ * value.
  */
 export function trivialTaintContext(scope: {
   id: string;
   level: TaintLevel;
   privateDataSeen: boolean;
   sourceClasses: readonly string[];
+  principal: unknown;
 }): TaintContext {
   return {
     matchedRecords: [],
@@ -84,6 +91,7 @@ export function trivialTaintContext(scope: {
     hasUnattributedSubstantialContent: false,
     scopeId: scope.id,
     sourceClasses: scope.sourceClasses,
+    principal: scope.principal,
   };
 }
 
@@ -97,6 +105,7 @@ export function recordTrivialAudit(
     level: TaintLevel;
     privateDataSeen: boolean;
     sourceClasses: readonly string[];
+    principal: unknown;
   },
   executed: boolean,
 ): void {
