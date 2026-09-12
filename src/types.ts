@@ -851,6 +851,15 @@ export interface TaintContext {
    * it did before this field existed when `BrokerOptions.principal` is
    * left unset), not "the caller is anonymous" or any other inferred
    * claim about who is actually calling.
+   *
+   * **Reading this off an `AuditEvent`:** `AuditEvent.taint` is the exact
+   * `TaintContext` that produced `AuditEvent.verdict` — read
+   * `event.taint.principal`, the one, sole, authoritative place this value
+   * lives on a recorded event. `AuditEvent` deliberately does NOT also grow
+   * its own separate top-level `actingPrincipal` copy of this same fact
+   * (nor an `onBehalfOf` delegation-chain field — no such chain exists
+   * anywhere in this library); see GAPS.md #34's own closing paragraph for
+   * why both were considered and declined.
    */
   principal?: unknown;
 }
