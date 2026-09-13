@@ -1,6 +1,11 @@
 # PROTOCOL.md
 
-**PROTOCOL.md v1 — as of `1.0.0` of this repository (2026-08-31).**
+**PROTOCOL.md v1.1 — as of `1.5.0` of this repository.** (v1: `1.0.0`,
+2026-08-31. v1.1 extends §4.1's minimum audit-event shape to require a
+per-call identifier and a session-scoping label on `call`, on top of the
+tool/action name and arguments v1 already required — see §4.1's own "why"
+paragraph and `CHANGELOG.md`'s entry for this version for the full
+rationale. Every other normative section is unchanged from v1.)
 
 ## 0. Status and scope
 
@@ -362,10 +367,27 @@ minimum, for every recorded event:
 | Field | Meaning |
 |---|---|
 | verdict | The policy decision produced (one of `ALLOW` / `ALLOW_WITH_WARNING` / `REQUIRE_APPROVAL` / `BLOCK`, plus a reason string for any non-bare-`ALLOW` verdict) |
-| call | What was called — at minimum a tool/action identifier and its arguments as they were actually evaluated (the same snapshot used for the gating decision and, if executed, for execution — never a separately-derived copy that could diverge from what was actually decided on or run) |
+| call | What was called — at minimum a **stable identifier unique to this specific call** (distinct from the tool/action name, which merely repeats across every call to the same tool), a tool/action name, its arguments as they were actually evaluated (the same snapshot used for the gating decision and, if executed, for execution — never a separately-derived copy that could diverge from what was actually decided on or run), and an **opaque label scoping the event to the broker/session instance that produced it** (never required to be a lookup key an implementation itself resolves anything by — see §1.2's own session-lifetime-boundary carve-out; it exists so something reading the audit trail from outside the implementation can group events, not so the implementation can) |
 | taint context | The scope's taint state at decision time — at minimum the scope's watermark level, its `privateDataSeen` flag, and the sink class the call was evaluated against |
 | timestamp | When the event was recorded |
 | executed | Whether the underlying action actually ran (true for a plain `ALLOW`/`ALLOW_WITH_WARNING`, or a `REQUIRE_APPROVAL` that was in fact granted; false otherwise) |
+
+**Why a per-call identifier and a session-scoping label are both
+load-bearing, not merely convenient.** An audit facility's most common
+real consumer is not a human reading a log line at a time, but a
+downstream system building its OWN structured record from the event
+stream — attributing calls to acting principals, correlating a specific
+call against that consumer's own independent dispatch record, or grouping
+every event belonging to one broker/session instance without a live
+reference to it. All three of those need something in `call` finer-grained
+than the tool/action name alone (which every call to the same tool shares)
+and something that survives being handed to a completely separate process
+with no shared memory. A conformant implementation's reference shape
+already provides both (a per-call `id`, and a `sessionId` bound once at
+construction) — this subsection makes explicit what was previously only
+implicit in that shape, so a from-scratch implementation in another
+language does not have to independently discover the same requirement the
+hard way, from a real downstream consumer that broke without it.
 
 An implementation MAY carry richer taint-context detail (e.g. matched
 attribution records, if Layer 2 is implemented — §5) and MAY extend this
@@ -535,6 +557,20 @@ harness) and mechanically check its own decision function's output against
 every case's `expected` block, rather than manually re-deriving each case
 from this document's prose or from reading `corpus/cases.ts`'s TypeScript
 by eye.
+
+`vectors.json` also carries `auditEventShape` — §4.1's minimum audit-event
+shape (as of this document's v1.1) made the same kind of mechanically
+checkable claim `tools[]`/`cases[]` already are for the decision table: a
+flat list of dot-notation field paths (`verdict.action`, `call.id`,
+`call.sessionId`, ...) and their runtime types, rather than a reader having
+to re-derive §4.1's table by eye into whatever shape their own
+implementation happens to use. `test/audit-event-shape-conformance.spec.ts`
+is this repository's own proof that its real, live `AuditEvent` output
+actually satisfies every entry — the identical "running this repository's
+own suite green is, by construction, conforming to the vectors" property
+the paragraph above already claims for case behavior, extended to shape.
+See `conformance/README.md`'s own `auditEventShape` section for the field
+list documented in full.
 
 The one JSON cannot express directly is the sanctioned quarantine path's
 extraction schema (§3, `QuarantineOpts.schema`) — genuinely a function in

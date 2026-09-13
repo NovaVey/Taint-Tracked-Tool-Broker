@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/taint-tracked-tool-broker.svg)](https://www.npmjs.com/package/taint-tracked-tool-broker)
 [![CI](https://github.com/NovaVey/Taint-Tracked-Tool-Broker/actions/workflows/ci.yml/badge.svg)](https://github.com/NovaVey/Taint-Tracked-Tool-Broker/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](./LICENSE)
-[![Node.js >= 20](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
+[![Node.js >= 22](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178c6.svg)](https://www.typescriptlang.org/)
 [![Module: ESM only](https://img.shields.io/badge/module-ESM%20only-informational.svg)](#install)
 
@@ -51,7 +51,7 @@ npm install && npm run build
 
 **ESM only** — this package ships as native ESM (`"type": "module"`, no CommonJS build). `import` it from an ESM project as normal. A CommonJS project on a Node version without [`require(esm)`](https://nodejs.org/api/modules.html#loading-ecmascript-modules-using-require) support can't `require()` it directly (`ERR_REQUIRE_ESM`) — use a dynamic `await import('taint-tracked-tool-broker')` instead. This is a deliberate, permanent design choice, not a gap to be filled later: ESM-only keeps the codebase simpler and matches the target audience of modern Node agent frameworks, which are themselves ESM-first.
 
-**Requires Node.js >= 20** (see `engines` in `package.json`).
+**Requires Node.js >= 22** (see `engines` in `package.json`).
 
 ## Quick start
 

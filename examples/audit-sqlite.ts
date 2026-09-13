@@ -8,20 +8,21 @@
  *
  *   npx tsx examples/audit-sqlite.ts
  *
- * **Node version note.** `node:sqlite` is a genuinely newer addition than
- * this library's own floor: `package.json`'s `engines.node` is `>=20`, but
- * `node:sqlite` does not exist at all before Node 22 (it landed, still
- * behind an experimental flag on some earlier 22.x releases, and is
- * available without a flag — though still marked experimental, which is why
- * running this prints an `ExperimentalWarning` to stderr — on the Node this
- * repository's own CI and this example were verified against). This example
- * specifically requires a newer Node than the library's own minimum; that's
- * fine for one example file to require (nothing in `src/` depends on
- * `node:sqlite`, so the library's own `>=20` floor is unaffected) but it is
- * NOT something every integrator on this library's stated floor can run
- * as-is. `assertSqliteAvailable()` below fails with a clear, actionable
- * message rather than the cryptic `ERR_UNKNOWN_BUILTIN_MODULE` a bare
- * `import { DatabaseSync } from 'node:sqlite'` would throw on Node <22.
+ * **Node version note.** `package.json`'s `engines.node` is `>=22`, which as
+ * of this writing happens to exactly match `node:sqlite`'s own minimum (it
+ * does not exist at all before Node 22; it landed, still behind an
+ * experimental flag on some earlier 22.x releases, and is available without
+ * a flag — though still marked experimental, which is why running this
+ * prints an `ExperimentalWarning` to stderr — on the Node this repository's
+ * own CI and this example were verified against). The two floors coinciding
+ * is coincidental, not load-bearing: nothing in `src/` depends on
+ * `node:sqlite`, so a future change to either floor (the library's own, or
+ * whatever Node version eventually stabilizes `node:sqlite` further) could
+ * easily separate them again — `assertSqliteAvailable()` below exists for
+ * exactly that reason, not only for today's already-aligned floors. It
+ * fails with a clear, actionable message rather than the cryptic
+ * `ERR_UNKNOWN_BUILTIN_MODULE` a bare `import { DatabaseSync } from
+ * 'node:sqlite'` would throw on a Node old enough to lack it.
  *
  * **No new dependency.** `node:sqlite` is a Node builtin — `package.json`
  * gains nothing from this file, matching every other file under `examples/`
@@ -83,9 +84,9 @@ function assertSqliteAvailable(): void {
   if (!Number.isNaN(major) && major < 22) {
     throw new Error(
       `examples/audit-sqlite.ts uses node:sqlite, which does not exist before Node 22 (running Node ` +
-        `${process.versions.node}). This is a stricter floor than this library's own package.json ` +
-        `engines.node (">=20") — see this file's header for why that's acceptable for one example to ` +
-        'require. Run this specific example under Node 22+, or see this file for the AuditSink shape to ' +
+        `${process.versions.node}, below this library's own package.json engines.node ">=22" floor — ` +
+        `see this file's header for why this guard exists even though the two floors currently coincide). ` +
+        'Run this specific example under Node 22+, or see this file for the AuditSink shape to ' +
         'reimplement against whatever SQL driver your own Node/runtime supports.',
     );
   }
