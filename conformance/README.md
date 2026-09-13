@@ -16,10 +16,11 @@ alongside this document if anything below is ambiguous.
 ```jsonc
 {
   "schemaVersion": 1,       // this file's own format version — bump on any breaking shape change
-  "protocolVersion": "1.0", // the PROTOCOL.md version this vector set was authored against
+  "protocolVersion": "1.1", // the PROTOCOL.md version this vector set was authored against
   "trueGapIds": [...],      // case ids asserting a documented MISS (GAPS.md), not a catch — see below
   "tools": [...],           // the declarative tool catalog every case's "tool" fields reference by name
-  "cases": [...]            // the corpus itself
+  "cases": [...],           // the corpus itself
+  "auditEventShape": {...}  // PROTOCOL.md §4.1's minimum AuditEvent shape, machine-checkable — see below
 }
 ```
 
@@ -124,3 +125,39 @@ these, not that it catches them. A conformance runner checking "does my
 implementation match the reference's behavior" should expect these cases'
 `expected.decision` to be the PERMISSIVE outcome (e.g. `ALLOW`), not treat
 a passing run against them as a security claim.
+
+## `auditEventShape` — the minimum `AuditEvent` shape, machine-checkable
+
+Everything above (`tools[]`/`cases[]`) is about *behavior* — what verdict a
+given sequence of calls should produce. `auditEventShape` is orthogonal to
+that: it is PROTOCOL.md §4.1's minimum audit-event shape (verdict, call,
+taint context, timestamp, executed) made mechanically checkable the same
+way §6.1's own opening paragraph already frames `tools[]`/`cases[]` for the
+decision table — a conformance runner reads this once and checks it
+against every real `AuditEvent` its OWN implementation actually produces,
+rather than re-deriving the field list from PROTOCOL.md's prose by eye.
+
+```jsonc
+{
+  "description": "...",     // human-readable summary — see PROTOCOL.md §4.1
+  "requiredFields": [
+    {
+      "path": "call.sessionId", // dot-notation path into a real AuditEvent
+      "type": "string",         // "string" | "number" | "boolean" | "any" — "any" means "must be defined", no type check
+      "notes": "..."            // optional — why this field exists / what values are valid
+    },
+    // ... one entry per required field
+  ]
+}
+```
+
+A conforming `AuditEvent` MUST resolve every listed `path` to a defined
+value; when `type` is not `"any"`, that value's runtime type MUST match.
+This repository's own `test/audit-event-shape-conformance.spec.ts` is the
+canonical, tested example of walking this manifest against real
+`AuditEvent`s captured from an actual `broker.call()` sequence — read it
+alongside this document if anything above is ambiguous. As with
+`protocolVersion` above, a normative change to PROTOCOL.md §4.1 that adds,
+removes, or retypes a required field should update `requiredFields` in the
+same change, for the identical "the JSON IS the spec's own claim, not a
+second copy of it" reason §6.1 already gives for `tools[]`/`cases[]`.

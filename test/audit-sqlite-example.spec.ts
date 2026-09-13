@@ -28,18 +28,20 @@ const execFileAsync = promisify(execFile);
 const exampleScriptPath = fileURLToPath(new URL('../examples/audit-sqlite.ts', import.meta.url));
 
 // examples/audit-sqlite.ts's own header is explicit that node:sqlite needs
-// Node 22+ -- a stricter floor than this library's own package.json
-// engines.node (">=20"), which this repository's CI matrix (ci.yml) tests
-// directly: Node 20, 22, and 24. Without this guard, this test fails on the
-// Node 20 job with ERR_UNKNOWN_BUILTIN_MODULE (node:internal/modules/esm/
-// translators) -- not a flake, and not a bug in the example or the library's
-// own >=20 floor (nothing in src/ uses node:sqlite), just this one example's
-// documented, deliberately-accepted stricter requirement colliding with a CI
-// matrix entry below it. assertSqliteAvailable() inside the example itself
-// already turns that into a clear thrown message rather than the cryptic
-// built-in-module error above; skipping here (rather than asserting on that
-// thrown-error text) avoids the test suite reporting a real capability gap
-// as a "pass" on Node 20, which would be its own kind of misleading result.
+// Node 22+, which as of this writing exactly matches this library's own
+// package.json engines.node (">=22") floor -- this repository's own CI
+// matrix (ci.yml) never goes below 22, so this guard is not expected to
+// actually skip anything in CI going forward. It stays anyway as a genuine
+// defensive measure, not dead code: `engines` is advisory, not enforced by
+// npm install by default, so this example can still be run directly on an
+// older Node despite the stated floor -- in which case a bare
+// `import { DatabaseSync } from 'node:sqlite'` throws the cryptic
+// ERR_UNKNOWN_BUILTIN_MODULE (node:internal/modules/esm/translators), which
+// assertSqliteAvailable() inside the example itself already turns into a
+// clear thrown message instead. Skipping here (rather than asserting on
+// that thrown-error text) avoids the test suite reporting a real capability
+// gap as a "pass" on such a Node version, which would be its own kind of
+// misleading result.
 const nodeMajor = Number(process.versions.node.split('.')[0]);
 
 describe('examples/audit-sqlite.ts', () => {

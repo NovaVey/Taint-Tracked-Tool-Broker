@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "protocolVersion": "1.0",
+  "protocolVersion": "1.1",
   "trueGapIds": [
     "untracked-tool-description-injection",
     "cross-turn-latent-influence",
@@ -748,5 +748,64 @@
         "notes": "TRUE KNOWN GAP, extending GAPS.md #12/#2 with a named mechanism (write:agent-memory, GAPS.md #12's new paragraph): write_agent_memory's own write is correctly gated like any other MUTATE sink (ALLOW at CLEAN here, REQUIRE_APPROVAL/BLOCK once the scope is tainted, exactly like write_file) -- this case is NOT about that write being under-gated. The gap is entirely on the read side: read_agent_memory is deliberately not isSource, so reading back the exact text written earlier raises nothing, even though the scope was genuinely RAW_UNTRUSTED earlier this same session (from the unrelated fetch_url call) and only reset because a real turn boundary correctly cleared it. Durably-persisted content re-entering through an unmarked channel is invisible to Layer 0 regardless of resetScope mode -- resetScope governs the IN-MEMORY watermark's lifetime, not whether content that left and later re-enters the tracked context carries its provenance with it."
       }
     }
-  ]
+  ],
+  "auditEventShape": {
+    "description": "The minimum AuditEvent shape PROTOCOL.md section 4.1 requires as of protocolVersion 1.1. A conformance runner should verify every entry below is present, with the stated type, on every real AuditEvent its own implementation produces for a gated call -- not only on synthetic fixtures. See PROTOCOL.md section 4.1's own \"why\" paragraph for the rationale behind call.id and call.sessionId specifically.",
+    "requiredFields": [
+      {
+        "path": "verdict.action",
+        "type": "string",
+        "notes": "one of ALLOW / ALLOW_WITH_WARNING / REQUIRE_APPROVAL / BLOCK"
+      },
+      {
+        "path": "verdict.reason",
+        "type": "string",
+        "notes": "required whenever verdict.action is not a bare ALLOW; see PROTOCOL.md section 4.1"
+      },
+      {
+        "path": "call.id",
+        "type": "string",
+        "notes": "unique per CALL, not per tool -- distinct from call.toolName, which repeats across every call to the same tool"
+      },
+      {
+        "path": "call.toolName",
+        "type": "string",
+        "notes": "the tool/action name; NOT unique per call -- see call.id"
+      },
+      {
+        "path": "call.args",
+        "type": "any",
+        "notes": "the exact argument snapshot the gating decision was computed from, never a separately-derived copy"
+      },
+      {
+        "path": "call.sessionId",
+        "type": "string",
+        "notes": "an opaque label scoping this event to one broker/session instance -- never a lookup key the implementation itself resolves anything by"
+      },
+      {
+        "path": "taint.scopeLevel",
+        "type": "string",
+        "notes": "one of CLEAN / DERIVED_UNTRUSTED / RAW_UNTRUSTED"
+      },
+      {
+        "path": "taint.privateDataSeen",
+        "type": "boolean"
+      },
+      {
+        "path": "taint.sinkClass",
+        "type": "string",
+        "notes": "one of EXEC / MUTATE / EXFIL / NONE"
+      },
+      {
+        "path": "at",
+        "type": "number",
+        "notes": "epoch milliseconds when the event was recorded"
+      },
+      {
+        "path": "executed",
+        "type": "boolean",
+        "notes": "whether the underlying action actually ran"
+      }
+    ]
+  }
 }
