@@ -6,45 +6,26 @@ on:
   pull_request:
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # Lower bound (package.json engines.node), the previous LTS, and
-        # current — catches a regression against the floor we actually
-        # advertise, not just whatever happens to be newest.
-        node-version: [20, 22, 24]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: ${{ matrix.node-version }}
-          cache: npm
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm run build
-      # Everything above/below this line exercises src/ TypeScript through
-      # either tsc's *type checker* (typecheck) or esbuild's transpilation
-      # (vitest/tsx, for test/corpus) — never the actual JavaScript tsc
-      # emits into dist/, which is the exact thing `npm publish` ships.
-      # This step closes that gap: it loads dist/index.js with Node's own
-      # ESM loader (no transpiler in between) and runs one real gated call
-      # through it, so a regression confined to tsc's emit can't reach npm
-      # invisibly. See scripts/smoke-test-dist.mjs's header for the full
-      # rationale, and GAPS.md's CI-coverage entry. Run across the whole
-      # Node matrix, not just one version, since the thing under test here
-      # is specifically "does compiled dist/ load and run correctly under
-      # Node's ESM loader" — that is exactly the kind of behavior that can
-      # legitimately vary by Node version, unlike the coverage job below.
-      - run: node scripts/smoke-test-dist.mjs
-      # Same rationale, applied to the SEPARATE shipped artifact `tttb doctor`
-      # is: dist/cli/doctor.js, package.json's "bin" entry — not a module
-      # export smoke-test-dist.mjs already covers. See
-      # scripts/smoke-test-doctor-cli.mjs's own header.
-      - run: node scripts/smoke-test-doctor-cli.mjs
-      - run: npm test
-      - run: npm run corpus
+  # Delegates typecheck/build/test/lint/format:check (npm run verify) to the
+  # org-shared reusable workflow, across the same Node matrix `package.json`
+  # itself now advertises support for (engines.node >=22): the previous LTS,
+  # current, and the next one already in the loop — not [20, 22, 24], since
+  # Node 20 reached end-of-life 2026-04-30 and this package's own floor
+  # moved to 22. `pre-verify` covers everything `npm run verify` itself does
+  # NOT — node-verify.yml's own script only runs typecheck/build/test/lint/
+  # format:check, so the dist/ smoke tests and the injection corpus (neither
+  # exercised by that script) are run here first instead of silently
+  # dropping out of CI coverage when this job replaced the old
+  # test+lint jobs below.
+  verify:
+    uses: NovaVey/.github/.github/workflows/node-verify.yml@main
+    with:
+      node-versions: '["22", "24", "26"]'
+      pre-verify: >-
+        npm run build &&
+        node scripts/smoke-test-dist.mjs &&
+        node scripts/smoke-test-doctor-cli.mjs &&
+        npm run corpus
 
   coverage:
     runs-on: ubuntu-latest
@@ -61,14 +42,32 @@ jobs:
       # V8 coverage isn't meaningfully Node-version-sensitive here.
       - run: npm run coverage
 
-  lint:
+  # Fails the build loud, on every push/PR, if package.json's current
+  # `version` is already a published npm version — the exact mistake that
+  # let `main` silently drift ahead of a `1.4.0` tag while package.json
+  # still said `1.4.0` too, so a git checkout of `main` and the real
+  # published `1.4.0` tarball claimed the identical version string while
+  # containing different code. Going forward `main` always sits on a
+  # prerelease strictly above the last real publish (e.g. `1.5.0-dev.0`),
+  # so this should never actually fire in the ordinary course of
+  # development — it exists specifically to catch the day someone forgets
+  # to bump it back up after a release, loudly and immediately, rather than
+  # only being discoverable later via a confusing type-drift bug downstream.
+  # `npm view <pkg>@<version> version` exits 0 with output only when that
+  # exact version is already published, and non-zero (E404) otherwise — no
+  # auth needed to query a public package's own metadata (release.yml's own
+  # "Check whether this version is already on npm" step uses the identical
+  # check, for a different purpose: deciding whether to skip a redundant
+  # `npm publish` on a re-run, not failing the build).
+  version-guard:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run lint
-      - run: npm run format:check
+      - name: Fail if package.json's version is already published to npm
+        run: |
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if npm view "${PKG_NAME}@${PKG_VERSION}" version >/dev/null 2>&1; then
+            echo "::error::package.json version ${PKG_VERSION} is already published to npm — bump it before merging (main must always sit on an unpublished version, ordinarily a *-dev.N prerelease above the last real release)."
+            exit 1
+          fi
