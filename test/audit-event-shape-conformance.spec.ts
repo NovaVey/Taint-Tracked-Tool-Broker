@@ -20,6 +20,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { createBroker, type AuditEvent, type ToolExecutor } from '../src/index.js';
+import novaveyContractsVectors from '@novavey/contracts/conformance/vectors.json' with { type: 'json' };
 
 interface RequiredField {
   path: string;
@@ -112,6 +113,53 @@ describe("conformance/vectors.json's auditEventShape manifest matches PROTOCOL.m
     ]) {
       expect(paths).toContain(expectedPath);
     }
+  });
+});
+
+/**
+ * `@novavey/contracts` (Stack-Contracts) ports this exact manifest as its
+ * own `auditEventShape` — PROTOCOL.md §2 there describes it as a deliberate
+ * port, "not a live reference," precisely so a consumer doesn't have to
+ * accept a direct dependency on this package just to use the floor. A port
+ * is only ever as good as its last sync, though: this repo is the
+ * AUTHORITATIVE source (per that same PROTOCOL.md §2), so if this suite
+ * only ever checked "does the real AuditEvent satisfy THIS repo's own
+ * requiredFields," a field added here and simply forgotten in the port
+ * would drift silently — exactly what happened before this test existed:
+ * verdict.reason was required here (and enforced by the ALLOW-case
+ * exemption below) but missing from @novavey/contracts's copy entirely,
+ * with nothing to ever notice. This block is the mechanical check that
+ * closes that gap, the same "structurally impossible to drift" discipline
+ * this file's own header describes, extended across the repo boundary.
+ */
+describe("@novavey/contracts's auditEventShape copy has not drifted from this repo's own", () => {
+  const portedFields = novaveyContractsVectors.auditEventShape.requiredFields as {
+    path: string;
+    type: string;
+    enum?: string[];
+    unless?: { path: string; equals: string };
+  }[];
+
+  it('carries every field this repo requires — nothing silently dropped in the port', () => {
+    const portedPaths = new Set(portedFields.map((f) => f.path));
+    for (const field of REQUIRED_FIELDS) {
+      expect(portedPaths.has(field.path), `@novavey/contracts is missing ${field.path}`).toBe(true);
+    }
+  });
+
+  it("each ported field's type and conditional-requirement match this repo's own", () => {
+    const byPath = new Map(portedFields.map((f) => [f.path, f]));
+    for (const field of REQUIRED_FIELDS) {
+      const ported = byPath.get(field.path);
+      if (!ported) continue; // reported by the previous test — don't double-report here
+      expect(ported.type, `${field.path}: type`).toBe(field.type);
+    }
+    // verdict.reason is this repo's one conditionally-required field (see the
+    // ALLOW-case exemption above) — the port must encode that condition too,
+    // not just carry the field as unconditionally required (which would
+    // reject every legitimate bare-ALLOW event the port is meant to accept).
+    const reason = byPath.get('verdict.reason');
+    expect(reason?.unless).toEqual({ path: 'verdict.action', equals: 'ALLOW' });
   });
 });
 
