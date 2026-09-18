@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/). As of `1.0.0`, the exported API surface (`src/index.ts`) is stable — no more breaking changes without a major bump. Releases before `1.0.0` could still include a breaking change in a minor release while the API stabilized; that caveat no longer applies.
 
-## [Unreleased]
+## [1.5.0] - 2026-09-17
 
 ### Added
 
